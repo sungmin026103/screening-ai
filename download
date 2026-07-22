@@ -1,0 +1,9 @@
+# 로컬 프로젝트 데이터/결과물은 절대 올리지 않음
+SR_Triage_Projects/
+*.xlsx
+*.zip
+!SAMPLE_INPUT_TEMPLATE.xlsx
+__pycache__/
+*.pyc
+.mplcache/
+.streamlit/secrets.toml
