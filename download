@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.env
-.DS_Store
-.streamlit/secrets.toml
-data/projects/*
-!data/projects/.gitkeep
