@@ -1,8 +1,0 @@
-SR_Triage_Projects/
-*.xlsx
-*.zip
-!SAMPLE_INPUT_TEMPLATE.xlsx
-__pycache__/
-*.pyc
-.mplcache/
-.streamlit/secrets.toml
