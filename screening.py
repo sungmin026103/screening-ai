@@ -8,6 +8,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import (
+    accuracy_score,
     average_precision_score,
     confusion_matrix,
     precision_recall_curve,
@@ -117,9 +118,13 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
     fpr, tpr, _ = roc_curve(y, probs)
 
+    recall_v = float(recall_score(y, pred, zero_division=0))
+    precision_v = float(precision_score(y, pred, zero_division=0))
     metrics = {
-        "recall": float(recall_score(y, pred, zero_division=0)),
-        "precision": float(precision_score(y, pred, zero_division=0)),
+        "recall": recall_v,
+        "precision": precision_v,
+        "accuracy": float(accuracy_score(y, pred)),
+        "f1": float(2 * precision_v * recall_v / (precision_v + recall_v)) if (precision_v + recall_v) > 0 else 0.0,
         "roc_auc": float(roc_auc_score(y, probs)),
         "average_precision": float(average_precision_score(y, probs)),
         "labeled_n": int(len(labeled)),

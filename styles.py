@@ -32,9 +32,37 @@ html, body, [class*="css"] { font-family: 'PretendardVariable', 'Pretendard', -a
 .stApp { background: var(--paper); }
 .block-container { max-width: 1180px; padding-top: 1.4rem; padding-bottom: 4rem; }
 
-/* ---------- Sidebar : 프로젝트 전용 영역 ---------- */
-[data-testid="stSidebar"] { background: var(--surface); border-right: 1px solid var(--line); }
-[data-testid="stSidebar"] .block-container { padding-top: 1.6rem; }
+/* ---------- Sidebar : 다크 네이비 내비게이션 ---------- */
+[data-testid="stSidebar"] { background: var(--ink); border-right: none; }
+[data-testid="stSidebar"] .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label,
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3,
+[data-testid="stSidebar"] h4, [data-testid="stSidebar"] div { color: #E7E9F5; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: #8B93B8 !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.12); margin: 14px 0; }
+
+/* 내비게이션 버튼 (사이드바 전체 폭 버튼을 리스트 아이템처럼) */
+[data-testid="stSidebar"] .stButton>button {
+    background: transparent; border: none; text-align:left; justify-content:flex-start;
+    color:#C4CAE6; font-weight:500; font-size:.94rem; padding:9px 12px; border-radius:10px;
+    box-shadow:none;
+}
+[data-testid="stSidebar"] .stButton>button:hover { background: rgba(255,255,255,.07); color:#fff; border-color:transparent; }
+[data-testid="stSidebar"] .stButton>button[kind="primary"] {
+    background: rgba(255,206,69,.16); color:#FFFFFF; font-weight:700;
+    border-left: 3px solid var(--highlighter); border-radius:8px;
+}
+[data-testid="stSidebar"] .stButton>button[kind="primary"]:hover { background: rgba(255,206,69,.22); }
+
+/* 프로젝트 목록 카드 */
+.side-project-card { background: rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.09);
+        border-radius:12px; padding:10px 12px; margin-bottom:8px; }
+.side-project-card .name { font-weight:600; font-size:.86rem; color:#fff; }
+.side-project-card .date { font-size:.72rem; color:#8B93B8; }
+.side-project-card.active { border-color: var(--highlighter); background: rgba(255,206,69,.09); }
+[data-testid="stSidebar"] .brandbar { border-bottom-color: rgba(255,255,255,.14); }
+[data-testid="stSidebar"] .brandbar .mark { color: #FFFFFF; }
+[data-testid="stSidebar"] .brandbar .tagline { color: #8B93B8; }
 
 /* ---------- 상단 브랜드 바 ---------- */
 .brandbar { display:flex; align-items:baseline; gap:14px; padding: 10px 4px 16px;
@@ -57,18 +85,35 @@ html, body, [class*="css"] { font-family: 'PretendardVariable', 'Pretendard', -a
         margin:0 0 10px; color:var(--ink); }
 .hero p { font-size:1.02rem; color:var(--slate); margin:0; max-width: 640px; }
 
-/* ---------- 탭 내비게이션 (실제 워크플로 단계) ---------- */
-[data-testid="stTabs"] { margin-top: 2px; }
-[data-testid="stTabs"] [data-baseweb="tab-list"] { gap: 4px; }
-[data-testid="stTabs"] button[role="tab"] {
-    font-weight:600; font-size:.92rem; color:var(--slate); padding:10px 14px; border-radius: 10px 10px 0 0;
-}
-[data-testid="stTabs"] button[role="tab"]:hover { background: rgba(22,33,62,.035); color:var(--ink); }
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
-    color: var(--ink); border-bottom: 3px solid var(--highlighter); background: rgba(255,206,69,.08);
-}
-[data-testid="stTabs"] [data-baseweb="tab-highlight"] { display:none; }
-[data-testid="stTabs"] [data-baseweb="tab-border"] { background: var(--line); }
+/* ---------- 상단 바 (현재 프로젝트 표시) ---------- */
+.topbar { display:flex; justify-content:flex-end; align-items:center; gap:10px; padding: 4px 0 10px; }
+.topbar .avatar { width:34px; height:34px; border-radius:50%; background:var(--ink); color:#fff;
+        display:flex; align-items:center; justify-content:center; font-weight:700; font-size:.82rem; }
+
+/* ---------- 스텝퍼 (스크리닝 진행 상황) ---------- */
+.stepper { position:relative; padding: 18px 12px 2px; }
+.stepper-track { position:absolute; top:35px; left:8%; right:8%; height:2px; background:var(--line); }
+.stepper-fill { height:100%; background:var(--ink); transition:width .3s; }
+.stepper-items { display:flex; justify-content:space-between; position:relative; z-index:2; }
+.step-item { flex:1; display:flex; flex-direction:column; align-items:center; text-align:center; padding:0 4px; }
+.step-circle { width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+        font-weight:700; font-size:14px; margin-bottom:10px; background:var(--surface); }
+.step-circle.done { background:var(--ink); color:#fff; border:2px solid var(--ink); }
+.step-circle.current { background:var(--surface); color:var(--ink); border:3px solid var(--ink); }
+.step-circle.pending { background:var(--surface); color:var(--slate); border:2px solid var(--line); }
+.step-label { font-size:.83rem; font-weight:600; color:var(--ink); margin-bottom:2px; }
+.step-value { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.2rem; color:var(--ink); }
+.step-date { font-size:.7rem; color:var(--slate); margin-top:2px; }
+
+/* ---------- 최근 활동 피드 ---------- */
+.activity-row { display:flex; gap:10px; align-items:flex-start; padding:9px 0;
+        border-bottom:1px solid var(--line); }
+.activity-row:last-child { border-bottom:none; }
+.activity-icon { width:30px; height:30px; border-radius:9px; background:rgba(58,78,134,.1);
+        display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0; }
+.activity-title { font-size:.85rem; font-weight:600; color:var(--ink); }
+.activity-detail { font-size:.76rem; color:var(--slate); }
+.activity-time { font-size:.7rem; color:var(--slate); white-space:nowrap; margin-left:auto; padding-top:2px; }
 
 /* ---------- 카드 / KPI ---------- */
 .kpi { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:20px;
@@ -209,6 +254,50 @@ def empty_state(big: str, title: str, body: str) -> None:
     st.markdown(
         f'<div class="empty-state"><div class="big">{big}</div>'
         f'<div class="title">{title}</div><div>{body}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def stepper(steps: list[dict]) -> None:
+    """steps: [{"label":str, "value":str, "date":str, "status":"done"|"current"|"pending"}]"""
+    n = len(steps)
+    done_count = sum(1 for s in steps if s["status"] == "done")
+    progress = (done_count / (n - 1) * 100) if n > 1 else 0
+    items_html = "".join(
+        f'<div class="step-item"><div class="step-circle {s["status"]}">'
+        f'{"✓" if s["status"] == "done" else ""}</div>'
+        f'<div class="step-label">{s["label"]}</div>'
+        f'<div class="step-value">{s.get("value","")}</div>'
+        f'<div class="step-date">{s.get("date","")}</div></div>'
+        for s in steps
+    )
+    st.markdown(
+        f'<div class="stepper"><div class="stepper-track"><div class="stepper-fill" style="width:{progress}%"></div></div>'
+        f'<div class="stepper-items">{items_html}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def activity_feed(rows: list[dict]) -> None:
+    """rows: [{"icon":str, "title":str, "detail":str, "time":str}]"""
+    if not rows:
+        st.caption("아직 활동 기록이 없습니다.")
+        return
+    html = "".join(
+        f'<div class="activity-row"><div class="activity-icon">{r["icon"]}</div>'
+        f'<div><div class="activity-title">{r["title"]}</div>'
+        f'<div class="activity-detail">{r.get("detail","")}</div></div>'
+        f'<div class="activity-time">{r.get("time","")}</div></div>'
+        for r in rows
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def topbar(project_name: str, initials: str = "SR") -> None:
+    st.markdown(
+        f'<div class="topbar"><span style="color:var(--slate);font-size:.86rem;">현재 프로젝트 · '
+        f'<b style="color:var(--ink);">{project_name}</b></span>'
+        f'<span class="avatar">{initials}</span></div>',
         unsafe_allow_html=True,
     )
 

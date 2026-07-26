@@ -17,7 +17,7 @@ from metaanalysis import (
 )
 from projects import create_project, list_projects, load_pico, load_records, save_pico, save_records
 from screening import train_and_predict
-from styles import apply_styles, empty_state, hero, kpi, render_funnel
+from styles import apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar
 from utils import dataframe_to_excel_bytes
 
 st.set_page_config(page_title="SR Studio · 문헌 스크리닝 워크스페이스", page_icon="◈", layout="wide")
@@ -30,31 +30,66 @@ if "records" not in st.session_state:
     st.session_state.records = pd.DataFrame()
 if "pico" not in st.session_state:
     st.session_state.pico = {}
+if "activity_log" not in st.session_state:
+    st.session_state.activity_log = []
+
+
+def log_activity(icon: str, title: str, detail: str = "") -> None:
+    import datetime
+    st.session_state.activity_log.insert(0, {
+        "icon": icon, "title": title, "detail": detail,
+        "time": datetime.datetime.now().strftime("%H:%M"),
+    })
+    st.session_state.activity_log = st.session_state.activity_log[:6]
 
 # ---------------------------------------------------------------------------
-# 사이드바 : 프로젝트 전용 (섹션 이동은 상단 탭에서 담당)
+# 사이드바 : 내비게이션 + 프로젝트
 # ---------------------------------------------------------------------------
+NAV_ITEMS = [
+    ("dashboard", "🏠", "대시보드"),
+    ("import", "📥", "가져오기 · 중복 제거"),
+    ("pico", "🧬", "PICO 설정"),
+    ("screen", "🤖", "AI 스크리닝"),
+    ("analytics", "📊", "문헌 분석"),
+    ("meta", "📈", "메타분석"),
+    ("export", "📤", "내보내기"),
+]
+if "nav" not in st.session_state:
+    st.session_state.nav = "dashboard"
+
 with st.sidebar:
-    st.markdown('<div class="brandbar"><span class="mark">◈ SR Studio</span></div>', unsafe_allow_html=True)
-    st.caption("문헌 스크리닝 워크스페이스")
-    st.divider()
-    st.markdown("#### 프로젝트")
-    projects = list_projects()
-    labels = {p["name"]: p["slug"] for p in projects}
-    if labels:
-        names = list(labels)
-        current_name = next((n for n, s in labels.items() if s == st.session_state.active_project), names[0])
-        chosen = st.selectbox("현재 프로젝트", names, index=names.index(current_name), label_visibility="collapsed")
-        if labels[chosen] != st.session_state.active_project:
-            st.session_state.active_project = labels[chosen]
-            st.session_state.records = load_records(labels[chosen])
-            st.session_state.pico = load_pico(labels[chosen])
+    st.markdown(
+        '<div class="brandbar"><span class="mark">◈ SR Studio</span></div>'
+        '<div style="margin-top:-10px;margin-bottom:10px;color:#8B93B8;font-size:.82rem;">문헌 스크리닝 워크스페이스</div>',
+        unsafe_allow_html=True,
+    )
+    for key, icon, label in NAV_ITEMS:
+        is_active = st.session_state.nav == key
+        if st.button(f"{icon}  {label}", key=f"nav_{key}", use_container_width=True,
+                    type="primary" if is_active else "secondary"):
+            st.session_state.nav = key
             st.rerun()
+
+    st.divider()
+    st.markdown("###### 프로젝트")
+    projects = list_projects()
+    if projects:
+        for p in projects:
+            is_active_proj = p["slug"] == st.session_state.active_project
+            label = f"{'● ' if is_active_proj else '○ '}{p['name']}"
+            if st.button(label, key=f"proj_{p['slug']}", use_container_width=True,
+                        type="primary" if is_active_proj else "secondary"):
+                if not is_active_proj:
+                    st.session_state.active_project = p["slug"]
+                    st.session_state.records = load_records(p["slug"])
+                    st.session_state.pico = load_pico(p["slug"])
+                    st.rerun()
+            st.caption(p.get("created_at", "")[:10])
     else:
-        st.caption("아직 프로젝트가 없습니다. 아래에서 새로 만드세요.")
+        st.caption("아직 프로젝트가 없습니다.")
     with st.expander("＋ 새 프로젝트 만들기"):
-        new_name = st.text_input("프로젝트 이름", placeholder="예: 우주 영양 SR")
-        if st.button("만들기", use_container_width=True, type="primary"):
+        new_name = st.text_input("프로젝트 이름", placeholder="예: 우주 영양 SR", label_visibility="collapsed")
+        if st.button("만들기", use_container_width=True, type="primary", key="create_project_btn"):
             if new_name.strip():
                 p = create_project(new_name)
                 st.session_state.active_project = p["slug"]
@@ -71,23 +106,15 @@ if active and not st.session_state.pico:
     st.session_state.pico = load_pico(active)
 records = st.session_state.records
 pico = st.session_state.pico
+nav = st.session_state.nav
 
-st.markdown(
-    '<div class="brandbar"><span class="mark">◈ SR Studio</span>'
-    '<span class="tagline">문헌 스크리닝 워크스페이스</span></div>',
-    unsafe_allow_html=True,
-)
+topbar(active or "프로젝트 없음")
 
-(tab_dash, tab_import, tab_pico, tab_screen,
- tab_analytics, tab_meta, tab_export) = st.tabs(
-    ["🏠 대시보드", "📥 가져오기 · 중복 제거", "🧬 PICO 설정",
-     "🤖 AI 스크리닝", "📊 문헌 분석", "📈 메타분석", "📤 내보내기"]
-)
 
 # ===========================================================================
 # 1. 대시보드
 # ===========================================================================
-with tab_dash:
+if nav == "dashboard":
     hero(
         "검색 결과를, 스크리닝 가능한 데이터로.",
         "문헌을 가져오고, 중복을 제거하고, PICO 기준과 AI로 우선순위를 매긴 뒤, 메타분석 그림까지 한 워크스페이스에서 진행하세요.",
@@ -95,64 +122,95 @@ with tab_dash:
     )
 
     if records.empty:
-        empty_state("◈", "아직 문헌이 없습니다", "「📥 가져오기 · 중복 제거」 탭에서 검색 결과 파일을 업로드해 시작하세요.")
+        empty_state("◈", "아직 문헌이 없습니다", "「📥 가져오기 · 중복 제거」에서 검색 결과 파일을 업로드해 시작하세요.")
     else:
         stats = st.session_state.get("import_stats", {})
         result = st.session_state.get("screening_result")
+        collected = stats.get("before", len(records))
+        coverage = records["abstract"].astype(str).str.len().gt(0).mean() * 100 if not records.empty else 0
+        include_n = int((result.predictions["AI_Recommendation"] == "Include candidate").sum()) if result else None
+        screen_progress = (result.metrics["labeled_n"] / len(records) * 100) if result and len(records) else 0
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            kpi("현재 문헌 수", f"{len(records):,}", "중복 제거 후")
+            kpi("총 문헌 수", f"{collected:,}", "가져오기 시점 기준")
         with c2:
-            kpi("프로젝트", active or "미선택", "저장된 워크스페이스")
+            kpi("중복 제거 후", f"{len(records):,}", f"{(len(records)/collected*100 if collected else 0):.1f}%")
         with c3:
-            coverage = records["abstract"].astype(str).str.len().gt(0).mean() * 100 if not records.empty else 0
-            kpi("초록 보유율", f"{coverage:.1f}%", "초록이 있는 문헌 비율")
+            kpi("Include 후보 (AI)", f"{include_n:,}" if include_n is not None else "—", "AI 스크리닝 결과")
         with c4:
-            next_action = "AI 스크리닝 실행" if result is None else "결과 내보내기"
-            kpi("다음 단계", next_action, "추천 워크플로")
+            kpi("초록 보유율", f"{coverage:.1f}%", "초록이 있는 문헌 비율")
+        with c5:
+            kpi("스크리닝 진행률", f"{screen_progress:.1f}%", "AI 스크리닝 대상 비율")
 
         st.markdown(
-            '<div class="section-title">스크리닝 진행 현황</div>'
-            '<div class="section-sub">각 단계를 거치며 문헌 수가 어떻게 줄어드는지 보여줍니다.</div>',
+            '<div class="section-title" style="margin-top:26px;">스크리닝 진행 상황</div>'
+            '<div class="section-sub">현재 프로젝트가 어느 단계까지 진행됐는지 보여줍니다.</div>',
             unsafe_allow_html=True,
         )
-        collected = stats.get("before", len(records))
-        after_dedup = len(records)
-        labeled_n = result.metrics["labeled_n"] if result else 0
-        include_n = int((result.predictions["AI_Recommendation"] == "Include candidate").sum()) if result else 0
+        meta_done = any(st.session_state.get(k) for k in ["meta_r_result", "meta_raw", "meta_result"])
+        flags = [True, bool(pico and any(v for v in pico.values())), result is not None, meta_done]
+        statuses, found_current = [], False
+        for f in flags:
+            if f:
+                statuses.append("done")
+            elif not found_current:
+                statuses.append("current")
+                found_current = True
+            else:
+                statuses.append("pending")
+        statuses.append("current" if statuses[-1] == "done" else "pending")
 
-        stages = [
-            {"label": "검색으로 확인된 문헌", "value": collected, "color": "#16213E", "text": "#FFFFFF"},
-            {"label": "중복 제거 후 남은 문헌", "value": after_dedup, "color": "#3A4E86", "text": "#FFFFFF"},
-            {"label": "AI 스크리닝 대상", "value": labeled_n, "color": "#FFCE45", "text": "#16213E"},
-            {"label": "Include 후보", "value": include_n, "color": "#2F8F6E", "text": "#FFFFFF"},
-        ]
-        funnel_svg = render_funnel(stages)
-        legend_rows = "".join(
-            f'<div class="row"><span class="dot" style="background:{s["color"]}"></span>{s["label"]}<span class="n">{s["value"]:,}</span></div>'
-            for s in stages
-        )
-        st.markdown(f'<div class="funnel-wrap">{funnel_svg}<div class="funnel-legend">{legend_rows}</div></div>', unsafe_allow_html=True)
-        if result is None:
-            st.caption("※ AI 스크리닝을 아직 실행하지 않아 마지막 두 단계는 0입니다. 「🤖 AI 스크리닝」 탭에서 실행해보세요.")
+        stepper([
+            {"label": "가져오기 · 중복 제거", "value": f"{len(records):,}", "status": statuses[0]},
+            {"label": "PICO 설정", "value": "완료" if statuses[1] == "done" else "", "status": statuses[1]},
+            {"label": "AI 스크리닝", "value": f"{include_n:,}" if include_n is not None else "", "status": statuses[2]},
+            {"label": "메타분석", "value": "완료" if statuses[3] == "done" else "", "status": statuses[3]},
+            {"label": "내보내기", "value": "", "status": statuses[4]},
+        ])
 
-    st.markdown('<div class="section-title" style="margin-top:28px;">워크플로</div><div class="section-sub">순서대로 진행하세요.</div>', unsafe_allow_html=True)
-    cols = st.columns(4)
-    steps = [
-        ("1", "가져오기 → 중복 제거", "업로드 즉시 3개 파일 제공"),
-        ("2", "PICO 설정", "연구 질문과 배제기준 정리"),
-        ("3", "AI 스크리닝", "사람 라벨 + PICO로 학습"),
-        ("4", "분석 → 메타분석 → 내보내기", "그림까지 한 번에"),
+        col_left, col_right = st.columns([1.3, 1])
+        with col_left:
+            st.markdown('<div class="section-title" style="margin-top:22px;">최근 활동</div>', unsafe_allow_html=True)
+            activity_feed(st.session_state.activity_log[:5])
+        with col_right:
+            st.markdown('<div class="section-title" style="margin-top:22px;">AI 성능 요약</div>', unsafe_allow_html=True)
+            if result:
+                m = result.metrics
+                perf_rows = [
+                    ("정확도 (Accuracy)", m.get("accuracy", 0)), ("재현율 (Recall)", m["recall"]),
+                    ("정밀도 (Precision)", m["precision"]), ("F1 Score", m.get("f1", 0)),
+                    ("ROC AUC", m["roc_auc"]),
+                ]
+                perf_html = "".join(
+                    f'<div style="display:flex;justify-content:space-between;padding:6px 0;'
+                    f'border-bottom:1px solid var(--line);font-size:.86rem;">'
+                    f'<span style="color:var(--slate);">{label}</span>'
+                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;color:var(--ink);">{val:.3f}</span></div>'
+                    for label, val in perf_rows
+                )
+                st.markdown(f'<div>{perf_html}</div>', unsafe_allow_html=True)
+            else:
+                st.caption("아직 AI 스크리닝을 실행하지 않았습니다.")
+
+    st.markdown('<div class="section-title" style="margin-top:28px;">빠른 시작</div>', unsafe_allow_html=True)
+    q1, q2, q3, q4 = st.columns(4)
+    quick_actions = [
+        (q1, "import", "📥", "문헌 가져오기"),
+        (q2, "pico", "🧬", "PICO 설정"),
+        (q3, "screen", "🤖", "AI 스크리닝"),
+        (q4, "export", "📤", "내보내기"),
     ]
-    for col, (num, name, desc) in zip(cols, steps):
+    for col, key, icon, label in quick_actions:
         with col:
-            kpi(f"STEP {num}", name, desc)
+            if st.button(f"{icon}  {label}", key=f"quick_{key}", use_container_width=True):
+                st.session_state.nav = key
+                st.rerun()
 
 # ===========================================================================
 # 2. 가져오기 · 중복 제거 (하나의 탭 — 업로드하면 바로 중복 제거된 3개 파일 제공)
 # ===========================================================================
-with tab_import:
+elif nav == "import":
     hero(
         "가져오기 · 중복 제거",
         "검색 결과 파일을 올리면 자동으로 병합·중복 제거하고, 다음 단계에 바로 쓸 수 있는 3가지 파일을 만들어 드립니다.",
@@ -179,6 +237,7 @@ with tab_import:
             if active:
                 save_records(active, deduped)
             st.success(f"{len(combined):,}건을 통합하고, 중복 {len(removed):,}건을 제거했습니다.")
+            log_activity("📥", "문헌 가져오기 · 중복 제거 완료", f"{len(combined):,}건 → {len(deduped):,}건")
             st.rerun()
 
     stats = st.session_state.get("import_stats", {})
@@ -243,7 +302,7 @@ with tab_import:
 # ===========================================================================
 # 3. PICO 설정
 # ===========================================================================
-with tab_pico:
+elif nav == "pico":
     hero("PICO 설정", "연구 질문(PICO)과 배제기준을 정리하세요. AI 스크리닝 시 문헌과의 유사도를 계산하는 보조 신호로 사용됩니다.", eyebrow="2 · PICO 설정")
     if not active:
         empty_state("◈", "선택된 프로젝트가 없습니다", "왼쪽 사이드바에서 프로젝트를 먼저 만들거나 선택하세요.")
@@ -280,7 +339,7 @@ with tab_pico:
 # ===========================================================================
 # 4. AI 스크리닝
 # ===========================================================================
-with tab_screen:
+elif nav == "screen":
     hero("AI 스크리닝", "사람의 Include/Exclude 판정과 PICO 기준을 함께 학습해 전체 문헌의 포함 확률 순위를 매깁니다.", eyebrow="3 · AI 스크리닝")
     criteria_text = " ".join(v for v in [pico.get("population", ""), pico.get("intervention", ""),
                                           pico.get("comparator", ""), pico.get("outcome", ""),
@@ -301,6 +360,7 @@ with tab_screen:
                 with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
                     result = train_and_predict(df, target_recall, criteria_text=criteria_text)
                 st.session_state["screening_result"] = result
+                log_activity("🤖", "AI 스크리닝 완료", f"재현율 {result.metrics['recall']*100:.1f}%, Include 후보 {int((result.predictions['AI_Recommendation']=='Include candidate').sum()):,}건")
             except Exception as exc:
                 st.error(str(exc))
 
@@ -363,7 +423,7 @@ with tab_screen:
 # ===========================================================================
 # 5. 문헌 분석
 # ===========================================================================
-with tab_analytics:
+elif nav == "analytics":
     hero("문헌 분석", "현재 프로젝트에 담긴 문헌의 구성과 완성도를 살펴봅니다.", eyebrow="4 · 분석")
     if records.empty:
         empty_state("◈", "분석할 문헌이 없습니다", "먼저 「📥 가져오기 · 중복 제거」 탭을 진행하세요.")
@@ -391,7 +451,7 @@ with tab_analytics:
 # ===========================================================================
 # 6. 메타분석 (R 결과 CSV 그대로 시각화 + 보조 미리보기 모드)
 # ===========================================================================
-with tab_meta:
+elif nav == "meta":
     hero(
         "메타분석 시각화",
         "R(metafor 3-level + clubSandwich CRVE)에서 계산한 결과를 그대로 올리면, 통계를 다시 계산하지 않고 "
@@ -413,87 +473,145 @@ with tab_meta:
     # -------------------------------------------------------------------
     if mode.startswith("R 결과"):
         st.markdown(
-            '<div class="small-note">R에서 <code>escalc()</code>로 계산한 <b>연구별 효과크기 CSV</b>'
-            '(예: <code>01_effect_sizes.csv</code> — study, yi, vi, mean_treat/sd_treat/n_treat, '
-            'mean_control/sd_control/n_control 등)를 그대로 올리세요. 종합효과(g, 95% CI, τ², I², p, '
-            '예측구간)는 R 콘솔이나 <code>02_main_results.csv</code>/<code>04_3level_plus_CRVE_results.csv</code>에서 '
-            '숫자를 그대로 옮겨 입력하면 됩니다 — 이 탭은 그 숫자를 <b>그대로</b> 그림으로 옮길 뿐, 다시 계산하지 않습니다.</div>',
+            '<div class="small-note">R에서 <code>escalc()</code>로 계산한 <b>연구별 효과크기 CSV</b>를 올리면 '
+            '열(연구명/yi/vi/mean·sd·n 등)을 자동으로 인식합니다. 잘못 인식됐을 때만 아래 "열 매핑" 펼쳐서 고치면 됩니다. '
+            '종합효과(g, 95% CI, τ², I², p)는 <b>요약 결과 CSV를 같이 올리면 자동으로 채워지고</b>, 없으면 직접 입력하세요. '
+            '이 탭은 입력된 숫자를 통계적으로 다시 계산하지 않고 <b>그대로</b> 그림으로 옮깁니다.</div>',
             unsafe_allow_html=True,
         )
-        es_file = st.file_uploader("연구별 효과크기 CSV/Excel 업로드", type=["csv", "xlsx", "xls"], key="meta_r_upload")
+        es_file = st.file_uploader("① 연구별 효과크기 CSV/Excel 업로드", type=["csv", "xlsx", "xls"], key="meta_r_upload")
         if es_file:
             es_df = pd.read_excel(es_file) if Path(es_file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(es_file)
             st.dataframe(es_df.head(20), use_container_width=True)
             cols = list(es_df.columns)
+            guess = guess_columns(cols)
 
-            outcome_col_pick = st.selectbox("outcome(결과지표) 열 — 여러 결과지표가 한 파일에 섞여 있으면 선택", ["(없음 — 전체 사용)"] + cols)
-            if outcome_col_pick != "(없음 — 전체 사용)":
-                outcomes = sorted(es_df[outcome_col_pick].dropna().astype(str).unique())
-                chosen_outcome = st.selectbox("어떤 outcome을 그릴까요?", outcomes)
-                es_df = es_df[es_df[outcome_col_pick].astype(str) == chosen_outcome].reset_index(drop=True)
-            else:
-                chosen_outcome = None
+            def _idx(colname, fallback=0):
+                if colname and colname in cols:
+                    return cols.index(colname)
+                return min(fallback, len(cols) - 1)
 
-            r1, r2 = st.columns(2)
-            with r1:
-                study_col = st.selectbox("연구명 열 (study_label / Study)", cols, index=0, key="r_study")
-            with r2:
-                yi_col = st.selectbox("효과크기 열 (yi)", cols, index=min(1, len(cols) - 1), key="r_yi")
-            r3, r4 = st.columns(2)
-            with r3:
-                vi_mode = st.radio("분산 정보", ["분산(vi) 열 사용", "CI 하한/상한 열 사용"], horizontal=True, key="r_vimode")
-            with r4:
-                pass
-            if vi_mode == "분산(vi) 열 사용":
-                vi_col = st.selectbox("분산 열 (vi)", cols, index=min(2, len(cols) - 1), key="r_vi")
-                ci_lo_col = ci_hi_col = None
-            else:
-                vi_col = None
-                cA, cB = st.columns(2)
-                with cA:
-                    ci_lo_col = st.selectbox("CI 하한 열", cols, index=min(2, len(cols) - 1), key="r_cilo")
-                with cB:
-                    ci_hi_col = st.selectbox("CI 상한 열", cols, index=min(3, len(cols) - 1), key="r_cihi")
+            chosen_outcome = None
+            if guess["outcome"]:
+                outcomes = sorted(es_df[guess["outcome"]].dropna().astype(str).unique())
+                if len(outcomes) > 1:
+                    chosen_outcome = st.selectbox(f"'{guess['outcome']}' 열에서 어떤 outcome을 그릴까요?", outcomes)
+                    es_df = es_df[es_df[guess["outcome"]].astype(str) == chosen_outcome].reset_index(drop=True)
 
-            has_raw_cols = st.checkbox("실험군/대조군 N·Mean·SD 열도 있음 (Cochrane 스타일 표에 표시)", value=True)
-            raw_cols = {}
-            if has_raw_cols:
-                g1, g2, g3 = st.columns(3)
-                with g1:
-                    raw_cols["n_treat"] = st.selectbox("실험군 N", cols, index=min(4, len(cols) - 1), key="r_nt")
-                with g2:
-                    raw_cols["mean_treat"] = st.selectbox("실험군 Mean", cols, index=min(5, len(cols) - 1), key="r_mt")
-                with g3:
-                    raw_cols["sd_treat"] = st.selectbox("실험군 SD", cols, index=min(6, len(cols) - 1), key="r_st")
-                g4, g5, g6 = st.columns(3)
-                with g4:
-                    raw_cols["n_control"] = st.selectbox("대조군 N", cols, index=min(7, len(cols) - 1), key="r_nc")
-                with g5:
-                    raw_cols["mean_control"] = st.selectbox("대조군 Mean", cols, index=min(8, len(cols) - 1), key="r_mc")
-                with g6:
-                    raw_cols["sd_control"] = st.selectbox("대조군 SD", cols, index=min(9, len(cols) - 1), key="r_sc")
+            detected_bits = [f"연구명={guess['study'] or '?'}", f"yi={guess['yi'] or '?'}"]
+            detected_bits.append(f"vi={guess['vi']}" if guess["vi"] else f"CI={guess['ci_lo'] or '?'}/{guess['ci_hi'] or '?'}")
+            if guess["mean_treat"]:
+                detected_bits.append("실험군/대조군 원자료 인식됨")
+            st.caption(f"🔎 자동 인식: {' · '.join(detected_bits)}")
 
-            st.markdown('<div class="section-title" style="margin-top:14px;">종합효과 (R 콘솔/CSV에서 그대로 입력)</div>', unsafe_allow_html=True)
+            with st.expander("열 매핑 확인 / 수정 (자동 인식이 틀렸을 때만 여세요)"):
+                r1, r2 = st.columns(2)
+                with r1:
+                    study_col = st.selectbox("연구명 열", cols, index=_idx(guess["study"], 0), key="r_study")
+                with r2:
+                    yi_col = st.selectbox("효과크기 열 (yi)", cols, index=_idx(guess["yi"], 1), key="r_yi")
+                vi_mode = st.radio("분산 정보", ["분산(vi) 열 사용", "CI 하한/상한 열 사용"], horizontal=True,
+                                  index=0 if guess["vi"] else 1, key="r_vimode")
+                if vi_mode == "분산(vi) 열 사용":
+                    vi_col = st.selectbox("분산 열 (vi)", cols, index=_idx(guess["vi"], 2), key="r_vi")
+                    ci_lo_col = ci_hi_col = None
+                else:
+                    vi_col = None
+                    cA, cB = st.columns(2)
+                    with cA:
+                        ci_lo_col = st.selectbox("CI 하한 열", cols, index=_idx(guess["ci_lo"], 2), key="r_cilo")
+                    with cB:
+                        ci_hi_col = st.selectbox("CI 상한 열", cols, index=_idx(guess["ci_hi"], 3), key="r_cihi")
+
+                has_raw_cols = st.checkbox("실험군/대조군 N·Mean·SD 열도 있음 (Cochrane 스타일 표에 표시)",
+                                           value=bool(guess["mean_treat"]))
+                raw_cols = {}
+                if has_raw_cols:
+                    g1, g2, g3 = st.columns(3)
+                    with g1:
+                        raw_cols["n_treat"] = st.selectbox("실험군 N", cols, index=_idx(guess["n_treat"], 4), key="r_nt")
+                    with g2:
+                        raw_cols["mean_treat"] = st.selectbox("실험군 Mean", cols, index=_idx(guess["mean_treat"], 5), key="r_mt")
+                    with g3:
+                        raw_cols["sd_treat"] = st.selectbox("실험군 SD", cols, index=_idx(guess["sd_treat"], 6), key="r_st")
+                    g4, g5, g6 = st.columns(3)
+                    with g4:
+                        raw_cols["n_control"] = st.selectbox("대조군 N", cols, index=_idx(guess["n_control"], 7), key="r_nc")
+                    with g5:
+                        raw_cols["mean_control"] = st.selectbox("대조군 Mean", cols, index=_idx(guess["mean_control"], 8), key="r_mc")
+                    with g6:
+                        raw_cols["sd_control"] = st.selectbox("대조군 SD", cols, index=_idx(guess["sd_control"], 9), key="r_sc")
+                else:
+                    raw_cols = {}
+
+            # 열 매핑을 안 열어봤어도 자동 인식값으로 동작하도록 기본값 확정
+            study_col = locals().get("study_col") or guess["study"] or cols[0]
+            yi_col = locals().get("yi_col") or guess["yi"] or (cols[1] if len(cols) > 1 else cols[0])
+            vi_mode = locals().get("vi_mode") or ("분산(vi) 열 사용" if guess["vi"] else "CI 하한/상한 열 사용")
+            vi_col = locals().get("vi_col") or guess["vi"]
+            ci_lo_col = locals().get("ci_lo_col") or guess["ci_lo"]
+            ci_hi_col = locals().get("ci_hi_col") or guess["ci_hi"]
+            has_raw_cols = locals().get("has_raw_cols", bool(guess["mean_treat"]))
+            if has_raw_cols and not locals().get("raw_cols"):
+                raw_cols = {k: guess[k] for k in ["n_treat", "mean_treat", "sd_treat", "n_control", "mean_control", "sd_control"]}
+                has_raw_cols = all(raw_cols.values())
+
+            st.markdown('<div class="section-title" style="margin-top:14px;">② 종합효과 — 요약 CSV를 올리면 자동으로 채워집니다</div>', unsafe_allow_html=True)
+            summary_file = st.file_uploader("요약 결과 CSV (선택 — main_res / CRVE 결과 등)", type=["csv", "xlsx", "xls"], key="meta_summary_upload")
+            sg = {"g": 0.0, "ci_lb": 0.0, "ci_ub": 0.0, "tau2": 0.0, "i2": 0.0, "p": 0.0, "pi_lb": 0.0, "pi_ub": 0.0}
+            has_pi_guess = False
+            if summary_file:
+                sdf = pd.read_excel(summary_file) if Path(summary_file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(summary_file)
+                srow = sdf.iloc[0]
+                if guess["outcome"] and guess["outcome"] in sdf.columns and chosen_outcome:
+                    match = sdf[sdf[guess["outcome"]].astype(str) == chosen_outcome]
+                    if not match.empty:
+                        srow = match.iloc[0]
+                scols = list(sdf.columns)
+                sg_map = guess_columns(scols)
+
+                def _val(role, aliases_extra=()):
+                    for alias in list(aliases_extra) + [role]:
+                        for c in scols:
+                            if _normalize_colname(c) == _normalize_colname(alias):
+                                v = pd.to_numeric(srow[c], errors="coerce")
+                                if pd.notna(v):
+                                    return float(v)
+                    return None
+
+                sg["g"] = _val("g", ["crve_g", "beta", "estimate"]) or 0.0
+                sg["ci_lb"] = _val("ci_lb", ["crve_ci_lb", "ci.lb"]) or 0.0
+                sg["ci_ub"] = _val("ci_ub", ["crve_ci_ub", "ci.ub"]) or 0.0
+                tau2_l2 = _val("tau2_l2") or 0.0
+                tau2_l3 = _val("tau2_l3") or 0.0
+                sg["tau2"] = _val("tau2") or (tau2_l2 + tau2_l3) or 0.0
+                sg["i2"] = _val("i2") or _val("i2total") or 0.0
+                sg["p"] = _val("p_value", ["crve_p_value", "pval", "p"]) or 0.0
+                pi_lb_v, pi_ub_v = _val("pi_lb"), _val("pi_ub")
+                if pi_lb_v is not None and pi_ub_v is not None:
+                    sg["pi_lb"], sg["pi_ub"], has_pi_guess = pi_lb_v, pi_ub_v, True
+                st.caption(f"🔎 요약 결과 자동 인식: g={sg['g']:.3f}, CI=[{sg['ci_lb']:.3f}, {sg['ci_ub']:.3f}], I²={sg['i2']:.1f}%")
+
             s1, s2, s3 = st.columns(3)
             with s1:
-                g_val = st.number_input("Pooled g", value=0.0, format="%.4f")
+                g_val = st.number_input("Pooled g", value=sg["g"], format="%.4f")
             with s2:
-                ci_lb_val = st.number_input("95% CI 하한", value=0.0, format="%.4f")
+                ci_lb_val = st.number_input("95% CI 하한", value=sg["ci_lb"], format="%.4f")
             with s3:
-                ci_ub_val = st.number_input("95% CI 상한", value=0.0, format="%.4f")
+                ci_ub_val = st.number_input("95% CI 상한", value=sg["ci_ub"], format="%.4f")
             s4, s5, s6 = st.columns(3)
             with s4:
-                tau2_val = st.number_input("τ² (tau2_L2 + tau2_L3 합)", value=0.0, format="%.4f")
+                tau2_val = st.number_input("τ² (tau2_L2 + tau2_L3 합)", value=sg["tau2"], format="%.4f")
             with s5:
-                i2_val = st.number_input("I² (%)", value=0.0, format="%.2f")
+                i2_val = st.number_input("I² (%)", value=sg["i2"], format="%.2f")
             with s6:
-                p_val = st.number_input("p-value", value=0.0, format="%.5f")
+                p_val = st.number_input("p-value", value=sg["p"], format="%.5f")
             s7, s8 = st.columns(2)
             with s7:
-                pi_lb_val = st.number_input("예측구간(PI) 하한 — 없으면 0", value=0.0, format="%.4f")
+                pi_lb_val = st.number_input("예측구간(PI) 하한 — 없으면 0", value=sg["pi_lb"], format="%.4f")
             with s8:
-                pi_ub_val = st.number_input("예측구간(PI) 상한 — 없으면 0", value=0.0, format="%.4f")
-            has_pi_input = st.checkbox("예측구간(PI) 입력함", value=False)
+                pi_ub_val = st.number_input("예측구간(PI) 상한 — 없으면 0", value=sg["pi_ub"], format="%.4f")
+            has_pi_input = st.checkbox("예측구간(PI) 입력함", value=has_pi_guess)
             title_input = st.text_input("그림 제목", value=chosen_outcome or "Effects of interventions")
 
             if st.button("Forest / Funnel plot 그리기", type="primary", use_container_width=True):
@@ -521,6 +639,7 @@ with tab_meta:
                             summary.pi_lb, summary.pi_ub = pi_lb_val, pi_ub_val
                         egger = eggers_test(sub.assign(se=np.sqrt(sub["vi"])))
                         st.session_state["meta_r_result"] = {"sub": sub, "summary": summary, "egger": egger, "title": title_input}
+                        log_activity("📈", "메타분석 그림 생성", f"{title_input} — g={g_val:.2f}")
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -694,7 +813,7 @@ with tab_meta:
 # ===========================================================================
 # 7. 내보내기
 # ===========================================================================
-with tab_export:
+elif nav == "export":
     hero("내보내기", "제목·초록 스크리닝용 최종 파일을 다운로드합니다.", eyebrow="6 · 내보내기")
     if records.empty:
         empty_state("◈", "내보낼 문헌이 없습니다", "먼저 「📥 가져오기 · 중복 제거」 탭을 진행하세요.")

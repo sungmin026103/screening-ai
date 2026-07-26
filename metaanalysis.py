@@ -457,6 +457,44 @@ def run_meta_analysis(df, study_col, effect_col, ci_low_col, ci_high_col, log_sc
 #    그대로 사용한다. 그래야 R에서 얻은 수치와 100% 동일하게 나온다.
 # ═══════════════════════════════════════════════════════════════════════════
 
+_COLUMN_ALIASES = {
+    "study": ["study", "study_label", "studylabel", "author", "연구명", "paper", "papers", "citation"],
+    "yi": ["yi", "g", "smd", "effect", "effectsize", "hedgesg", "estimate", "효과크기"],
+    "vi": ["vi", "variance", "var"],
+    "se": ["se", "stderr", "standarderror"],
+    "ci_lo": ["ci_lb", "cilb", "lower", "ci_low", "cilow", "lcl", "ci.lb", "95cilower", "하한"],
+    "ci_hi": ["ci_ub", "ciub", "upper", "ci_high", "cihigh", "ucl", "ci.ub", "95ciupper", "상한"],
+    "n_treat": ["n_treat", "ntreat", "n1", "nexperimental", "n_exp", "experimentaln", "실험군n"],
+    "mean_treat": ["mean_treat", "meantreat", "m1", "meanexperimental", "experimentalmean", "실험군평균"],
+    "sd_treat": ["sd_treat", "sdtreat", "sd1", "sdexperimental", "experimentalsd", "실험군sd"],
+    "n_control": ["n_control", "ncontrol", "n2", "controln", "대조군n"],
+    "mean_control": ["mean_control", "meancontrol", "m2", "controlmean", "대조군평균"],
+    "sd_control": ["sd_control", "sdcontrol", "sd2", "controlsd", "대조군sd"],
+    "outcome": ["outcome", "dataset", "measure", "결과지표"],
+    "subgroup": ["subgroup", "intervention_subgroup", "interventionsubgroup", "model_subgroup", "group", "하위그룹"],
+}
+
+
+def _normalize_colname(c: str) -> str:
+    return str(c).strip().lower().replace(" ", "").replace("_", "").replace(".", "")
+
+
+def guess_columns(columns: list[str]) -> dict[str, str | None]:
+    """R/metafor 내보내기에서 흔히 쓰는 열 이름 규칙으로 자동 매핑을 추론한다.
+    반환값은 role -> 실제 열 이름 (못 찾으면 None)."""
+    lookup = {_normalize_colname(c): c for c in columns}
+    guessed: dict[str, str | None] = {}
+    for role, aliases in _COLUMN_ALIASES.items():
+        found = None
+        for alias in aliases:
+            key = _normalize_colname(alias)
+            if key in lookup:
+                found = lookup[key]
+                break
+        guessed[role] = found
+    return guessed
+
+
 @dataclass
 class ForestSummary:
     g: float
