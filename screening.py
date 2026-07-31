@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -28,7 +29,7 @@ class ScreeningResult:
     predictions: pd.DataFrame
     metrics: dict
     threshold: float
-    pr_curve: dict = field(default_factory=dict)   # {"precision": [...], "recall": [...]}
+    pr_curve: dict = field(default_factory=dict)   # {"precision": [...], "recall": [...], "thresholds": [...]}
     roc_curve: dict = field(default_factory=dict)   # {"fpr": [...], "tpr": [...]}
     confusion: dict = field(default_factory=dict)   # {"tn":.., "fp":.., "fn":.., "tp":..}
 
@@ -148,6 +149,58 @@ def _build_pipeline(criteria_text: str = "") -> Pipeline:
     return Pipeline([("features", features), ("model", model)])
 
 
+def _priority_labels(probabilities: np.ndarray, threshold: float, very_low_cutoff: float = 0.005) -> np.ndarray:
+    """확률을 실제 검토 목적에 맞는 3단계로 구분한다."""
+    cutoff = min(float(very_low_cutoff), max(float(threshold) * 0.95, 0.0))
+    return np.select(
+        [probabilities >= threshold, probabilities < cutoff],
+        ["우선 검토", "매우 낮은 확률"],
+        default="후순위 검토",
+    )
+
+
+def apply_recall_target(result: ScreeningResult, target_recall: float, very_low_cutoff: float = 0.005) -> ScreeningResult:
+    """저장된 교차검증 확률을 사용해 재학습 없이 임계값과 화면 분류를 갱신한다."""
+    updated = deepcopy(result)
+    precision = np.asarray(updated.pr_curve.get("precision", []), dtype=float)
+    recall = np.asarray(updated.pr_curve.get("recall", []), dtype=float)
+    thresholds = np.asarray(updated.pr_curve.get("thresholds", []), dtype=float)
+    if len(thresholds) == 0 or len(recall) < 2:
+        return updated
+    valid = np.where(recall[:-1] >= float(target_recall))[0]
+    threshold = float(thresholds[valid[-1]]) if len(valid) else float(thresholds[0])
+    updated.threshold = threshold
+
+    pred_df = updated.predictions.copy()
+    probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
+    pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, very_low_cutoff)
+
+    if {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
+        mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
+        cv_probs = pd.to_numeric(pred_df.loc[mask, "CV_Probability"], errors="coerce").to_numpy()
+        y = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
+        cv_pred = (cv_probs >= threshold).astype(int)
+        pred_df.loc[:, "CV_Prediction"] = np.nan
+        pred_df.loc[mask, "CV_Prediction"] = cv_pred
+        pred_df.loc[:, "False_Negative"] = False
+        pred_df.loc[mask, "False_Negative"] = (y == 1) & (cv_pred == 0)
+        tn, fp, fn, tp = confusion_matrix(y, cv_pred, labels=[0, 1]).ravel()
+        rec = float(recall_score(y, cv_pred, zero_division=0))
+        pre = float(precision_score(y, cv_pred, zero_division=0))
+        updated.confusion = {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+        updated.metrics.update({
+            "recall": rec, "precision": pre,
+            "accuracy": float(accuracy_score(y, cv_pred)),
+            "f1": float(2 * pre * rec / (pre + rec)) if pre + rec > 0 else 0.0,
+        })
+    order = pd.Categorical(pred_df["AI_Recommendation"], ["우선 검토", "후순위 검토", "매우 낮은 확률"], ordered=True)
+    pred_df = pred_df.assign(_priority_order=order).sort_values(
+        ["_priority_order", "AI_Probability"], ascending=[True, False]
+    ).drop(columns="_priority_order").reset_index(drop=True)
+    updated.predictions = pred_df
+    return updated
+
+
 def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_text: str = "") -> ScreeningResult:
     data, _ = prepare_screening_data(df)
     labeled = data[data["Human_Label"].isin([0, 1])].copy()
@@ -191,14 +244,24 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     result_df = df.copy().reset_index(drop=True)
     result_df["AI_Probability"] = all_probs
     result_df["AI_Probability_%"] = (all_probs * 100).round(2)
-    result_df["AI_Recommendation"] = np.where(all_probs >= threshold, "Include candidate", "Low probability")
-    result_df = result_df.sort_values("AI_Probability", ascending=False).reset_index(drop=True)
+    result_df["Human_Label_Normalized"] = data["Human_Label"].to_numpy()
+    result_df["CV_Probability"] = np.nan
+    result_df.loc[labeled.index, "CV_Probability"] = probs
+    result_df["CV_Prediction"] = np.nan
+    result_df.loc[labeled.index, "CV_Prediction"] = pred
+    result_df["False_Negative"] = False
+    result_df.loc[labeled.index, "False_Negative"] = (y == 1) & (pred == 0)
+    result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, 0.005)
+    order = pd.Categorical(result_df["AI_Recommendation"], ["우선 검토", "후순위 검토", "매우 낮은 확률"], ordered=True)
+    result_df = result_df.assign(_priority_order=order).sort_values(
+        ["_priority_order", "AI_Probability"], ascending=[True, False]
+    ).drop(columns="_priority_order").reset_index(drop=True)
 
     return ScreeningResult(
         predictions=result_df,
         metrics=metrics,
         threshold=threshold,
-        pr_curve={"precision": precision.tolist(), "recall": recall.tolist()},
+        pr_curve={"precision": precision.tolist(), "recall": recall.tolist(), "thresholds": thresholds.tolist()},
         roc_curve={"fpr": fpr.tolist(), "tpr": tpr.tolist()},
         confusion={"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
     )

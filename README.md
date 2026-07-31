@@ -1,4 +1,4 @@
-# SR Studio v8.1.0
+# SR Studio v9.0.0
 
 GitHub-ready Streamlit application for systematic-review literature management, AI-assisted screening prioritization, and Python-based visualization of R meta-analysis results.
 
@@ -65,7 +65,7 @@ streamlit run app.py
 Projects are saved under `data/projects/` on the running machine. Streamlit Community Cloud local storage is not guaranteed to persist across redeployments or container restarts. For durable multi-user use, connect a database or cloud object storage.
 
 
-## v8.1.0 UI 및 프로젝트 저장
+## v9.0.0 UI 및 프로젝트 저장
 
 - 첫 화면은 프로젝트 선택 전용 허브로 표시됩니다.
 - 프로젝트를 열기 전에는 작업 메뉴가 나타나지 않습니다.
@@ -77,8 +77,15 @@ Projects are saved under `data/projects/` on the running machine. Streamlit Comm
 > Streamlit Community Cloud의 로컬 파일 저장소는 영구 저장소가 아닙니다. 재배포 또는 서버 초기화에도 보존하려면 외부 DB·스토리지를 연결해야 합니다.
 
 
-## v8.1 변경사항
+## v9.0 변경사항
 - Human_Label의 1/0 및 O/X 자동 인식
 - 복수 검토자 열의 합의 라벨 자동 생성, 불일치 행 제외
 - Forest plot 하단 텍스트·범례 간격 확대
 - Funnel 및 진단 그림의 화면 비율과 여백 최적화
+
+
+## v9.0 updates
+- Three-level AI screening display: priority review, deferred review, and very-low-probability records.
+- Full-row gray shading and optional hiding of low-priority records.
+- Real-time recall threshold adjustment and false-negative review table.
+- Forest-plot axis label spacing, balanced funnel geometry, and non-overlapping influence labels.

@@ -658,8 +658,8 @@ def forest_plot_from_R(
     Y_NOTE = -0.72
     Y_AXIS_BASE = Y_SEP2 - 0.35
     Y_TICKNUM = Y_AXIS_BASE - 0.30
-    Y_SUBTITLE = Y_AXIS_BASE - 0.78
-    Y_MIN = -2.65
+    Y_SUBTITLE = Y_AXIS_BASE - 1.28
+    Y_MIN = -3.20
     Y_MAX = Y_TITLE + 0.35
 
     ax = fig.add_axes([0, 0, 1, 1])
@@ -779,11 +779,14 @@ def forest_plot_from_R(
 
 def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerResult | None = None,
                        title: str = "Funnel Plot") -> "plt.Figure":
-    yi = sub["yi"].to_numpy()
-    se = np.sqrt(sub["vi"].to_numpy()) if "se" not in sub.columns else sub["se"].to_numpy()
-    max_se = float(se.max()) * 1.15 if len(se) else 1.0
-    se_seq = np.linspace(0.0001, max_se, 200)
-    k = len(sub)
+    yi = pd.to_numeric(sub["yi"], errors="coerce").to_numpy()
+    se = (np.sqrt(pd.to_numeric(sub["vi"], errors="coerce").to_numpy())
+          if "se" not in sub.columns else pd.to_numeric(sub["se"], errors="coerce").to_numpy())
+    keep = np.isfinite(yi) & np.isfinite(se) & (se >= 0)
+    yi, se = yi[keep], se[keep]
+    max_se = float(se.max()) * 1.12 if len(se) else 1.0
+    se_seq = np.linspace(0.0001, max_se, 240)
+    k = len(yi)
 
     p_txt = "N/A"
     has_egger_line = False
@@ -791,28 +794,34 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
         p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
         has_egger_line = True
 
-    fig, ax = plt.subplots(figsize=(7.6, 6.4), dpi=100)
+    fig, ax = plt.subplots(figsize=(8.2, 7.2), dpi=100)
     ax.fill_betweenx(se_seq, summary.g - 1.96 * se_seq, summary.g + 1.96 * se_seq,
-                     color=C_POOL, alpha=0.10, label="95% pseudo-CI")
+                     color=C_POOL, alpha=0.10, label="95% pseudo-CI", zorder=1)
     ax.fill_betweenx(se_seq, summary.g - 1.645 * se_seq, summary.g + 1.645 * se_seq,
-                     color=C_POOL, alpha=0.20, label="90% pseudo-CI")
-    ax.axvline(summary.g, color=C_POOL, lw=1.3)
+                     color=C_POOL, alpha=0.20, label="90% pseudo-CI", zorder=2)
+    ax.axvline(summary.g, color=C_POOL, lw=1.3, zorder=3)
 
     if has_egger_line and len(se) >= 2 and np.ptp(se) > 1e-9:
         slope, intercept = np.polyfit(se, yi, 1)
         ax.plot(intercept + slope * se_seq, se_seq, color=C_EGGER, ls="--", lw=1.7,
-               label=f"Egger line ($p$ {p_txt})", zorder=3)
+                label=f"Egger line ($p$ {p_txt})", zorder=4)
 
-    ax.scatter(yi, se, s=64, color=C_NORM, edgecolor="white", linewidth=0.9, zorder=4, label="Individual study")
-    ax.invert_yaxis()
-    ax.set_xlabel("Standardized Mean Difference")
-    ax.set_ylabel("Standard Error")
-    ax.set_title(f"Funnel plot — {title}", fontsize=13, loc="left", fontweight="bold")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9, frameon=True, borderaxespad=0.0)
+    ax.scatter(yi, se, s=58, color=C_NORM, edgecolor="white", linewidth=0.9,
+               zorder=5, label="Individual study")
+    half_range = max(1.96 * max_se, float(np.max(np.abs(yi - summary.g))) * 1.12 if len(yi) else 1.0, 0.5)
+    ax.set_xlim(summary.g - half_range, summary.g + half_range)
+    ax.set_ylim(max_se, 0)
+    ax.set_box_aspect(1.0)
+    ax.set_xlabel("Standardized Mean Difference", labelpad=12)
+    ax.set_ylabel("Standard Error", labelpad=10)
+    ax.set_title(f"Funnel plot — {title}", fontsize=13, loc="left", fontweight="bold", pad=14)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncol=2, fontsize=9, frameon=True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.text(0.02, 0.01, f"k = {k} effect sizes   |   Egger $p$ {p_txt}", fontsize=9.5, color="#555555")
-    fig.subplots_adjust(left=0.13, right=0.76, bottom=0.14, top=0.90)
+    ax.grid(axis="both", color="#E7E9EE", linewidth=0.6, alpha=0.7)
+    fig.text(0.5, 0.035, f"k = {k} effect sizes   |   Egger $p$ {p_txt}",
+             fontsize=9.5, color="#555555", ha="center")
+    fig.subplots_adjust(left=0.14, right=0.96, bottom=0.30, top=0.88)
     return fig
 
 
@@ -993,8 +1002,7 @@ def trim_fill_plot(tf_result: dict, title: str = "Trim-and-fill sensitivity") ->
 
 def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col: str = "study",
                    title: str = "Influence diagnostics") -> "plt.Figure":
-    """Cook's Distance / DFFITS 근사치 — leave-one-out 재적합 기반.
-    임계값은 R metafor의 공식과 완전히 같지 않은 참고용 근사(평균+2SD, 2*sqrt(1/k))이다."""
+    """Cook's Distance / DFFITS 근사치 — leave-one-out 재적합 기반."""
     loo = leave_one_out(effect_df, cluster_col)
     k = len(loo)
     dffits = (pooled.beta - loo["g"].to_numpy()) / pooled.se
@@ -1004,31 +1012,42 @@ def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col:
     infl_cook = cooks > thr_cook
     infl_dffits = np.abs(dffits) > thr_dffits
 
-    studies = loo["study"].to_numpy()
-    y = np.arange(k, 0, -1)
-    fig, axes = plt.subplots(1, 2, figsize=(10.2, max(3.2, 0.34 * k + 1.3)), dpi=100)
+    def short_label(value: str, max_len: int = 38) -> str:
+        value = " ".join(str(value).split())
+        return value if len(value) <= max_len else value[:max_len - 1] + "…"
 
-    axes[0].barh(y, cooks, color=[C_PI if f else C_NORM for f in infl_cook])
+    studies = [short_label(v) for v in loo["study"].astype(str)]
+    y = np.arange(k)
+    fig_h = max(4.2, 0.43 * max(k, 1) + 2.0)
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, fig_h), dpi=100, sharey=True,
+                             gridspec_kw={"width_ratios": [1, 1]})
+
+    axes[0].barh(y, cooks, height=0.62, color=[C_PI if f else C_NORM for f in infl_cook])
     axes[0].axvline(thr_cook, color=C_PI, ls="--", lw=1.3)
     axes[0].set_yticks(y)
-    axes[0].set_yticklabels(studies)
-    axes[0].set_xlabel(f"Cook's Distance (approx.)\nThreshold = {thr_cook:.3f}", fontsize=9.5)
-    axes[0].set_title("A", loc="left", fontweight="bold", fontsize=13)
-    axes[0].spines["top"].set_visible(False)
-    axes[0].spines["right"].set_visible(False)
+    axes[0].set_yticklabels(studies, fontsize=8.6)
+    axes[0].invert_yaxis()
+    axes[0].set_xlabel(f"Cook's Distance (approx.)\nThreshold = {thr_cook:.3f}", fontsize=9.5, labelpad=9)
+    axes[0].set_title("A  Cook's Distance", loc="left", fontweight="bold", fontsize=12, pad=10)
 
-    axes[1].barh(y, dffits, color=[C_PI if f else C_NORM for f in infl_dffits])
+    axes[1].barh(y, dffits, height=0.62, color=[C_PI if f else C_NORM for f in infl_dffits])
     axes[1].axvline(thr_dffits, color=C_PI, ls="--", lw=1.3)
     axes[1].axvline(-thr_dffits, color=C_PI, ls="--", lw=1.3)
     axes[1].set_yticks(y)
-    axes[1].set_yticklabels([])
-    axes[1].set_xlabel(f"DFFITS (approx.)\nThreshold = \u00b1{thr_dffits:.3f}", fontsize=9.5)
-    axes[1].set_title("B", loc="left", fontweight="bold", fontsize=13)
-    axes[1].spines["top"].set_visible(False)
-    axes[1].spines["right"].set_visible(False)
+    axes[1].tick_params(axis="y", labelleft=False)
+    axes[1].set_xlabel(f"DFFITS (approx.)\nThreshold = ±{thr_dffits:.3f}", fontsize=9.5, labelpad=9)
+    axes[1].set_title("B  DFFITS", loc="left", fontweight="bold", fontsize=12, pad=10)
 
-    fig.suptitle(f"Influence diagnostics — {title}", fontsize=13, fontweight="bold", x=0.02, ha="left")
+    for ax in axes:
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="x", color="#E7E9EE", linewidth=0.6, alpha=0.8)
+        ax.set_axisbelow(True)
+
+    fig.suptitle(f"Influence diagnostics — {title}", fontsize=13, fontweight="bold", x=0.04, ha="left")
     handles = [Patch(color=C_NORM, label="Non-influential"), Patch(color=C_PI, label="Influential")]
-    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=True, bbox_to_anchor=(0.5, -0.02))
-    fig.subplots_adjust(left=0.22, right=0.97, bottom=0.18, top=0.86, wspace=0.22)
+    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=True, bbox_to_anchor=(0.5, 0.015))
+    max_chars = max([len(x) for x in studies], default=10)
+    left_margin = min(0.34, max(0.18, 0.012 * max_chars + 0.05))
+    fig.subplots_adjust(left=left_margin, right=0.98, bottom=0.18, top=0.86, wspace=0.20)
     return fig

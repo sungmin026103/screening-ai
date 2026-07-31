@@ -22,7 +22,7 @@ from projects import (
     rename_project, save_pico, save_records, project_progress,
     load_project_state, save_project_state, touch_project,
 )
-from screening import train_and_predict
+from screening import train_and_predict, apply_recall_target
 from styles import apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar
 from utils import dataframe_to_excel_bytes
 
@@ -262,7 +262,7 @@ if nav == "dashboard":
         result = st.session_state.get("screening_result")
         collected = stats.get("before", len(records))
         coverage = records["abstract"].astype(str).str.len().gt(0).mean() * 100 if not records.empty else 0
-        include_n = int((result.predictions["AI_Recommendation"] == "Include candidate").sum()) if result else None
+        include_n = int((result.predictions["AI_Recommendation"] == "우선 검토").sum()) if result else None
         screen_progress = (result.metrics["labeled_n"] / len(records) * 100) if result and len(records) else 0
 
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -495,12 +495,34 @@ elif nav == "screen":
                     result = train_and_predict(df, target_recall, criteria_text=criteria_text)
                 st.session_state["screening_result"] = result
                 save_project_state(active, "screening_result", result)
-                log_activity("🤖", "AI 스크리닝 완료", f"재현율 {result.metrics['recall']*100:.1f}%, Include 후보 {int((result.predictions['AI_Recommendation']=='Include candidate').sum()):,}건")
+                log_activity("🤖", "AI 스크리닝 완료", f"재현율 {result.metrics['recall']*100:.1f}%, Include 후보 {int((result.predictions['AI_Recommendation']=='우선 검토').sum()):,}건")
             except Exception as exc:
                 st.error(str(exc))
 
     result = st.session_state.get("screening_result")
     if result:
+        st.markdown('<div class="section-title" style="margin-top:18px;">검토 기준 조정</div>', unsafe_allow_html=True)
+        rc1, rc2 = st.columns([2, 1])
+        with rc1:
+            display_recall = st.slider(
+                "적용할 목표 재현율", 0.90, 0.995,
+                float(st.session_state.get("screening_target_recall", max(0.90, min(0.995, result.metrics.get("recall", 0.95))))),
+                0.005, format="%.1f%%",
+                help="슬라이더를 높이면 놓치는 Include 문헌은 줄지만 우선 검토 문헌 수는 늘어납니다.",
+                key="screening_recall_adjust",
+            )
+        with rc2:
+            very_low_cutoff = st.number_input(
+                "매우 낮은 확률 기준", min_value=0.0001, max_value=0.05, value=0.005, step=0.0005, format="%.4f",
+                help="이 값 미만은 진한 회색으로 표시합니다.",
+            )
+        adjusted = apply_recall_target(result, display_recall, very_low_cutoff)
+        st.session_state["screening_target_recall"] = display_recall
+        if adjusted.threshold != result.threshold or not adjusted.predictions.equals(result.predictions):
+            result = adjusted
+            st.session_state["screening_result"] = result
+            save_project_state(active, "screening_result", result)
+
         st.markdown('<div class="section-title" style="margin-top:18px;">모델 성능</div>', unsafe_allow_html=True)
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -519,11 +541,12 @@ elif nav == "screen":
                                xaxis_title="Include 확률", yaxis_title="문헌 수")
             st.plotly_chart(fig, use_container_width=True)
         with row1b:
-            include_n = int((result.predictions["AI_Recommendation"] == "Include candidate").sum())
-            low_n = len(result.predictions) - include_n
-            donut_df = pd.DataFrame({"구분": ["Include 후보", "낮은 확률"], "건수": [include_n, low_n]})
+            include_n = int((result.predictions["AI_Recommendation"] == "우선 검토").sum())
+            deferred_n = int((result.predictions["AI_Recommendation"] == "후순위 검토").sum())
+            very_low_n = int((result.predictions["AI_Recommendation"] == "매우 낮은 확률").sum())
+            donut_df = pd.DataFrame({"구분": ["우선 검토", "후순위 검토", "매우 낮은 확률"], "건수": [include_n, deferred_n, very_low_n]})
             fig2 = px.pie(donut_df, names="구분", values="건수", hole=0.62, color="구분",
-                          color_discrete_map={"Include 후보": "#2F8F6E", "낮은 확률": "#D95F4B"})
+                          color_discrete_map={"우선 검토": "#2F8F6E", "후순위 검토": "#C8CDD5", "매우 낮은 확률": "#747B86"})
             fig2.update_layout(title=dict(text="AI 판정 구성", y=0.96), margin=dict(l=10, r=10, t=55, b=60), height=340,
                                legend=dict(orientation="h", yanchor="bottom", y=-0.2))
             fig2.update_traces(textinfo="value+percent")
@@ -547,9 +570,43 @@ elif nav == "screen":
             fig4.update_layout(title=dict(text="혼동행렬 (임계값 기준)", y=0.96), margin=dict(l=10, r=10, t=55, b=45), height=340)
             st.plotly_chart(fig4, use_container_width=True)
 
-        st.warning("AI의 낮은 확률 결과는 배제 검토 우선순위를 정하는 보조 신호입니다. 최종 배제는 연구자가 제목·초록을 확인한 뒤 결정하세요.")
-        st.markdown('<div class="section-title">AI 순위 결과</div>', unsafe_allow_html=True)
-        st.dataframe(result.predictions.head(200), use_container_width=True, height=420)
+        counts = result.predictions["AI_Recommendation"].value_counts()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("우선 검토", f"{int(counts.get('우선 검토', 0)):,}편")
+        c2.metric("후순위 검토", f"{int(counts.get('후순위 검토', 0)):,}편")
+        c3.metric("매우 낮은 확률", f"{int(counts.get('매우 낮은 확률', 0)):,}편")
+        saved_n = int(counts.get("매우 낮은 확률", 0))
+        st.info(f"매우 낮은 확률 문헌 {saved_n:,}편은 진한 회색으로 구분되며, 기본적으로 가장 아래에 정렬됩니다.")
+
+        tab_ranked, tab_fn = st.tabs(["우선순위 결과", f"False Negative 검토 ({result.confusion.get('fn', 0)}편)"])
+        with tab_ranked:
+            hide_very_low = st.checkbox("매우 낮은 확률 문헌 숨기기", value=False)
+            hide_deferred = st.checkbox("후순위 검토 문헌도 숨기기", value=False)
+            shown = result.predictions.copy()
+            if hide_very_low:
+                shown = shown[shown["AI_Recommendation"] != "매우 낮은 확률"]
+            if hide_deferred:
+                shown = shown[shown["AI_Recommendation"] == "우선 검토"]
+
+            def _shade_priority(row):
+                status = row.get("AI_Recommendation", "")
+                if status == "매우 낮은 확률":
+                    return ["background-color: #B8BDC6; color: #111827"] * len(row)
+                if status == "후순위 검토":
+                    return ["background-color: #EEF0F3; color: #111827"] * len(row)
+                return ["background-color: #FFFFFF; color: #111827"] * len(row)
+
+            st.markdown('<div class="section-title">AI 순위 결과</div>', unsafe_allow_html=True)
+            st.dataframe(shown.head(1000).style.apply(_shade_priority, axis=1), use_container_width=True, height=520)
+
+        with tab_fn:
+            fn_df = result.predictions[result.predictions.get("False_Negative", False) == True].copy()
+            if fn_df.empty:
+                st.success("현재 검증 데이터에서 False Negative가 없습니다.")
+            else:
+                st.caption("실제 Include였지만 교차검증에서 임계값 아래로 예측된 문헌입니다. 모델 개선용으로 먼저 확인하세요.")
+                st.dataframe(fn_df.style.apply(lambda row: ["background-color: #F7D6D2"] * len(row), axis=1), use_container_width=True, height=360)
+
         st.download_button(
             "AI 순위 결과 다운로드 (AI_Screening_Ranked.xlsx)", dataframe_to_excel_bytes(result.predictions),
             "AI_Screening_Ranked.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
