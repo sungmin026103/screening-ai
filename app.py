@@ -17,7 +17,11 @@ from metaanalysis import (
     _normalize_colname,
     leave_one_out_plot, baujat_plot, gosh_plot, trim_and_fill, trim_fill_plot, influence_plot,
 )
-from projects import create_project, list_projects, load_pico, load_records, save_pico, save_records
+from projects import (
+    create_project, delete_project, list_projects, load_pico, load_records,
+    rename_project, save_pico, save_records, project_progress,
+    load_project_state, save_project_state, touch_project,
+)
 from screening import train_and_predict
 from styles import apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar
 from utils import dataframe_to_excel_bytes
@@ -26,8 +30,7 @@ st.set_page_config(page_title="SR Studio · 문헌 스크리닝 워크스페이�
 apply_styles()
 
 if "active_project" not in st.session_state:
-    projects = list_projects()
-    st.session_state.active_project = projects[0]["slug"] if projects else None
+    st.session_state.active_project = None
 if "records" not in st.session_state:
     st.session_state.records = pd.DataFrame()
 if "pico" not in st.session_state:
@@ -36,13 +39,44 @@ if "activity_log" not in st.session_state:
     st.session_state.activity_log = []
 
 
+PROJECT_SCOPED_STATE_KEYS = [
+    "screening_result", "import_stats", "meta_raw", "meta_result", "meta_r_result",
+]
+
+
+def reset_project_session() -> None:
+    """프로젝트 간 결과가 섞이지 않도록 프로젝트 종속 세션 상태를 초기화한다."""
+    for key in PROJECT_SCOPED_STATE_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state.records = pd.DataFrame()
+    st.session_state.pico = {}
+    st.session_state.activity_log = []
+
+
+def activate_project(slug: str | None) -> None:
+    reset_project_session()
+    st.session_state.active_project = slug
+    st.session_state.nav = "dashboard" if slug else "projects"
+    if slug:
+        st.session_state.records = load_records(slug)
+        st.session_state.pico = load_pico(slug)
+        st.session_state.activity_log = load_project_state(slug, "activity_log", [])
+        for key in PROJECT_SCOPED_STATE_KEYS:
+            value = load_project_state(slug, key)
+            if value is not None:
+                st.session_state[key] = value
+        touch_project(slug)
+
+
 def log_activity(icon: str, title: str, detail: str = "") -> None:
     import datetime
     st.session_state.activity_log.insert(0, {
         "icon": icon, "title": title, "detail": detail,
-        "time": datetime.datetime.now().strftime("%H:%M"),
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
-    st.session_state.activity_log = st.session_state.activity_log[:6]
+    st.session_state.activity_log = st.session_state.activity_log[:20]
+    if st.session_state.get("active_project"):
+        save_project_state(st.session_state.active_project, "activity_log", st.session_state.activity_log)
 
 
 def _detect_raw_meta_columns(cols: list[str]) -> dict:
@@ -89,61 +123,114 @@ def _detect_raw_meta_columns(cols: list[str]) -> dict:
     return role
 
 # ---------------------------------------------------------------------------
-# 사이드바 : 내비게이션 + 프로젝트
+# 프로젝트 허브 / 프로젝트 내부 내비게이션
 # ---------------------------------------------------------------------------
 NAV_ITEMS = [
-    ("dashboard", "🏠", "대시보드"),
-    ("import", "📥", "가져오기 · 중복 제거"),
-    ("pico", "🧬", "PICO 설정"),
-    ("screen", "🤖", "AI 스크리닝"),
-    ("analytics", "📊", "문헌 분석"),
-    ("meta", "📈", "메타분석"),
-    ("export", "📤", "내보내기"),
+    ("dashboard", "프로젝트 개요"),
+    ("import", "문헌 가져오기 · 중복 제거"),
+    ("pico", "PICO 설정"),
+    ("screen", "AI 스크리닝"),
+    ("analytics", "문헌 분석"),
+    ("meta", "메타분석 Figure"),
+    ("export", "내보내기"),
 ]
 if "nav" not in st.session_state:
-    st.session_state.nav = "dashboard"
+    st.session_state.nav = "projects"
 
-with st.sidebar:
+# 프로젝트를 열기 전에는 일반 사이트처럼 프로젝트 선택 화면만 표시
+if not st.session_state.active_project:
     st.markdown(
-        '<div class="brandbar"><span class="mark">◈ SR Studio</span></div>'
-        '<div style="margin-top:-10px;margin-bottom:10px;color:#8B93B8;font-size:.82rem;">문헌 스크리닝 워크스페이스</div>',
+        '<div class="hub-head"><h1>SR Studio</h1>'
+        '<p>Systematic Review &amp; Meta-analysis</p></div>',
         unsafe_allow_html=True,
     )
-    for key, icon, label in NAV_ITEMS:
+    st.markdown('<div class="section-title">프로젝트를 선택하세요.</div>', unsafe_allow_html=True)
+    c_new, c_open = st.columns(2)
+    with c_new:
+        with st.container(border=True):
+            st.markdown("### 새 프로젝트")
+            st.caption("새로운 체계적 문헌고찰 프로젝트를 시작합니다.")
+            new_name = st.text_input("프로젝트 이름", placeholder="예: 우주 영양 SR", key="hub_new_name")
+            if st.button("새 프로젝트 만들기", type="primary", use_container_width=True, key="hub_create"):
+                try:
+                    p = create_project(new_name)
+                    activate_project(p["slug"])
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+    with c_open:
+        with st.container(border=True):
+            st.markdown("### 프로젝트 열기")
+            st.caption("저장된 프로젝트를 선택해 이어서 작업합니다.")
+            projects = list_projects()
+            if projects:
+                choice = st.selectbox("저장된 프로젝트", projects, format_func=lambda x: x["name"], key="hub_open_select")
+                if st.button("프로젝트 열기", use_container_width=True, key="hub_open"):
+                    activate_project(choice["slug"])
+                    st.rerun()
+            else:
+                st.info("저장된 프로젝트가 없습니다.")
+
+    projects = list_projects()
+    if projects:
+        st.markdown('<div class="section-title" style="margin-top:30px;">최근 프로젝트</div>', unsafe_allow_html=True)
+        st.caption("최근 수정된 순서입니다. 프로젝트를 열면 저장된 문헌, PICO, AI 결과와 작업 상태가 복원됩니다.")
+        for p in projects[:8]:
+            prog = project_progress(p["slug"])
+            col_info, col_btn = st.columns([5, 1])
+            with col_info:
+                updated = str(p.get("updated_at", "")).replace("T", " ")[:16] or "기록 없음"
+                st.markdown(
+                    f'<div class="project-card"><div class="name">{p["name"]}</div>'
+                    f'<div class="meta">진행률 {prog["percent"]}% · 마지막 작업 {updated}</div>'
+                    f'<div class="progress-shell"><div class="progress-fill" style="width:{prog["percent"]}%"></div></div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_btn:
+                st.write("")
+                if st.button("열기", key=f"recent_{p['slug']}", use_container_width=True):
+                    activate_project(p["slug"])
+                    st.rerun()
+    st.markdown('<div class="hub-note">Version 8.0 · 프로젝트는 작업 시 자동 저장됩니다.</div>', unsafe_allow_html=True)
+    st.stop()
+
+with st.sidebar:
+    st.markdown('<div class="brandbar"><span class="mark">SR Studio</span></div>', unsafe_allow_html=True)
+    projects = list_projects()
+    active_meta = next((p for p in projects if p["slug"] == st.session_state.active_project), None)
+    st.caption(active_meta["name"] if active_meta else "프로젝트")
+    if st.button("← 프로젝트 목록", use_container_width=True, key="back_projects"):
+        activate_project(None)
+        st.rerun()
+    st.divider()
+    for key, label in NAV_ITEMS:
         is_active = st.session_state.nav == key
-        if st.button(f"{icon}  {label}", key=f"nav_{key}", use_container_width=True,
-                    type="primary" if is_active else "secondary"):
+        if st.button(label, key=f"nav_{key}", use_container_width=True,
+                     type="primary" if is_active else "secondary"):
             st.session_state.nav = key
             st.rerun()
 
     st.divider()
-    st.markdown("###### 프로젝트")
-    projects = list_projects()
-    if projects:
-        for p in projects:
-            is_active_proj = p["slug"] == st.session_state.active_project
-            label = f"{'● ' if is_active_proj else '○ '}{p['name']}"
-            if st.button(label, key=f"proj_{p['slug']}", use_container_width=True,
-                        type="primary" if is_active_proj else "secondary"):
-                if not is_active_proj:
-                    st.session_state.active_project = p["slug"]
-                    st.session_state.records = load_records(p["slug"])
-                    st.session_state.pico = load_pico(p["slug"])
+    if active_meta:
+        with st.expander("프로젝트 관리"):
+            renamed = st.text_input("프로젝트 이름", value=active_meta["name"], key=f"rename_{active_meta['slug']}")
+            if st.button("이름 변경", use_container_width=True, key=f"rename_btn_{active_meta['slug']}"):
+                try:
+                    updated = rename_project(active_meta["slug"], renamed)
+                    activate_project(updated["slug"])
                     st.rerun()
-            st.caption(p.get("created_at", "")[:10])
-    else:
-        st.caption("아직 프로젝트가 없습니다.")
-    with st.expander("＋ 새 프로젝트 만들기"):
-        new_name = st.text_input("프로젝트 이름", placeholder="예: 우주 영양 SR", label_visibility="collapsed")
-        if st.button("만들기", use_container_width=True, type="primary", key="create_project_btn"):
-            if new_name.strip():
-                p = create_project(new_name)
-                st.session_state.active_project = p["slug"]
-                st.session_state.records = pd.DataFrame()
-                st.session_state.pico = load_pico(p["slug"])
-                st.rerun()
-    st.divider()
-    st.caption("프로젝트 데이터는 이 앱이 켜져 있는 서버에 저장됩니다. Streamlit Community Cloud는 재배포 시 저장된 파일이 초기화될 수 있습니다.")
+                except Exception as exc:
+                    st.error(str(exc))
+            confirm_delete = st.checkbox("프로젝트와 저장 데이터를 삭제합니다.", key=f"delete_confirm_{active_meta['slug']}")
+            if st.button("프로젝트 삭제", use_container_width=True, disabled=not confirm_delete,
+                         key=f"delete_btn_{active_meta['slug']}"):
+                try:
+                    delete_project(active_meta["slug"])
+                    activate_project(None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+    st.caption("작업 내용은 프로젝트별로 자동 저장됩니다. Community Cloud 재배포 시 서버 저장 파일은 초기화될 수 있습니다.")
 
 active = st.session_state.active_project
 if active and st.session_state.records.empty:
@@ -154,7 +241,8 @@ records = st.session_state.records
 pico = st.session_state.pico
 nav = st.session_state.nav
 
-topbar(active or "프로젝트 없음")
+active_meta = next((p for p in list_projects() if p["slug"] == active), None)
+topbar(active_meta["name"] if active_meta else active)
 
 
 # ===========================================================================
@@ -386,7 +474,7 @@ elif nav == "pico":
 # 4. AI 스크리닝
 # ===========================================================================
 elif nav == "screen":
-    hero("AI 스크리닝", "사람의 Include/Exclude 판정과 PICO 기준을 함께 학습해 전체 문헌의 포함 확률 순위를 매깁니다.", eyebrow="AI 스크리닝")
+    hero("AI 스크리닝", "사람의 판정을 학습해 확실한 배제 후보를 뒤로 보내고, 검토가 필요한 문헌을 우선 확인하도록 순위를 매깁니다.", eyebrow="AI 스크리닝")
     criteria_text = " ".join(v for v in [pico.get("population", ""), pico.get("intervention", ""),
                                           pico.get("comparator", ""), pico.get("outcome", ""),
                                           pico.get("exclusion_criteria", "")] if v).strip()
@@ -397,7 +485,7 @@ elif nav == "screen":
 
     st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label(1=Include, 0=Exclude)을 일부 채워서 올려주세요.")
     file = st.file_uploader("라벨링된 스크리닝 파일 업로드", type=["xlsx", "xls", "csv"])
-    target_recall = st.slider("목표 재현율 (Recall)", 0.80, 0.99, 0.95, 0.01, help="이 값 이상으로 실제 Include 문헌을 놓치지 않도록 임계값을 설정합니다.")
+    target_recall = st.slider("목표 재현율 (Recall)", 0.80, 0.99, 0.95, 0.01, help="교차검증 데이터에서 Include 문헌을 보존하도록 임계값을 설정합니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.")
     if file:
         df = pd.read_excel(file) if Path(file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(file)
         st.dataframe(df.head(20), use_container_width=True)
@@ -406,6 +494,7 @@ elif nav == "screen":
                 with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
                     result = train_and_predict(df, target_recall, criteria_text=criteria_text)
                 st.session_state["screening_result"] = result
+                save_project_state(active, "screening_result", result)
                 log_activity("🤖", "AI 스크리닝 완료", f"재현율 {result.metrics['recall']*100:.1f}%, Include 후보 {int((result.predictions['AI_Recommendation']=='Include candidate').sum()):,}건")
             except Exception as exc:
                 st.error(str(exc))
@@ -458,6 +547,7 @@ elif nav == "screen":
             fig4.update_layout(title=dict(text="혼동행렬 (임계값 기준)", y=0.96), margin=dict(l=10, r=10, t=55, b=45), height=340)
             st.plotly_chart(fig4, use_container_width=True)
 
+        st.warning("AI의 낮은 확률 결과는 배제 검토 우선순위를 정하는 보조 신호입니다. 최종 배제는 연구자가 제목·초록을 확인한 뒤 결정하세요.")
         st.markdown('<div class="section-title">AI 순위 결과</div>', unsafe_allow_html=True)
         st.dataframe(result.predictions.head(200), use_container_width=True, height=420)
         st.download_button(
@@ -500,14 +590,14 @@ elif nav == "analytics":
 elif nav == "meta":
     hero(
         "메타분석 시각화",
-        "엑셀/CSV를 올리면 열을 자동으로 인식해서 바로 Forest/Funnel plot을 그립니다. "
-        "원자료(평균·SD·N)든, R에서 계산한 효과크기(yi/vi 또는 CI)든 파일 형태를 보고 알아서 처리합니다.",
+        "R에서 계산한 연구별 효과크기와 통계 결과를 불러와 Forest/Funnel plot을 Python으로 정리합니다. "
+        "논문 최종 통계는 R 결과를 기준으로 하고, 이 탭은 Figure 확인과 시각적 다듬기에 사용하세요.",
         eyebrow="메타분석",
     )
     meta_file = st.file_uploader("데이터 업로드 (Excel/CSV)", type=["xlsx", "xls", "csv"], key="meta_upload_unified")
 
     if not meta_file:
-        empty_state("📈", "파일을 업로드하면 바로 그려드립니다", "연구별 평균·SD·N이 있는 원자료든, R에서 계산한 효과크기(yi/vi, CI) 결과든 상관없이 업로드만 하면 됩니다.")
+        empty_state("📈", "R 결과 파일을 업로드하세요", "R에서 산출한 연구별 효과크기(yi/vi 또는 95% CI) 결과를 권장합니다. Python은 Figure 확인과 시각적 정리에 사용합니다.")
     else:
         meta_df = pd.read_excel(meta_file) if Path(meta_file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(meta_file)
         cols = list(meta_df.columns)
@@ -639,6 +729,8 @@ elif nav == "meta":
                 egger_p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
                 st.caption(f"k={pooled.k} · Hedges' g={pooled.beta:.3f} [{pooled.ci[0]:.3f}, {pooled.ci[1]:.3f}] · I²={pooled.i2:.1f}% · Egger's test p={egger_p_txt}")
             st.session_state["meta_raw"] = {"done": True}
+            save_project_state(active, "meta_raw", st.session_state["meta_raw"])
+            save_project_state(active, "meta_done", True)
             log_activity("📈", "메타분석 그림 생성", f"{title} — g={pooled.beta:.2f}")
 
             st.markdown('<div class="section-title" style="margin-top:22px;">고급 진단 그림</div>', unsafe_allow_html=True)

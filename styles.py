@@ -160,6 +160,20 @@ div[data-testid="stMetric"] { background:var(--surface); border:1px solid var(--
     .hero-visual { max-width: 220px; }
     .funnel-wrap { flex-direction:column; align-items:flex-start; }
 }
+
+/* ---------- 프로젝트 허브 ---------- */
+.hub-head { text-align:center; padding:58px 0 24px; }
+.hub-head h1 { font-family:'Noto Serif KR',serif; font-size:2.35rem; margin:0 0 8px; color:var(--ink); }
+.hub-head p { color:var(--slate); margin:0; font-size:1rem; }
+.hub-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; margin:18px 0 34px; }
+.project-card { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:18px 20px; margin-bottom:10px; }
+.project-card .name { font-weight:700; font-size:1rem; color:var(--ink); }
+.project-card .meta { color:var(--slate); font-size:.78rem; margin-top:4px; }
+.progress-shell { height:7px; border-radius:999px; background:#ECEEF4; overflow:hidden; margin-top:12px; }
+.progress-fill { height:100%; background:var(--ink); border-radius:999px; }
+.hub-note { text-align:center; color:var(--slate); font-size:.78rem; margin-top:32px; }
+@media (max-width: 760px) { .hub-grid { grid-template-columns:1fr; } .hub-head { padding-top:30px; } }
+
 </style>
 """
 
@@ -199,7 +213,21 @@ def hero_visual() -> str:
         @keyframes hvPulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
         .hv-badge { animation: hvPop 3.4s ease-in-out infinite; transform-origin: 292px 128px; }
         @keyframes hvPop { 0%,78%,100% { transform: scale(1); } 88% { transform: scale(1.16); } }
-      </style>
+      
+/* ---------- 프로젝트 허브 ---------- */
+.hub-head { text-align:center; padding:58px 0 24px; }
+.hub-head h1 { font-family:'Noto Serif KR',serif; font-size:2.35rem; margin:0 0 8px; color:var(--ink); }
+.hub-head p { color:var(--slate); margin:0; font-size:1rem; }
+.hub-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; margin:18px 0 34px; }
+.project-card { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:18px 20px; margin-bottom:10px; }
+.project-card .name { font-weight:700; font-size:1rem; color:var(--ink); }
+.project-card .meta { color:var(--slate); font-size:.78rem; margin-top:4px; }
+.progress-shell { height:7px; border-radius:999px; background:#ECEEF4; overflow:hidden; margin-top:12px; }
+.progress-fill { height:100%; background:var(--ink); border-radius:999px; }
+.hub-note { text-align:center; color:var(--slate); font-size:.78rem; margin-top:32px; }
+@media (max-width: 760px) { .hub-grid { grid-template-columns:1fr; } .hub-head { padding-top:30px; } }
+
+</style>
       <g class="hv-doc">
         <rect x="14" y="44" width="56" height="70" rx="8" fill="#FFFFFF" stroke="#C9CFE0" stroke-width="1.5"/>
         <line x1="24" y1="62" x2="60" y2="62" stroke="#C9CFE0" stroke-width="3"/>
