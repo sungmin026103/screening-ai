@@ -645,7 +645,7 @@ def forest_plot_from_R(
         right_margin = max(right_margin, note_w - right_block_w + 0.15)
     fig_w = left_margin + left_block_w + gap + plot_w + gap + right_block_w + right_margin
     row_h = 0.30
-    fig_h = max(3.6, (k + 6.5) * row_h)
+    fig_h = max(4.6, (k + 8.8) * row_h)
 
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=100)
     Y_TITLE = k + 2.55
@@ -655,11 +655,11 @@ def forest_plot_from_R(
     Y_SEP2 = 0.72
     Y_POOL = 0.40
     Y_PI = 0.02
-    Y_NOTE = -0.55
+    Y_NOTE = -0.72
     Y_AXIS_BASE = Y_SEP2 - 0.35
     Y_TICKNUM = Y_AXIS_BASE - 0.30
-    Y_SUBTITLE = Y_AXIS_BASE - 0.95
-    Y_MIN = -1.85
+    Y_SUBTITLE = Y_AXIS_BASE - 0.78
+    Y_MIN = -2.65
     Y_MAX = Y_TITLE + 0.35
 
     ax = fig.add_axes([0, 0, 1, 1])
@@ -764,7 +764,7 @@ def forest_plot_from_R(
     leg_items = [("s", C_TEXT, "Individual study (95% CI)"), ("D", C_POOL, "Pooled effect (diamond, 95% CI)")]
     if has_pi:
         leg_items.append((None, C_PI, "Prediction interval (95%)"))
-    ly = Y_NOTE - 0.1
+    ly = Y_NOTE - 0.62
     for marker, color, label in leg_items:
         if marker:
             ax.scatter([XS + 0.05], [ly], s=26, marker=marker, color=color, zorder=5, linewidths=0)
@@ -791,7 +791,7 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
         p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
         has_egger_line = True
 
-    fig, ax = plt.subplots(figsize=(6.8, 7.4), dpi=100)
+    fig, ax = plt.subplots(figsize=(7.6, 6.4), dpi=100)
     ax.fill_betweenx(se_seq, summary.g - 1.96 * se_seq, summary.g + 1.96 * se_seq,
                      color=C_POOL, alpha=0.10, label="95% pseudo-CI")
     ax.fill_betweenx(se_seq, summary.g - 1.645 * se_seq, summary.g + 1.645 * se_seq,
@@ -812,7 +812,7 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     fig.text(0.02, 0.01, f"k = {k} effect sizes   |   Egger $p$ {p_txt}", fontsize=9.5, color="#555555")
-    fig.tight_layout(rect=[0.0, 0.035, 0.80, 1.0])
+    fig.subplots_adjust(left=0.13, right=0.76, bottom=0.14, top=0.90)
     return fig
 
 
@@ -884,7 +884,7 @@ def baujat_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col: st
     n_flag = min(top_n, len(score))
     flagged = set(np.argsort(-score)[:n_flag]) if n_flag > 0 else set()
 
-    fig, ax = plt.subplots(figsize=(7.4, 6.2), dpi=100)
+    fig, ax = plt.subplots(figsize=(7.6, 6.0), dpi=100)
     normal_idx = [i for i in range(len(studies)) if i not in flagged]
     ax.scatter(contrib_q[normal_idx], influence[normal_idx], s=60, color=C_NORM, zorder=3,
               edgecolor="white", linewidth=0.6)
@@ -923,7 +923,7 @@ def gosh_plot(effect_df: pd.DataFrame, n_iter: int = 1500, min_frac: float = 0.5
             continue
     full = pool_random_effects(effect_df)
 
-    fig, ax = plt.subplots(figsize=(6.8, 5.8), dpi=100)
+    fig, ax = plt.subplots(figsize=(7.4, 5.8), dpi=100)
     ax.scatter(gs, i2s, s=9, alpha=0.35, color=C_NORM, linewidths=0)
     ax.scatter([full.beta], [full.i2], s=140, color=C_PI, marker="*", zorder=5,
               edgecolor="white", linewidth=0.7, label="Full model")
@@ -968,7 +968,7 @@ def trim_and_fill(effect_df: pd.DataFrame, cluster_col: str = "study") -> dict:
 
 def trim_fill_plot(tf_result: dict, title: str = "Trim-and-fill sensitivity") -> "plt.Figure":
     orig, adj = tf_result["original"], tf_result["adjusted"]
-    fig, ax = plt.subplots(figsize=(8.6, 3.4), dpi=100)
+    fig, ax = plt.subplots(figsize=(9.2, 4.2), dpi=100)
     y = 1
     ax.plot([orig.ci[0], orig.ci[1]], [y + 0.14] * 2, color=C_POOL, lw=1.7, zorder=2)
     ax.scatter([orig.beta], [y + 0.14], s=100, color=C_POOL, marker="o", zorder=4,
@@ -987,7 +987,7 @@ def trim_fill_plot(tf_result: dict, title: str = "Trim-and-fill sensitivity") ->
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_visible(False)
-    fig.tight_layout(rect=[0.0, 0.0, 0.78, 1.0])
+    fig.subplots_adjust(left=0.16, right=0.76, bottom=0.22, top=0.82)
     return fig
 
 
@@ -1030,5 +1030,5 @@ def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col:
     fig.suptitle(f"Influence diagnostics — {title}", fontsize=13, fontweight="bold", x=0.02, ha="left")
     handles = [Patch(color=C_NORM, label="Non-influential"), Patch(color=C_PI, label="Influential")]
     fig.legend(handles=handles, loc="lower center", ncol=2, frameon=True, bbox_to_anchor=(0.5, -0.02))
-    fig.tight_layout(rect=[0.0, 0.06, 1.0, 0.93])
+    fig.subplots_adjust(left=0.22, right=0.97, bottom=0.18, top=0.86, wspace=0.22)
     return fig

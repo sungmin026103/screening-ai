@@ -425,7 +425,7 @@ elif nav == "import":
                                use_container_width=True)
         with d3:
             st.markdown("**③ AI 스크리닝용**")
-            st.caption("+ Human_Label 열 (일부만 1/0 채워서 「🤖 AI 스크리닝」에 그대로 업로드)")
+            st.caption("+ Human_Label 열 (일부만 1/0 또는 O/X로 채워서 「🤖 AI 스크리닝」에 그대로 업로드)")
             st.download_button("다운로드 (AI_Screening_Template.xlsx)", dataframe_to_excel_bytes(ai_template),
                                "AI_Screening_Template.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                type="primary", use_container_width=True)
@@ -483,7 +483,7 @@ elif nav == "screen":
     else:
         st.markdown('<div class="small-note">PICO가 비어 있어 텍스트 분류기만으로 학습합니다. 「🧬 PICO 설정」 탭에서 입력하면 정확도에 도움이 됩니다.</div>', unsafe_allow_html=True)
 
-    st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label(1=Include, 0=Exclude)을 일부 채워서 올려주세요.")
+    st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label에는 1/0 또는 O/X를 사용할 수 있습니다. 검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다.")
     file = st.file_uploader("라벨링된 스크리닝 파일 업로드", type=["xlsx", "xls", "csv"])
     target_recall = st.slider("목표 재현율 (Recall)", 0.80, 0.99, 0.95, 0.01, help="교차검증 데이터에서 Include 문헌을 보존하도록 임계값을 설정합니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.")
     if file:

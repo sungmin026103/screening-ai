@@ -38,22 +38,76 @@ def _find_col(df: pd.DataFrame, options: list[str]) -> str | None:
     return next((lookup[x] for x in options if x in lookup), None)
 
 
+def _normalize_label_value(value):
+    """사용자 라벨을 0/1로 표준화한다. O/X, 숫자, 한글 판정을 모두 허용한다."""
+    if pd.isna(value):
+        return np.nan
+    key = str(value).strip().lower()
+    mapping = {
+        "1": 1, "1.0": 1, "o": 1, "○": 1, "ㅇ": 1,
+        "include": 1, "included": 1, "yes": 1, "y": 1, "포함": 1,
+        "0": 0, "0.0": 0, "x": 0, "×": 0,
+        "exclude": 0, "excluded": 0, "no": 0, "n": 0, "제외": 0,
+    }
+    return mapping.get(key, np.nan)
+
+
+def _reviewer_label_columns(df: pd.DataFrame, excluded: set[str]) -> list[str]:
+    """O/X 또는 0/1 값이 주로 들어 있는 검토자 열을 자동 탐지한다."""
+    found = []
+    for col in df.columns:
+        if col in excluded:
+            continue
+        vals = df[col].dropna()
+        if len(vals) == 0:
+            continue
+        normalized = vals.map(_normalize_label_value)
+        valid_rate = float(normalized.notna().mean())
+        if valid_rate >= 0.70 and normalized.notna().sum() >= 2:
+            found.append(col)
+    return found
+
+
 def prepare_screening_data(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     title_col = _find_col(df, ["title", "제목"])
     abstract_col = _find_col(df, ["abstract", "초록"])
-    label_col = _find_col(df, ["human_label", "include", "label", "decision", "포함", "라벨"])
-    if not title_col or not label_col:
-        raise ValueError("제목(Title/제목)과 라벨(Human_Label/Include/Label) 열이 필요합니다.")
+    label_col = _find_col(df, [
+        "human_label", "human label", "include", "label", "decision",
+        "포함", "라벨", "판정", "최종판정", "최종라벨",
+    ])
+    if not title_col:
+        raise ValueError("제목(Title/제목) 열이 필요합니다.")
+
     out = pd.DataFrame()
     out["Title"] = df[title_col].fillna("").astype(str)
     out["Abstract"] = df[abstract_col].fillna("").astype(str) if abstract_col else ""
-    out["Human_Label"] = df[label_col]
-    mapping = {"include": 1, "included": 1, "yes": 1, "y": 1, "o": 1, "1": 1,
-               "exclude": 0, "excluded": 0, "no": 0, "n": 0, "x": 0, "0": 0}
-    out["Human_Label"] = out["Human_Label"].map(lambda x: mapping.get(str(x).strip().lower(), x))
+
+    if label_col:
+        out["Human_Label"] = df[label_col].map(_normalize_label_value)
+        label_source = str(label_col)
+    else:
+        excluded = {title_col}
+        if abstract_col:
+            excluded.add(abstract_col)
+        reviewer_cols = _reviewer_label_columns(df, excluded)
+        if not reviewer_cols:
+            raise ValueError(
+                "라벨 열을 찾지 못했습니다. Human_Label/Label 열을 추가하거나, "
+                "검토자 열에 O(포함)와 X(제외)를 입력해 주세요."
+            )
+        normalized = pd.DataFrame({c: df[c].map(_normalize_label_value) for c in reviewer_cols})
+        if len(reviewer_cols) == 1:
+            out["Human_Label"] = normalized.iloc[:, 0]
+        else:
+            # 두 명 이상이 모두 같은 판정을 내린 행만 학습에 사용하고, 불일치는 미합의로 둔다.
+            n_valid = normalized.notna().sum(axis=1)
+            unanimous = normalized.nunique(axis=1, dropna=True).eq(1) & n_valid.ge(2)
+            out["Human_Label"] = np.where(unanimous, normalized.bfill(axis=1).iloc[:, 0], np.nan)
+        label_source = "검토자 자동합의: " + ", ".join(map(str, reviewer_cols))
+
     out["Human_Label"] = pd.to_numeric(out["Human_Label"], errors="coerce")
     out["Text"] = (out["Title"] + " " + out["Abstract"]).str.strip()
-    return out, label_col
+    return out, label_source
 
 
 class CriteriaSimilarity(BaseEstimator, TransformerMixin):
