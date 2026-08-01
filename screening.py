@@ -221,17 +221,49 @@ def _compute_safety_signals(
     return signals
 
 
-def _combine_safety(signals: dict, key: str) -> tuple[np.ndarray, np.ndarray]:
-    """신호 딕셔너리에서 지정한 키("cv" 또는 "all")의 확률들을 모아
-    (모든 모델이 Exclude 방향(확률 < 0.5)인지 여부, Safety Score)를 계산한다.
-    Safety Score는 각 모델의 "Exclude 쪽 확신도"(1 - 확률) 평균으로,
-    1에 가까울수록 여러 모델이 강하게 Exclude로 동의한다는 뜻이다.
+def _signal_safe_cutoff(cv_probs: np.ndarray, y: np.ndarray, target_recall: float) -> float:
+    """단일 신호(뷰)의 라벨 데이터 교차검증 확률만으로, 그 신호 혼자 판단해도
+    목표 재현율 이상(>=)을 지킬 수 있는 가장 높은 컷오프를 계산한다.
+    0.5 같은 임의의 고정값이 아니라 메인 임계값과 동일한 기준(목표 재현율)으로
+    보수적인 컷오프를 잡기 때문에, 신호 하나의 판단 기준이 느슨해서 안전 제외
+    후보에 실제 Include 문헌이 섞여 들어가는 문제를 줄여준다.
     """
-    arrs = [np.asarray(v[key], dtype=float) for v in signals.values()]
-    stacked = np.stack(arrs, axis=1)
-    unanimous_exclude = np.all(stacked < 0.5, axis=1)
-    safety_score = np.mean(1.0 - stacked, axis=1)
-    return unanimous_exclude, safety_score
+    precision, recall, thresholds = precision_recall_curve(y, cv_probs)
+    if len(thresholds) == 0:
+        return 0.5
+    valid = np.where(recall[:-1] >= float(target_recall))[0]
+    return float(thresholds[valid[-1]]) if len(valid) else float(thresholds[0])
+
+
+def _recompute_unanimous_exclude(pred_df: pd.DataFrame, target_recall: float):
+    """저장된 각 신호의 (라벨 데이터 교차검증 확률, 전체 데이터 확률) 컬럼으로부터
+    신호별 안전 컷오프를 다시 계산하고, 모든 신호의 확률이 각자의 컷오프보다
+    낮을 때만 안전 제외 후보로 인정한다. 모델을 재학습하지 않고 저장된 확률만
+    사용하므로 재현율 슬라이더를 움직여도 즉시 재계산된다.
+    """
+    signal_names = [c[len("Prob_"):] for c in pred_df.columns if c.startswith("Prob_")]
+    mask = pred_df["Human_Label_Normalized"].isin([0, 1])
+    if signal_names:
+        first_cv_col = f"CV_Prob_{signal_names[0]}"
+        mask = mask & pred_df[first_cv_col].notna()
+    y = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
+
+    n = len(pred_df)
+    unanimous_all = np.ones(n, dtype=bool)
+    unanimous_cv_labeled = np.ones(int(mask.sum()), dtype=bool)
+    safety_terms = []
+    for name in signal_names:
+        cv_probs = pd.to_numeric(pred_df.loc[mask, f"CV_Prob_{name}"], errors="coerce").to_numpy()
+        cutoff = _signal_safe_cutoff(cv_probs, y, target_recall) if len(cv_probs) else 0.5
+        all_probs = pd.to_numeric(pred_df[f"Prob_{name}"], errors="coerce").to_numpy()
+        unanimous_all &= (all_probs < cutoff)
+        unanimous_cv_labeled &= (cv_probs < cutoff)
+        safety_terms.append(1.0 - all_probs)
+
+    safety_score = np.mean(safety_terms, axis=0) if safety_terms else np.zeros(n)
+    safe_exclude_cv_n = int(unanimous_cv_labeled.sum())
+    safe_exclude_cv_fn = int(((y == 1) & unanimous_cv_labeled).sum())
+    return unanimous_all, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn
 
 
 def _priority_labels(probabilities: np.ndarray, threshold: float, unanimous_exclude: np.ndarray) -> np.ndarray:
@@ -258,10 +290,9 @@ def _sort_by_priority(pred_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_recall_target(result: ScreeningResult, target_recall: float) -> ScreeningResult:
-    """저장된 교차검증 확률/Safety Score를 사용해 재학습 없이 임계값과 화면
-    분류(우선 검토 / 경계 문헌 / 안전 제외 후보)를 갱신한다. Safety Score와
-    다중 모델 합의 여부는 임계값과 무관하게 학습 시점에 이미 계산되어 있으므로
-    다시 계산하지 않는다.
+    """저장된 교차검증 확률(메인 모델 + 보조 신호들)을 사용해 재학습 없이
+    임계값과 화면 분류(우선 검토 / 경계 문헌 / 안전 제외 후보)를 갱신한다.
+    안전 제외 후보 조건(신호별 컷오프)도 새 목표 재현율에 맞춰 함께 다시 계산된다.
     """
     updated = deepcopy(result)
     precision = np.asarray(updated.pr_curve.get("precision", []), dtype=float)
@@ -276,8 +307,15 @@ def apply_recall_target(result: ScreeningResult, target_recall: float) -> Screen
 
     pred_df = updated.predictions.copy()
     probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
-    unanimous_exclude = pred_df["Unanimous_Exclude"].fillna(False).to_numpy(dtype=bool)
+
+    unanimous_exclude, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn = _recompute_unanimous_exclude(
+        pred_df, target_recall
+    )
+    pred_df["Safety_Score"] = safety_score
+    pred_df["Unanimous_Exclude"] = unanimous_exclude
     pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, unanimous_exclude)
+    updated.metrics["safe_exclude_cv_n"] = safe_exclude_cv_n
+    updated.metrics["safe_exclude_cv_false_negatives"] = safe_exclude_cv_fn
 
     if {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
         mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
@@ -347,19 +385,11 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     final_pipeline.fit(texts, y)
     all_probs = final_pipeline.predict_proba(all_texts)[:, 1]
 
-    # --- Safety Score: 서로 다른 근거를 가진 여러 모델이 "모두" Exclude
-    # 방향일 때만 안전 제외 후보로 인정한다 (Include 확률 하나만 보지 않는다).
+    # --- Safety Score: 서로 다른 근거를 가진 여러 모델이, "각자의 기준으로도
+    # 목표 재현율을 지킬 수 있는 컷오프" 아래일 때만 안전 제외 후보로 인정한다.
+    # (Include 확률 하나만 보거나, 임의의 0.5 컷오프에 의존하지 않는다.)
     aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text)
     aux_signals["linear_svm"] = {"cv": probs, "all": all_probs}  # 메인 모델도 하나의 투표로 포함
-
-    unanimous_exclude_cv, _ = _combine_safety(aux_signals, "cv")
-    unanimous_exclude_all, safety_score_all = _combine_safety(aux_signals, "all")
-
-    # 라벨 데이터에서 "안전 제외 후보로 분류되었지만 실제로는 Include였던" 건수를
-    # 교차검증 기준으로 집계해 이 버킷의 신뢰도를 투명하게 보여준다 (이상적으로는 0).
-    metrics["safe_exclude_cv_n"] = int(unanimous_exclude_cv.sum())
-    metrics["safe_exclude_cv_false_negatives"] = int(((y == 1) & unanimous_exclude_cv).sum())
-    metrics["safety_signal_count"] = len(aux_signals)
 
     result_df = df.copy().reset_index(drop=True)
     result_df["AI_Probability"] = all_probs
@@ -371,6 +401,21 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     result_df.loc[labeled.index, "CV_Prediction"] = pred
     result_df["False_Negative"] = False
     result_df.loc[labeled.index, "False_Negative"] = (y == 1) & (pred == 0)
+
+    for name, sig in aux_signals.items():
+        result_df[f"Prob_{name}"] = sig["all"]
+        result_df[f"CV_Prob_{name}"] = np.nan
+        result_df.loc[labeled.index, f"CV_Prob_{name}"] = sig["cv"]
+
+    unanimous_exclude_all, safety_score_all, safe_exclude_cv_n, safe_exclude_cv_fn = _recompute_unanimous_exclude(
+        result_df, target_recall
+    )
+    # 라벨 데이터에서 "안전 제외 후보로 분류되었지만 실제로는 Include였던" 건수를
+    # 교차검증 기준으로 집계해 이 버킷의 신뢰도를 투명하게 보여준다 (이상적으로는 0).
+    metrics["safe_exclude_cv_n"] = safe_exclude_cv_n
+    metrics["safe_exclude_cv_false_negatives"] = safe_exclude_cv_fn
+    metrics["safety_signal_count"] = len(aux_signals)
+
     result_df["Safety_Score"] = safety_score_all
     result_df["Unanimous_Exclude"] = unanimous_exclude_all
     result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, unanimous_exclude_all)
