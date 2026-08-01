@@ -17,6 +17,8 @@ COLUMN_ALIASES = {
     "journal": ["journal", "jo", "jf", "source title", "publication name", "저널"],
     "authors": ["authors", "author", "au", "저자"],
     "pmid": ["pmid", "pubmed id", "an"],
+    "accession_id": ["accession_id", "accession id", "ut", "wos id"],
+    "keywords": ["keywords", "keyword", "de", "id", "키워드"],
 }
 
 
@@ -45,6 +47,80 @@ def standardize_dataframe(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
     out["year"] = out["year"].map(safe_year)
     return out[out["title"].str.len() > 0].reset_index(drop=True)
 
+
+
+def _decode_text(raw: bytes) -> str:
+    """Decode bibliographic exports without silently corrupting common WoS characters."""
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_ciw(text: str, source_name: str) -> pd.DataFrame:
+    """Parse Clarivate Web of Science plain-text/CIW exports.
+
+    Records end with ``ER``. A two-character tag starts a field and lines
+    beginning with whitespace continue the preceding field. Repeated and
+    continued values (for example AU/AF) are preserved.
+    """
+    records: list[dict[str, list[str]]] = []
+    current: dict[str, list[str]] = {}
+    last_tag: str | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\r\n")
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # File-level metadata, not article records.
+        if stripped.startswith("FN ") or stripped.startswith("VR "):
+            continue
+        if stripped == "ER":
+            if current:
+                records.append(current)
+            current = {}
+            last_tag = None
+            continue
+        if stripped == "EF":
+            break
+
+        match = re.match(r"^([A-Z0-9]{2})\s+(.*)$", line)
+        if match:
+            tag, value = match.group(1), match.group(2).strip()
+            current.setdefault(tag, []).append(value)
+            last_tag = tag
+        elif last_tag and line[:1].isspace():
+            value = stripped
+            if value:
+                current.setdefault(last_tag, []).append(value)
+
+    if current:
+        records.append(current)
+
+    def joined(record: dict[str, list[str]], tag: str, sep: str = " ") -> str:
+        return sep.join(v.strip() for v in record.get(tag, []) if v.strip()).strip()
+
+    rows: list[dict[str, str]] = []
+    for record in records:
+        keywords = [joined(record, "DE", "; "), joined(record, "ID", "; ")]
+        rows.append({
+            "title": joined(record, "TI"),
+            "abstract": joined(record, "AB"),
+            "year": joined(record, "PY") or joined(record, "PD"),
+            "doi": joined(record, "DI"),
+            "journal": joined(record, "SO") or joined(record, "J9"),
+            "authors": joined(record, "AU", "; ") or joined(record, "AF", "; "),
+            "pmid": joined(record, "PM"),
+            "accession_id": joined(record, "UT"),
+            "keywords": "; ".join(k for k in keywords if k),
+            "source": source_name,
+        })
+
+    return standardize_dataframe(pd.DataFrame(rows), source_name)
 
 def parse_nbib(text: str, source_name: str) -> pd.DataFrame:
     records: list[dict[str, str]] = []
@@ -117,9 +193,11 @@ def read_uploaded_file(uploaded) -> pd.DataFrame:
     suffix = Path(name).suffix.lower()
     raw = uploaded.getvalue()
     if suffix == ".nbib":
-        return parse_nbib(raw.decode("utf-8-sig", errors="replace"), name)
+        return parse_nbib(_decode_text(raw), name)
     if suffix == ".ris":
-        return parse_ris(raw.decode("utf-8-sig", errors="replace"), name)
+        return parse_ris(_decode_text(raw), name)
+    if suffix == ".ciw":
+        return parse_ciw(_decode_text(raw), name)
     if suffix in {".csv", ".tsv", ".txt"}:
         sep = "\t" if suffix == ".tsv" else None
         df = pd.read_csv(io.BytesIO(raw), sep=sep, engine="python", encoding_errors="replace")

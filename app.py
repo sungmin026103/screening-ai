@@ -358,10 +358,10 @@ elif nav == "import":
         eyebrow="가져오기 · 중복 제거",
     )
     uploaded = st.file_uploader(
-        "검색 결과 파일 업로드", type=["nbib", "ris", "csv", "tsv", "txt", "xlsx", "xls"], accept_multiple_files=True,
+        "검색 결과 파일 업로드", type=["nbib", "ris", "ciw", "csv", "tsv", "txt", "xlsx", "xls"], accept_multiple_files=True,
     )
     st.markdown(
-        '<div class="small-note">지원 형식: PubMed NBIB, RIS, CSV/TSV, Excel. DOI를 우선으로, 없으면 정규화된 제목으로 '
+        '<div class="small-note">지원 형식: PubMed NBIB, RIS, Web of Science CIW, CSV/TSV, Excel. DOI를 우선으로, 없으면 정규화된 제목으로 '
         '중복을 판정합니다. 같은 문헌이 여럿이면 초록이 더 풍부한 쪽을 남기고, 연도 오름차순(오래된 → 최신)으로 정렬합니다.</div>',
         unsafe_allow_html=True,
     )
