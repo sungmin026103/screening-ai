@@ -54,7 +54,7 @@ header[data-testid="stHeader"]{background:rgba(247,249,252,.82);backdrop-filter:
  radial-gradient(circle at 72% 25%,rgba(74,112,255,.22),transparent 27%),
  radial-gradient(circle at 92% 82%,rgba(133,76,255,.18),transparent 32%),
  linear-gradient(120deg,#07152e 0%,#0a1e42 55%,#101d4a 100%);
- box-shadow:0 22px 55px rgba(7,21,46,.22);margin-bottom:0;color:#fff}
+ box-shadow:0 22px 55px rgba(7,21,46,.22);margin-bottom:18px;color:#fff}
 .landing-hero-content{position:relative;z-index:3;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(380px,.95fr);gap:48px;align-items:center;padding:70px 64px 92px}
 .landing-eyebrow{font-size:.73rem;letter-spacing:.16em;text-transform:uppercase;color:#8ab2ff;font-weight:750;margin-bottom:16px}
 .landing-hero h1{font-size:2.75rem;line-height:1.22;letter-spacing:-.035em;margin:0 0 17px;font-weight:760}
@@ -77,11 +77,13 @@ header[data-testid="stHeader"]{background:rgba(247,249,252,.82);backdrop-filter:
 @keyframes shimmer{0%{opacity:.15}50%{opacity:.85}100%{opacity:.15}}
 
 /* Button row under hero, visually connected */
-.hero-actions{display:flex;gap:12px;margin-top:-72px;position:relative;z-index:5;padding:0 64px 31px;max-width:600px}
+.landing-actions{display:grid;grid-template-columns:180px 180px 1fr;gap:12px;align-items:center;margin:0 0 18px;padding:0 4px;position:relative;z-index:2}
+.landing-actions [data-testid="column"]{min-width:0}
+.landing-actions .stButton>button{width:100%;min-height:44px}
 .hero-actions-spacer{height:0}
 
 /* Summary strip */
-.summary-strip{position:relative;z-index:4;margin:-42px 34px 30px;background:rgba(255,255,255,.97);border:1px solid rgba(226,231,241,.95);border-radius:17px;display:grid;grid-template-columns:repeat(4,1fr);box-shadow:0 18px 45px rgba(16,26,53,.11);overflow:hidden}
+.summary-strip{position:relative;z-index:1;margin:0 0 30px;background:rgba(255,255,255,.97);border:1px solid rgba(226,231,241,.95);border-radius:17px;display:grid;grid-template-columns:repeat(4,1fr);box-shadow:0 18px 45px rgba(16,26,53,.11);overflow:hidden}
 .summary-item{padding:22px 25px;border-right:1px solid var(--line)}.summary-item:last-child{border-right:0}
 .summary-label{font-size:.76rem;color:var(--muted);margin-bottom:8px}.summary-value{font:700 1.65rem 'JetBrains Mono',monospace;color:var(--ink)}.summary-hint{font-size:.71rem;color:#929aae;margin-top:5px}
 
@@ -114,8 +116,8 @@ header[data-testid="stHeader"]{background:rgba(247,249,252,.82);backdrop-filter:
 /* Legacy funnel components */
 .funnel-wrap{display:flex;align-items:center;gap:26px;flex-wrap:wrap}.funnel-svg{width:340px;max-width:100%;height:auto}.funnel-num{font:700 20px 'JetBrains Mono',monospace}.funnel-label{font-weight:600;font-size:12.5px}.funnel-legend{display:flex;flex-direction:column;gap:10px;min-width:220px}.funnel-legend .row{display:flex;align-items:center;gap:10px;font-size:.88rem}.funnel-legend .dot{width:11px;height:11px;border-radius:4px}.funnel-legend .n{font:700 .88rem 'JetBrains Mono',monospace;margin-left:auto}
 
-@media(max-width:900px){.landing-links{display:none}.landing-hero-content{grid-template-columns:1fr;padding:48px 34px 92px}.hero-art{display:none}.summary-strip{grid-template-columns:repeat(2,1fr)}.summary-item:nth-child(2){border-right:0}.project-grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:620px){.block-container{padding-left:1rem;padding-right:1rem}.landing-tag{display:none}.landing-hero h1{font-size:2rem}.landing-hero-content{padding:42px 24px 86px}.hero-actions{padding-left:24px}.summary-strip{margin:-36px 12px 24px}.summary-item{padding:18px 16px}.project-grid{grid-template-columns:1fr}.hero{padding:26px 23px}.hero-visual{display:none}.step-label{font-size:.68rem}}
+@media(max-width:900px){.landing-links{display:none}.landing-hero-content{grid-template-columns:1fr;padding:48px 34px 54px}.hero-art{display:none}.landing-actions{grid-template-columns:1fr 1fr}.summary-strip{grid-template-columns:repeat(2,1fr)}.summary-item:nth-child(2){border-right:0}.project-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:620px){.block-container{padding-left:1rem;padding-right:1rem}.landing-tag{display:none}.landing-hero h1{font-size:2rem}.landing-hero-content{padding:42px 24px 48px}.landing-actions{grid-template-columns:1fr;margin-bottom:14px}.summary-strip{margin:0 0 24px}.summary-item{padding:18px 16px}.project-grid{grid-template-columns:1fr}.hero{padding:26px 23px}.hero-visual{display:none}.step-label{font-size:.68rem}}
 </style>
 """
 
