@@ -23,7 +23,8 @@ from projects import (
     load_project_state, save_project_state, touch_project,
 )
 from screening import train_and_predict, apply_fn_budget, build_grouped_excel_bytes
-from styles import apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar
+from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
+                    landing_nav, landing_hero, summary_strip)
 from utils import dataframe_to_excel_bytes
 
 st.set_page_config(page_title="SR Studio · 문헌 스크리닝 워크스페이스", page_icon="◈", layout="wide")
@@ -137,61 +138,103 @@ NAV_ITEMS = [
 if "nav" not in st.session_state:
     st.session_state.nav = "projects"
 
-# 프로젝트를 열기 전에는 일반 사이트처럼 프로젝트 선택 화면만 표시
+# 프로젝트를 열기 전에는 간결한 랜딩 화면과 최근 프로젝트만 표시
 if not st.session_state.active_project:
-    st.markdown(
-        '<div class="hub-head"><h1>SR Studio</h1>'
-        '<p>Systematic Review &amp; Meta-analysis</p></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="section-title">프로젝트를 선택하세요.</div>', unsafe_allow_html=True)
-    c_new, c_open = st.columns(2)
-    with c_new:
+    landing_nav()
+    landing_hero()
+
+    projects = list_projects()
+    total_projects = len(projects)
+    total_records = 0
+    total_labeled = 0
+    for p in projects:
+        try:
+            rec = load_records(p["slug"])
+            total_records += len(rec)
+        except Exception:
+            pass
+        try:
+            saved_result = load_project_state(p["slug"], "screening_result")
+            if saved_result is not None:
+                total_labeled += int(saved_result.metrics.get("labeled_n", 0))
+        except Exception:
+            pass
+
+    # Streamlit 버튼은 HTML 안에 넣을 수 없으므로 Hero 바로 아래에 연결해 배치합니다.
+    b1, b2, spacer = st.columns([1.05, 1.05, 4.2])
+    with b1:
+        create_clicked = st.button("＋ 새 프로젝트", type="primary", use_container_width=True, key="landing_new")
+    with b2:
+        open_clicked = st.button("▣ 프로젝트 열기", use_container_width=True, key="landing_open")
+
+    if create_clicked:
+        st.session_state["show_new_project"] = True
+    if open_clicked:
+        st.session_state["show_open_project"] = True
+
+    summary_strip([
+        ("전체 문헌", f"{total_records:,}", "저장된 프로젝트 합계"),
+        ("라벨링 완료", f"{total_labeled:,}", "AI 학습에 사용된 문헌"),
+        ("현재 프로젝트", f"{total_projects:,}", "저장된 프로젝트 수"),
+        ("자동 저장", "ON", "프로젝트별 상태 복원"),
+    ])
+
+    if st.session_state.get("show_new_project"):
         with st.container(border=True):
-            st.markdown("### 새 프로젝트")
-            st.caption("새로운 체계적 문헌고찰 프로젝트를 시작합니다.")
-            new_name = st.text_input("프로젝트 이름", placeholder="예: 우주 영양 SR", key="hub_new_name")
-            if st.button("새 프로젝트 만들기", type="primary", use_container_width=True, key="hub_create"):
-                try:
-                    p = create_project(new_name)
-                    activate_project(p["slug"])
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-    with c_open:
+            st.markdown("#### 새 프로젝트")
+            n1, n2 = st.columns([4, 1])
+            with n1:
+                new_name = st.text_input("프로젝트 이름", placeholder="예: Space Nutrition Review", key="hub_new_name", label_visibility="collapsed")
+            with n2:
+                if st.button("만들기", type="primary", use_container_width=True, key="hub_create"):
+                    try:
+                        created = create_project(new_name)
+                        activate_project(created["slug"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+    if st.session_state.get("show_open_project"):
         with st.container(border=True):
-            st.markdown("### 프로젝트 열기")
-            st.caption("저장된 프로젝트를 선택해 이어서 작업합니다.")
-            projects = list_projects()
+            st.markdown("#### 프로젝트 열기")
             if projects:
-                choice = st.selectbox("저장된 프로젝트", projects, format_func=lambda x: x["name"], key="hub_open_select")
-                if st.button("프로젝트 열기", use_container_width=True, key="hub_open"):
-                    activate_project(choice["slug"])
-                    st.rerun()
+                o1, o2 = st.columns([4, 1])
+                with o1:
+                    choice = st.selectbox("저장된 프로젝트", projects, format_func=lambda x: x["name"], key="hub_open_select", label_visibility="collapsed")
+                with o2:
+                    if st.button("열기", use_container_width=True, key="hub_open"):
+                        activate_project(choice["slug"])
+                        st.rerun()
             else:
                 st.info("저장된 프로젝트가 없습니다.")
 
-    projects = list_projects()
     if projects:
-        st.markdown('<div class="section-title" style="margin-top:30px;">최근 프로젝트</div>', unsafe_allow_html=True)
-        st.caption("최근 수정된 순서입니다. 프로젝트를 열면 저장된 문헌, PICO, AI 결과와 작업 상태가 복원됩니다.")
-        for p in projects[:8]:
-            prog = project_progress(p["slug"])
-            col_info, col_btn = st.columns([5, 1])
-            with col_info:
-                updated = str(p.get("updated_at", "")).replace("T", " ")[:16] or "기록 없음"
+        st.markdown('<div class="recent-head"><h2>최근 프로젝트</h2><span>최근 수정된 순서</span></div>', unsafe_allow_html=True)
+        recent = projects[:4]
+        cols = st.columns(len(recent))
+        for col, project in zip(cols, recent):
+            prog = project_progress(project["slug"])
+            updated = str(project.get("updated_at", "")).replace("T", " ")[:10] or "기록 없음"
+            try:
+                rec_n = len(load_records(project["slug"]))
+            except Exception:
+                rec_n = 0
+            with col:
                 st.markdown(
-                    f'<div class="project-card"><div class="name">{p["name"]}</div>'
-                    f'<div class="meta">진행률 {prog["percent"]}% · 마지막 작업 {updated}</div>'
+                    f'<div class="project-card"><div class="name">{project["name"]}</div>'
+                    f'<div class="meta">수정일 {updated}</div>'
+                    f'<div class="stats"><span>{rec_n:,} 문헌</span><span class="pct">{prog["percent"]}%</span></div>'
                     f'<div class="progress-shell"><div class="progress-fill" style="width:{prog["percent"]}%"></div></div></div>',
                     unsafe_allow_html=True,
                 )
-            with col_btn:
-                st.write("")
-                if st.button("열기", key=f"recent_{p['slug']}", use_container_width=True):
-                    activate_project(p["slug"])
+                if st.button("열기", key=f"recent_{project['slug']}", use_container_width=True):
+                    activate_project(project["slug"])
                     st.rerun()
-    st.markdown('<div class="hub-note">Version 8.0 · 프로젝트는 작업 시 자동 저장됩니다.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="recent-head"><h2>최근 프로젝트</h2></div>', unsafe_allow_html=True)
+        empty_state("◇", "아직 프로젝트가 없습니다", "새 프로젝트를 만들어 시작하세요.")
+
+    st.markdown('<div class="hub-note">SR Studio · 프로젝트 작업 내용은 자동 저장됩니다.</div>', unsafe_allow_html=True)
     st.stop()
 
 with st.sidebar:
@@ -249,100 +292,59 @@ topbar(active_meta["name"] if active_meta else active)
 # 1. 대시보드
 # ===========================================================================
 if nav == "dashboard":
+    result = st.session_state.get("screening_result")
+    stats = st.session_state.get("import_stats", {})
+    collected = stats.get("before", len(records)) if not records.empty else 0
+    labeled_n = int(result.metrics.get("labeled_n", 0)) if result else 0
+    priority_n = int((result.predictions["AI_Recommendation"] == "우선 검토").sum()) if result else 0
+
     hero(
-        "검색 결과를, 스크리닝 가능한 데이터로.",
-        "문헌을 가져오고, 중복을 제거하고, PICO 기준과 AI로 우선순위를 매긴 뒤, 메타분석 그림까지 한 워크스페이스에서 진행하세요.",
-        eyebrow="대시보드", visual=True,
+        active_meta["name"] if active_meta else "프로젝트 개요",
+        "현재 문헌과 스크리닝 상태를 확인하고 다음 작업을 이어갑니다.",
+        eyebrow="PROJECT OVERVIEW", visual=True,
     )
 
-    if records.empty:
-        empty_state("◈", "아직 문헌이 없습니다", "「📥 가져오기 · 중복 제거」에서 검색 결과 파일을 업로드해 시작하세요.")
-    else:
-        stats = st.session_state.get("import_stats", {})
-        result = st.session_state.get("screening_result")
-        collected = stats.get("before", len(records))
-        coverage = records["abstract"].astype(str).str.len().gt(0).mean() * 100 if not records.empty else 0
-        include_n = int((result.predictions["AI_Recommendation"] == "우선 검토").sum()) if result else None
-        screen_progress = (result.metrics["labeled_n"] / len(records) * 100) if result and len(records) else 0
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi("전체 문헌", f"{collected:,}", "가져온 검색 결과")
+    with c2:
+        kpi("중복 제거 후", f"{len(records):,}", "현재 저장 문헌")
+    with c3:
+        kpi("라벨링 완료", f"{labeled_n:,}", "AI 학습 데이터")
+    with c4:
+        kpi("우선 검토", f"{priority_n:,}" if result else "—", "AI 스크리닝 결과")
 
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            kpi("총 문헌 수", f"{collected:,}", "가져오기 시점 기준")
-        with c2:
-            kpi("중복 제거 후", f"{len(records):,}", f"{(len(records)/collected*100 if collected else 0):.1f}%")
-        with c3:
-            kpi("Include 후보 (AI)", f"{include_n:,}" if include_n is not None else "—", "AI 스크리닝 결과")
-        with c4:
-            kpi("초록 보유율", f"{coverage:.1f}%", "초록이 있는 문헌 비율")
-        with c5:
-            kpi("스크리닝 진행률", f"{screen_progress:.1f}%", "AI 스크리닝 대상 비율")
+    st.markdown('<div class="section-title" style="margin-top:22px;">진행 단계</div>', unsafe_allow_html=True)
+    meta_done = any(st.session_state.get(k) for k in ["meta_r_result", "meta_raw", "meta_result"])
+    pico_done = bool(pico and any(v for v in pico.values()))
+    flags = [not records.empty, pico_done, result is not None, meta_done]
+    statuses, current_found = [], False
+    for flag in flags:
+        if flag:
+            statuses.append("done")
+        elif not current_found:
+            statuses.append("current"); current_found = True
+        else:
+            statuses.append("pending")
+    statuses.append("current" if statuses[-1] == "done" else "pending")
+    stepper([
+        {"label":"문헌 가져오기", "value":f"{len(records):,}" if not records.empty else "", "status":statuses[0]},
+        {"label":"PICO 설정", "value":"완료" if pico_done else "", "status":statuses[1]},
+        {"label":"AI 스크리닝", "value":f"{priority_n:,}" if result else "", "status":statuses[2]},
+        {"label":"메타분석", "value":"완료" if meta_done else "", "status":statuses[3]},
+        {"label":"내보내기", "value":"", "status":statuses[4]},
+    ])
 
-        st.markdown(
-            '<div class="section-title" style="margin-top:26px;">스크리닝 진행 상황</div>'
-            '<div class="section-sub">현재 프로젝트가 어느 단계까지 진행됐는지 보여줍니다.</div>',
-            unsafe_allow_html=True,
-        )
-        meta_done = any(st.session_state.get(k) for k in ["meta_r_result", "meta_raw", "meta_result"])
-        flags = [True, bool(pico and any(v for v in pico.values())), result is not None, meta_done]
-        statuses, found_current = [], False
-        for f in flags:
-            if f:
-                statuses.append("done")
-            elif not found_current:
-                statuses.append("current")
-                found_current = True
-            else:
-                statuses.append("pending")
-        statuses.append("current" if statuses[-1] == "done" else "pending")
-
-        stepper([
-            {"label": "가져오기 · 중복 제거", "value": f"{len(records):,}", "status": statuses[0]},
-            {"label": "PICO 설정", "value": "완료" if statuses[1] == "done" else "", "status": statuses[1]},
-            {"label": "AI 스크리닝", "value": f"{include_n:,}" if include_n is not None else "", "status": statuses[2]},
-            {"label": "메타분석", "value": "완료" if statuses[3] == "done" else "", "status": statuses[3]},
-            {"label": "내보내기", "value": "", "status": statuses[4]},
-        ])
-
-        col_left, col_right = st.columns([1.3, 1])
-        with col_left:
-            st.markdown('<div class="section-title" style="margin-top:22px;">최근 활동</div>', unsafe_allow_html=True)
-            activity_feed(st.session_state.activity_log[:5])
-        with col_right:
-            st.markdown('<div class="section-title" style="margin-top:22px;">AI 성능 요약</div>', unsafe_allow_html=True)
-            if result:
-                m = result.metrics
-                total_n = len(result.predictions)
-                safe_n = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-                reduction_rate = (safe_n / total_n * 100) if total_n else 0.0
-                perf_rows = [
-                    ("검토량 절감률", f"{reduction_rate:.1f}%"),
-                    ("허용 FN / 실측 FN", f"{m.get('allowed_fn', 0)} / {m.get('measured_fn', m.get('safe_exclude_cv_false_negatives', 0))}"),
-                    ("정확도 (Accuracy)", f"{m.get('accuracy', 0):.3f}"), ("정밀도 (Precision)", f"{m['precision']:.3f}"),
-                    ("재현율 (Recall, 참고용)", f"{m['recall']:.3f}"),
-                ]
-                perf_html = "".join(
-                    f'<div style="display:flex;justify-content:space-between;padding:6px 0;'
-                    f'border-bottom:1px solid var(--line);font-size:.86rem;">'
-                    f'<span style="color:var(--slate);">{label}</span>'
-                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;color:var(--ink);">{val}</span></div>'
-                    for label, val in perf_rows
-                )
-                st.markdown(f'<div>{perf_html}</div>', unsafe_allow_html=True)
-            else:
-                st.caption("아직 AI 스크리닝을 실행하지 않았습니다.")
-
-    st.markdown('<div class="section-title" style="margin-top:28px;">빠른 시작</div>', unsafe_allow_html=True)
-    q1, q2, q3, q4 = st.columns(4)
-    quick_actions = [
-        (q1, "import", "📥", "문헌 가져오기"),
-        (q2, "pico", "🧬", "PICO 설정"),
-        (q3, "screen", "🤖", "AI 스크리닝"),
-        (q4, "export", "📤", "내보내기"),
-    ]
-    for col, key, icon, label in quick_actions:
-        with col:
-            if st.button(f"{icon}  {label}", key=f"quick_{key}", use_container_width=True):
-                st.session_state.nav = key
+    lower_left, lower_right = st.columns([1.15, .85])
+    with lower_left:
+        st.markdown('<div class="section-title" style="margin-top:20px;">최근 활동</div>', unsafe_allow_html=True)
+        activity_feed(st.session_state.activity_log[:5])
+    with lower_right:
+        st.markdown('<div class="section-title" style="margin-top:20px;">다음 작업</div>', unsafe_allow_html=True)
+        actions = [("import", "문헌 가져오기"), ("pico", "PICO 설정"), ("screen", "AI 스크리닝"), ("meta", "메타분석 Figure")]
+        for target, label in actions:
+            if st.button(label, key=f"dash_action_{target}", use_container_width=True):
+                st.session_state.nav = target
                 st.rerun()
 
 # ===========================================================================
