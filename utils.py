@@ -25,10 +25,14 @@ def normalize_title(value: Any) -> str:
 
 
 def normalize_doi(value: Any) -> str:
+    """Extract and canonicalize the first DOI embedded in a field."""
     text = normalize_text(value)
-    text = re.sub(r"^https?://(dx\.)?doi\.org/", "", text)
+    text = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", text)
     text = re.sub(r"^doi:\s*", "", text)
-    return text.strip(" .;,/")
+    match = re.search(r"10\.\d{4,9}/[^\s\[\]<>]+", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(0).rstrip(" .,/>)];:").lower()
 
 
 def safe_year(value: Any) -> str:
