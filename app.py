@@ -22,7 +22,7 @@ from projects import (
     rename_project, save_pico, save_records, project_progress,
     load_project_state, save_project_state, touch_project,
 )
-from screening import train_and_predict, apply_fn_budget
+from screening import train_and_predict, apply_fn_budget, build_grouped_excel_bytes
 from styles import apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar
 from utils import dataframe_to_excel_bytes
 
@@ -660,8 +660,9 @@ elif nav == "screen":
                 st.caption("실제 Include였지만 교차검증에서 임계값 아래로 예측된 문헌입니다. 모델 개선용으로 먼저 확인하세요.")
                 st.dataframe(fn_df.style.apply(lambda row: ["background-color: #F7D6D2"] * len(row), axis=1), use_container_width=True, height=360)
 
+        st.caption("다운로드 파일은 우선 검토 → 경계 문헌 → False Negative → 안전 제외 후보 순서로 정렬되며, 구간별로 배경색이 다르게 표시됩니다.")
         st.download_button(
-            "AI 순위 결과 다운로드 (AI_Screening_Ranked.xlsx)", dataframe_to_excel_bytes(result.predictions),
+            "AI 순위 결과 다운로드 (AI_Screening_Ranked.xlsx)", build_grouped_excel_bytes(result.predictions),
             "AI_Screening_Ranked.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary", use_container_width=True,
         )

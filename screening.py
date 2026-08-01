@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, field
 from copy import deepcopy
 
 import numpy as np
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -26,6 +31,17 @@ from sklearn.svm import LinearSVC
 
 # 화면에 표시되는 3단계 우선순위 (정렬 순서 그대로 사용)
 PRIORITY_ORDER = ["우선 검토", "경계 문헌", "안전 제외 후보"]
+
+# 엑셀 다운로드 시 구간 순서와 배경색. False Negative는 실제 라벨이 Include인데
+# 컷오프 밖으로 밀려난, 눈에 띄어야 하는 문헌이라 원래 버킷에서 따로 떼어내
+# 독립된 구간으로 모은다 (행이 두 번 나오지 않도록 한 구간에만 배치한다).
+EXPORT_GROUP_ORDER = ["우선 검토", "경계 문헌", "False Negative", "안전 제외 후보"]
+EXPORT_GROUP_COLORS = {
+    "우선 검토": "FFFFFF",       # 흰색
+    "경계 문헌": "E9ECF1",       # 중간 회색
+    "False Negative": "F7D6D2",  # 경고용 붉은색 (기존 FN 탭과 동일 색)
+    "안전 제외 후보": "B8BDC6",  # 진한 회색
+}
 
 
 @dataclass
@@ -446,3 +462,82 @@ def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str 
         roc_curve={"fpr": fpr.tolist(), "tpr": tpr.tolist()},
         confusion={"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
     )
+
+
+def _export_group_labels(predictions: pd.DataFrame) -> pd.Series:
+    """다운로드용 4구간 라벨을 만든다: 우선 검토 -> 경계 문헌 -> False Negative ->
+    안전 제외 후보. False Negative(실제 Include인데 컷오프 아래로 예측된 문헌)는
+    원래 속했던 버킷(보통 경계 문헌 또는 드물게 안전 제외 후보)에서 분리해
+    독립된 구간으로 모아, 다운로드했을 때 놓치면 안 되는 문헌이 눈에 띄도록 한다.
+    한 문헌은 정확히 한 구간에만 속한다 (중복 없음).
+    """
+    rec = predictions.get("AI_Recommendation", pd.Series("", index=predictions.index)).fillna("")
+    is_fn = predictions.get("False_Negative", pd.Series(False, index=predictions.index)).fillna(False).astype(bool)
+    group = np.select(
+        [is_fn, rec.eq("우선 검토"), rec.eq("안전 제외 후보")],
+        ["False Negative", "우선 검토", "안전 제외 후보"],
+        default="경계 문헌",
+    )
+    return pd.Series(group, index=predictions.index, name="_export_group")
+
+
+def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
+    """AI 스크리닝 결과를 우선 검토 -> 경계 문헌 -> False Negative -> 안전 제외 후보
+    순서로 정렬하고, 구간별로 배경색을 입힌 엑셀 파일 바이트를 만든다.
+    """
+    df = predictions.copy()
+    df["_export_group"] = _export_group_labels(df)
+    df["_export_group"] = pd.Categorical(df["_export_group"], EXPORT_GROUP_ORDER, ordered=True)
+    sort_cols = ["_export_group"] + (["AI_Probability"] if "AI_Probability" in df.columns else [])
+    ascending = [True] + ([False] * (len(sort_cols) - 1))
+    df = df.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    group_labels = df["_export_group"].astype(str).tolist()
+    export_df = df.drop(columns=["_export_group"])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "AI_Screening_Ranked"
+
+    for row in dataframe_to_rows(export_df, index=False, header=True):
+        ws.append(row)
+
+    header_fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for i, grp in enumerate(group_labels, start=2):  # 1행은 헤더
+        color = EXPORT_GROUP_COLORS.get(grp, "FFFFFF")
+        fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+        for cell in ws[i]:
+            cell.fill = fill
+
+    for col_idx, col_name in enumerate(export_df.columns, start=1):
+        sample = export_df[col_name].astype(str).head(200).tolist()
+        max_len = max([len(str(col_name))] + [len(v) for v in sample]) if sample else len(str(col_name))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(60, max(10, max_len + 2))
+
+    ws.freeze_panes = "A2"
+
+    legend_ws = wb.create_sheet("안내")
+    legend_ws.append(["구간", "설명"])
+    legend_ws["A1"].font = Font(bold=True)
+    legend_ws["B1"].font = Font(bold=True)
+    legend_rows = [
+        ("우선 검토", "Include 확률이 임계값 이상인 문헌. 사람이 우선적으로 확인해야 합니다."),
+        ("경계 문헌", "임계값 미만이지만 5개 모델(Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도)의 의견이 갈리는 문헌. 반드시 사람이 확인해야 합니다."),
+        ("False Negative", "실제 라벨은 Include였지만 교차검증에서 임계값 아래로 예측된 문헌. 모델 개선 및 재확인이 필요합니다."),
+        ("안전 제외 후보", "5개 모델 모두, 설정한 허용 FN 기준을 지키면서 Exclude 방향으로 동의한 문헌. 사람이 읽지 않아도 되는 문헌입니다."),
+    ]
+    for i, (name, desc) in enumerate(legend_rows, start=2):
+        legend_ws.append([name, desc])
+        color = EXPORT_GROUP_COLORS.get(name, "FFFFFF")
+        legend_ws.cell(row=i, column=1).fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+    legend_ws.column_dimensions["A"].width = 16
+    legend_ws.column_dimensions["B"].width = 90
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
