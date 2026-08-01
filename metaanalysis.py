@@ -645,7 +645,7 @@ def forest_plot_from_R(
         right_margin = max(right_margin, note_w - right_block_w + 0.15)
     fig_w = left_margin + left_block_w + gap + plot_w + gap + right_block_w + right_margin
     row_h = 0.30
-    fig_h = max(4.6, (k + 8.8) * row_h)
+    fig_h = max(5.2, (k + 10.8) * row_h)
 
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=100)
     Y_TITLE = k + 2.55
@@ -653,12 +653,14 @@ def forest_plot_from_R(
     Y_HDR2 = k + 1.45
     Y_SEP1 = k + 1.05
     Y_SEP2 = 0.72
-    Y_POOL = 0.40
-    Y_PI = 0.02
-    Y_NOTE = -0.72
-    Y_AXIS_BASE = Y_SEP2 - 0.35
-    Y_TICKNUM = Y_AXIS_BASE - 0.30
-    Y_SUBTITLE = Y_AXIS_BASE - 1.28
+    # 종합효과, 예측구간, 눈금, 효과크기 축 제목을 단계적으로 아래에 배치해
+    # 하단 텍스트가 서로 겹치지 않도록 충분한 간격을 확보한다.
+    Y_POOL = 0.26
+    Y_PI = -0.20
+    Y_AXIS_BASE = -0.62
+    Y_TICKNUM = -0.92
+    Y_SUBTITLE = -1.46
+    Y_NOTE = -2.02
     Y_MIN = -3.20
     Y_MAX = Y_TITLE + 0.35
 
@@ -794,7 +796,7 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
         p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
         has_egger_line = True
 
-    fig, ax = plt.subplots(figsize=(8.2, 7.2), dpi=100)
+    fig, ax = plt.subplots(figsize=(10.0, 6.6), dpi=100)
     ax.fill_betweenx(se_seq, summary.g - 1.96 * se_seq, summary.g + 1.96 * se_seq,
                      color=C_POOL, alpha=0.10, label="95% pseudo-CI", zorder=1)
     ax.fill_betweenx(se_seq, summary.g - 1.645 * se_seq, summary.g + 1.645 * se_seq,
@@ -811,7 +813,6 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
     half_range = max(1.96 * max_se, float(np.max(np.abs(yi - summary.g))) * 1.12 if len(yi) else 1.0, 0.5)
     ax.set_xlim(summary.g - half_range, summary.g + half_range)
     ax.set_ylim(max_se, 0)
-    ax.set_box_aspect(1.0)
     ax.set_xlabel("Standardized Mean Difference", labelpad=12)
     ax.set_ylabel("Standard Error", labelpad=10)
     ax.set_title(f"Funnel plot — {title}", fontsize=13, loc="left", fontweight="bold", pad=14)
@@ -821,7 +822,7 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
     ax.grid(axis="both", color="#E7E9EE", linewidth=0.6, alpha=0.7)
     fig.text(0.5, 0.035, f"k = {k} effect sizes   |   Egger $p$ {p_txt}",
              fontsize=9.5, color="#555555", ha="center")
-    fig.subplots_adjust(left=0.14, right=0.96, bottom=0.30, top=0.88)
+    fig.subplots_adjust(left=0.12, right=0.97, bottom=0.28, top=0.86)
     return fig
 
 
@@ -1028,7 +1029,7 @@ def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col:
     axes[0].set_yticklabels(studies, fontsize=8.6)
     axes[0].invert_yaxis()
     axes[0].set_xlabel(f"Cook's Distance (approx.)\nThreshold = {thr_cook:.3f}", fontsize=9.5, labelpad=9)
-    axes[0].set_title("A  Cook's Distance", loc="left", fontweight="bold", fontsize=12, pad=10)
+    axes[0].set_title("A  Cook's Distance", x=0.0, ha="left", fontweight="bold", fontsize=12, pad=10)
 
     axes[1].barh(y, dffits, height=0.62, color=[C_PI if f else C_NORM for f in infl_dffits])
     axes[1].axvline(thr_dffits, color=C_PI, ls="--", lw=1.3)
@@ -1036,7 +1037,7 @@ def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col:
     axes[1].set_yticks(y)
     axes[1].tick_params(axis="y", labelleft=False)
     axes[1].set_xlabel(f"DFFITS (approx.)\nThreshold = ±{thr_dffits:.3f}", fontsize=9.5, labelpad=9)
-    axes[1].set_title("B  DFFITS", loc="left", fontweight="bold", fontsize=12, pad=10)
+    axes[1].set_title("B  DFFITS", x=0.0, ha="left", fontweight="bold", fontsize=12, pad=10)
 
     for ax in axes:
         ax.spines["top"].set_visible(False)
@@ -1049,5 +1050,5 @@ def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col:
     fig.legend(handles=handles, loc="lower center", ncol=2, frameon=True, bbox_to_anchor=(0.5, 0.015))
     max_chars = max([len(x) for x in studies], default=10)
     left_margin = min(0.34, max(0.18, 0.012 * max_chars + 0.05))
-    fig.subplots_adjust(left=left_margin, right=0.98, bottom=0.18, top=0.86, wspace=0.20)
+    fig.subplots_adjust(left=left_margin, right=0.98, bottom=0.18, top=0.86, wspace=0.28)
     return fig

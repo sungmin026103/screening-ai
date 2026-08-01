@@ -485,7 +485,7 @@ elif nav == "screen":
 
     st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label에는 1/0 또는 O/X를 사용할 수 있습니다. 검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다.")
     file = st.file_uploader("라벨링된 스크리닝 파일 업로드", type=["xlsx", "xls", "csv"])
-    target_recall = st.slider("목표 재현율 (Recall)", 0.80, 0.99, 0.95, 0.01, help="교차검증 데이터에서 Include 문헌을 보존하도록 임계값을 설정합니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.")
+    target_recall = st.slider("목표 재현율 (Recall)", 0.80, 0.99, 0.98, 0.01, help="교차검증 데이터에서 Include 문헌을 보존하도록 임계값을 설정합니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.")
     if file:
         df = pd.read_excel(file) if Path(file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(file)
         st.dataframe(df.head(20), use_container_width=True)
@@ -506,7 +506,7 @@ elif nav == "screen":
         with rc1:
             display_recall = st.slider(
                 "적용할 목표 재현율", 0.90, 0.995,
-                float(st.session_state.get("screening_target_recall", max(0.90, min(0.995, result.metrics.get("recall", 0.95))))),
+                float(st.session_state.get("screening_target_recall", max(0.90, min(0.995, result.metrics.get("recall", 0.98))))),
                 0.005, format="%.1f%%",
                 help="슬라이더를 높이면 놓치는 Include 문헌은 줄지만 우선 검토 문헌 수는 늘어납니다.",
                 key="screening_recall_adjust",
@@ -514,9 +514,10 @@ elif nav == "screen":
         with rc2:
             very_low_cutoff = st.number_input(
                 "매우 낮은 확률 기준", min_value=0.0001, max_value=0.05, value=0.005, step=0.0005, format="%.4f",
-                help="이 값 미만은 진한 회색으로 표시합니다.",
+                help="이 값과 검증 데이터의 FN=0 안전 기준 중 더 엄격한 값을 적용해 진한 회색으로 표시합니다.",
             )
         adjusted = apply_recall_target(result, display_recall, very_low_cutoff)
+        applied_vl_cutoff = float(adjusted.predictions.get("Very_Low_Cutoff", pd.Series([very_low_cutoff])).iloc[0])
         st.session_state["screening_target_recall"] = display_recall
         if adjusted.threshold != result.threshold or not adjusted.predictions.equals(result.predictions):
             result = adjusted
@@ -576,7 +577,10 @@ elif nav == "screen":
         c2.metric("후순위 검토", f"{int(counts.get('후순위 검토', 0)):,}편")
         c3.metric("매우 낮은 확률", f"{int(counts.get('매우 낮은 확률', 0)):,}편")
         saved_n = int(counts.get("매우 낮은 확률", 0))
-        st.info(f"매우 낮은 확률 문헌 {saved_n:,}편은 진한 회색으로 구분되며, 기본적으로 가장 아래에 정렬됩니다.")
+        st.info(
+            f"매우 낮은 확률 문헌 {saved_n:,}편은 진한 회색으로 구분되며 가장 아래에 정렬됩니다. "
+            f"적용 기준은 Include 확률 < {applied_vl_cutoff:.5f}이며, 라벨링된 교차검증 데이터에서 이 구간의 False Negative가 0편이 되도록 제한합니다."
+        )
 
         tab_ranked, tab_fn = st.tabs(["우선순위 결과", f"False Negative 검토 ({result.confusion.get('fn', 0)}편)"])
         with tab_ranked:

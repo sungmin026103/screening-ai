@@ -149,6 +149,25 @@ def _build_pipeline(criteria_text: str = "") -> Pipeline:
     return Pipeline([("features", features), ("model", model)])
 
 
+def _safe_zero_fn_cutoff(pred_df: pd.DataFrame, fallback: float = 0.005) -> float:
+    """Return the largest cutoff that leaves zero labeled Include records below it.
+
+    The cutoff is estimated only from out-of-fold probabilities. A small epsilon keeps
+    records exactly at the minimum Include probability out of the very-low group.
+    """
+    required = {"CV_Probability", "Human_Label_Normalized"}
+    if not required.issubset(pred_df.columns):
+        return float(fallback)
+    inc = pd.to_numeric(
+        pred_df.loc[pred_df["Human_Label_Normalized"] == 1, "CV_Probability"],
+        errors="coerce",
+    ).dropna()
+    if inc.empty:
+        return float(fallback)
+    min_inc = float(inc.min())
+    return max(0.0, min_inc - max(1e-12, abs(min_inc) * 1e-9))
+
+
 def _priority_labels(probabilities: np.ndarray, threshold: float, very_low_cutoff: float = 0.005) -> np.ndarray:
     """확률을 실제 검토 목적에 맞는 3단계로 구분한다."""
     cutoff = min(float(very_low_cutoff), max(float(threshold) * 0.95, 0.0))
@@ -173,7 +192,10 @@ def apply_recall_target(result: ScreeningResult, target_recall: float, very_low_
 
     pred_df = updated.predictions.copy()
     probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
-    pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, very_low_cutoff)
+    safe_cutoff = _safe_zero_fn_cutoff(pred_df, fallback=very_low_cutoff)
+    effective_cutoff = min(float(very_low_cutoff), float(safe_cutoff), float(threshold))
+    pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, effective_cutoff)
+    pred_df["Very_Low_Cutoff"] = effective_cutoff
 
     if {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
         mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
@@ -251,7 +273,10 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     result_df.loc[labeled.index, "CV_Prediction"] = pred
     result_df["False_Negative"] = False
     result_df.loc[labeled.index, "False_Negative"] = (y == 1) & (pred == 0)
-    result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, 0.005)
+    safe_cutoff = _safe_zero_fn_cutoff(result_df, fallback=0.005)
+    effective_cutoff = min(0.005, safe_cutoff, threshold)
+    result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, effective_cutoff)
+    result_df["Very_Low_Cutoff"] = effective_cutoff
     order = pd.Categorical(result_df["AI_Recommendation"], ["우선 검토", "후순위 검토", "매우 낮은 확률"], ordered=True)
     result_df = result_df.assign(_priority_order=order).sort_values(
         ["_priority_order", "AI_Probability"], ascending=[True, False]
