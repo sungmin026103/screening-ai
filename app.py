@@ -22,7 +22,7 @@ from projects import (
     rename_project, save_pico, save_records, project_progress,
     load_project_state, save_project_state, touch_project,
 )
-from screening import train_and_predict, apply_recall_target
+from screening import train_and_predict, apply_fn_budget
 from styles import apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar
 from utils import dataframe_to_excel_bytes
 
@@ -311,16 +311,20 @@ if nav == "dashboard":
             st.markdown('<div class="section-title" style="margin-top:22px;">AI 성능 요약</div>', unsafe_allow_html=True)
             if result:
                 m = result.metrics
+                total_n = len(result.predictions)
+                safe_n = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                reduction_rate = (safe_n / total_n * 100) if total_n else 0.0
                 perf_rows = [
-                    ("정확도 (Accuracy)", m.get("accuracy", 0)), ("재현율 (Recall)", m["recall"]),
-                    ("정밀도 (Precision)", m["precision"]), ("F1 Score", m.get("f1", 0)),
-                    ("ROC AUC", m["roc_auc"]),
+                    ("검토량 절감률", f"{reduction_rate:.1f}%"),
+                    ("허용 FN / 실측 FN", f"{m.get('allowed_fn', 0)} / {m.get('measured_fn', m.get('safe_exclude_cv_false_negatives', 0))}"),
+                    ("정확도 (Accuracy)", f"{m.get('accuracy', 0):.3f}"), ("정밀도 (Precision)", f"{m['precision']:.3f}"),
+                    ("재현율 (Recall, 참고용)", f"{m['recall']:.3f}"),
                 ]
                 perf_html = "".join(
                     f'<div style="display:flex;justify-content:space-between;padding:6px 0;'
                     f'border-bottom:1px solid var(--line);font-size:.86rem;">'
                     f'<span style="color:var(--slate);">{label}</span>'
-                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;color:var(--ink);">{val:.3f}</span></div>'
+                    f'<span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;color:var(--ink);">{val}</span></div>'
                     for label, val in perf_rows
                 )
                 st.markdown(f'<div>{perf_html}</div>', unsafe_allow_html=True)
@@ -485,47 +489,43 @@ elif nav == "screen":
 
     st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label에는 1/0 또는 O/X를 사용할 수 있습니다. 검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다.")
     file = st.file_uploader("라벨링된 스크리닝 파일 업로드", type=["xlsx", "xls", "csv"])
-    target_recall = st.slider("목표 재현율 (Recall)", 0.80, 0.99, 0.98, 0.01, help="교차검증 데이터에서 Include 문헌을 보존하도록 임계값을 설정합니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.")
+    allowed_fn_initial = st.number_input(
+        "허용 False Negative 수", min_value=0, max_value=50, value=0, step=1,
+        help="라벨된 Include 문헌 중 '우선 검토' 밖으로 놓치는 것을 허용하는 최대 개수입니다. 0이면 라벨 데이터에서 하나도 놓치지 않도록 임계값을 가장 보수적으로 잡습니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.",
+    )
     if file:
         df = pd.read_excel(file) if Path(file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(file)
         st.dataframe(df.head(20), use_container_width=True)
         if st.button("모델 학습 및 순위 매기기", type="primary", use_container_width=True):
             try:
                 with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
-                    result = train_and_predict(df, target_recall, criteria_text=criteria_text)
+                    result = train_and_predict(df, allowed_fn=int(allowed_fn_initial), criteria_text=criteria_text)
                 st.session_state["screening_result"] = result
                 save_project_state(active, "screening_result", result)
-                log_activity("🤖", "AI 스크리닝 완료", f"재현율 {result.metrics['recall']*100:.1f}%, Include 후보 {int((result.predictions['AI_Recommendation']=='우선 검토').sum()):,}건")
+                safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                log_activity("🤖", "AI 스크리닝 완료", f"검토량 절감 {safe_n0:,}건, 허용 FN {result.metrics.get('allowed_fn', 0)} / 실측 FN {result.metrics.get('measured_fn', 0)}")
             except Exception as exc:
                 st.error(str(exc))
 
     result = st.session_state.get("screening_result")
     if result:
         st.markdown('<div class="section-title" style="margin-top:18px;">검토 기준 조정</div>', unsafe_allow_html=True)
-        display_recall = st.slider(
-            "적용할 목표 재현율", 0.90, 0.995,
-            float(st.session_state.get("screening_target_recall", max(0.90, min(0.995, result.metrics.get("recall", 0.98))))),
-            0.005, format="%.1f%%",
-            help="목표 재현율 이상을 만족하는 임계값 중 가장 높은 값을 사용합니다. 슬라이더를 높이면 놓치는 Include 문헌은 줄지만 우선 검토 문헌 수는 늘어납니다.",
-            key="screening_recall_adjust",
+        allowed_fn = st.number_input(
+            "허용 False Negative 수",
+            min_value=0, max_value=max(50, int(result.metrics.get("include_n", 50))),
+            value=int(st.session_state.get("screening_allowed_fn", result.metrics.get("allowed_fn", 0))),
+            step=1,
+            help="라벨 데이터에서 Include 문헌을 최대 몇 편까지 놓쳐도 되는지 직접 정합니다. 0에 가까울수록 '우선 검토'와 '안전 제외 후보' 모두 더 보수적(안전)으로 잡히고, 검토량 절감률은 낮아질 수 있습니다.",
+            key="screening_allowed_fn_input",
         )
-        adjusted = apply_recall_target(result, display_recall)
-        st.session_state["screening_target_recall"] = display_recall
+        adjusted = apply_fn_budget(result, int(allowed_fn))
+        st.session_state["screening_allowed_fn"] = int(allowed_fn)
         if adjusted.threshold != result.threshold or not adjusted.predictions.equals(result.predictions):
             result = adjusted
             st.session_state["screening_result"] = result
             save_project_state(active, "screening_result", result)
 
-        st.markdown('<div class="section-title" style="margin-top:18px;">모델 성능</div>', unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("재현율 (Recall)", f"{result.metrics['recall']*100:.1f}%")
-        with c2:
-            st.metric("정밀도 (Precision)", f"{result.metrics['precision']*100:.1f}%")
-        with c3:
-            st.metric("ROC AUC", f"{result.metrics['roc_auc']:.3f}")
-        with c4:
-            st.metric("적용 임계값", f"{result.threshold:.3f}")
+
 
         total_n = len(result.predictions)
         safe_exclude_n = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
@@ -533,27 +533,54 @@ elif nav == "screen":
         avg_safety_score = float(result.predictions.loc[
             result.predictions["AI_Recommendation"] == "안전 제외 후보", "Safety_Score"
         ].mean()) if safe_exclude_n else 0.0
-
-        st.markdown('<div class="section-title" style="margin-top:18px;">검토 부담 절감 대시보드</div>', unsafe_allow_html=True)
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("검토량 절감률", f"{reduction_rate:.1f}%", help="사람이 읽지 않아도 되는 '안전 제외 후보'가 전체 문헌에서 차지하는 비율입니다.")
-        d2.metric("AI Safety Score", f"{avg_safety_score:.3f}" if safe_exclude_n else "-", help="안전 제외 후보로 분류된 문헌들의 평균 안전 점수입니다. Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도 등 서로 다른 근거를 가진 모델들이 Exclude 방향으로 동의한 정도(1에 가까울수록 강한 합의)를 나타냅니다.")
-        d3.metric("안전 제외 후보 수", f"{safe_exclude_n:,}편")
-        d4.metric("현재 Threshold", f"{result.threshold:.3f}")
-        d5.metric("False Negative", f"{result.confusion.get('fn', 0)}건", help="교차검증에서 실제 Include였지만 임계값 아래로 예측된 건수입니다.")
-
+        allowed_fn_val = int(result.metrics.get("allowed_fn", 0))
+        measured_fn_val = int(result.metrics.get("measured_fn", result.confusion.get("fn", 0)))
         safe_cv_fn = result.metrics.get("safe_exclude_cv_false_negatives", 0)
         safe_cv_n = result.metrics.get("safe_exclude_cv_n", 0)
+
+        st.markdown('<div class="section-title" style="margin-top:18px;">검토 부담 절감 대시보드</div>', unsafe_allow_html=True)
+        headline_html = f'''
+        <div style="display:flex; gap:16px; margin-bottom:14px;">
+          <div style="flex:1; padding:20px; border-radius:14px; background:linear-gradient(135deg,#0F4C3A,#1B6F52); color:#fff;">
+            <div style="font-size:.85rem; opacity:.85;">검토량 절감률</div>
+            <div style="font-size:2.4rem; font-weight:800; line-height:1.2;">{reduction_rate:.1f}%</div>
+            <div style="font-size:.78rem; opacity:.8;">사람이 읽지 않아도 되는 '안전 제외 후보'의 비율</div>
+          </div>
+          <div style="flex:1; padding:20px; border-radius:14px; background:#1F2937; color:#fff;">
+            <div style="font-size:.85rem; opacity:.85;">허용 FN / 실측 FN</div>
+            <div style="font-size:2.4rem; font-weight:800; line-height:1.2;">{allowed_fn_val} / {measured_fn_val}</div>
+            <div style="font-size:.78rem; opacity:.8;">라벨 데이터에서 허용하기로 한 개수 대비 실제 측정치</div>
+          </div>
+        </div>
+        '''
+        st.markdown(headline_html, unsafe_allow_html=True)
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("AI Safety Score", f"{avg_safety_score:.3f}" if safe_exclude_n else "-", help="안전 제외 후보로 분류된 문헌들의 평균 안전 점수입니다. Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도 등 서로 다른 근거를 가진 모델들이 Exclude 방향으로 동의한 정도(1에 가까울수록 강한 합의)를 나타냅니다.")
+        d2.metric("안전 제외 후보 수", f"{safe_exclude_n:,}편")
+        d3.metric("안전 제외 후보 중 실제 FN (교차검증)", f"{safe_cv_fn}건 / 후보 {safe_cv_n:,}건", help="안전 제외 후보 조건에 해당했던 라벨 문헌 중 실제로는 Include였던 건수입니다. 5개 신호가 모두 같은 허용 FN 기준을 지키며 동의한 경우만 인정하므로, 이 값은 항상 위의 '허용 FN' 이하로 유지됩니다.")
+
         if safe_cv_fn > 0:
             st.warning(
                 f"⚠️ 교차검증 기준으로, 안전 제외 후보 조건에 해당했던 라벨 문헌 {safe_cv_n:,}건 중 "
-                f"{safe_cv_fn:,}건이 실제로는 Include였습니다. 안전 제외 후보라도 전수 확인을 권장합니다."
+                f"{safe_cv_fn:,}건이 실제로는 Include였습니다. 허용 FN을 더 낮추면 이 값도 함께 줄어듭니다."
             )
         else:
             st.success(
                 f"✅ 교차검증 기준으로, 안전 제외 후보 조건에 해당했던 라벨 문헌 {safe_cv_n:,}건 중 "
                 f"실제 Include로 확인된 False Negative는 0건입니다."
             )
+
+        with st.expander("모델 참고 지표 (Recall / Precision / ROC AUC 등)"):
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("재현율 (Recall)", f"{result.metrics['recall']*100:.1f}%")
+            with c2:
+                st.metric("정밀도 (Precision)", f"{result.metrics['precision']*100:.1f}%")
+            with c3:
+                st.metric("ROC AUC", f"{result.metrics['roc_auc']:.3f}")
+            with c4:
+                st.metric("적용 임계값", f"{result.threshold:.3f}")
 
         row1a, row1b = st.columns(2)
         with row1a:

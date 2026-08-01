@@ -33,7 +33,7 @@ class ScreeningResult:
     predictions: pd.DataFrame
     metrics: dict
     threshold: float
-    pr_curve: dict = field(default_factory=dict)   # {"precision": [...], "recall": [...], "thresholds": [...]}
+    pr_curve: dict = field(default_factory=dict)   # {"precision": [...], "recall": [...], "thresholds": [...]} (참고용 차트)
     roc_curve: dict = field(default_factory=dict)   # {"fpr": [...], "tpr": [...]}
     confusion: dict = field(default_factory=dict)   # {"tn":.., "fp":.., "fn":.., "tp":..}
 
@@ -169,8 +169,8 @@ def _build_pipeline(criteria_text: str = "") -> Pipeline:
 
 
 # ---------------------------------------------------------------------------
-# 안전 제외 후보(Safety Score)를 위한 보조 뷰 모델들.
-# 메인 랭킹 모델(위 _build_pipeline)은 그대로 유지하고, "확률 하나"만으로
+# 안전 제외 후보를 위한 보조 뷰 모델들.
+# 메인 랭킹 모델(위 _build_pipeline)은 그대로 유지하고, 확률 하나만으로
 # 안전 제외를 결정하지 않기 위해 서로 다른 근거(단어 TF-IDF만, 문자 TF-IDF만,
 # 전체 피처 기반 로지스틱 회귀, PICO 유사도만)로 학습한 표준 sklearn 모델의
 # 의견을 추가로 모은다. 모두 검증 fold 누수 없이 cross_val_predict로 계산한다.
@@ -221,25 +221,33 @@ def _compute_safety_signals(
     return signals
 
 
-def _signal_safe_cutoff(cv_probs: np.ndarray, y: np.ndarray, target_recall: float) -> float:
-    """단일 신호(뷰)의 라벨 데이터 교차검증 확률만으로, 그 신호 혼자 판단해도
-    목표 재현율 이상(>=)을 지킬 수 있는 가장 높은 컷오프를 계산한다.
-    0.5 같은 임의의 고정값이 아니라 메인 임계값과 동일한 기준(목표 재현율)으로
-    보수적인 컷오프를 잡기 때문에, 신호 하나의 판단 기준이 느슨해서 안전 제외
-    후보에 실제 Include 문헌이 섞여 들어가는 문제를 줄여준다.
-    """
-    precision, recall, thresholds = precision_recall_curve(y, cv_probs)
-    if len(thresholds) == 0:
+# ---------------------------------------------------------------------------
+# 허용 False Negative(FN) 개수 기반 컷오프.
+#
+# "재현율 몇 %" 대신, 사람이 이해하기 쉬운 절대 개수("Include 문헌을 최대 N편까지만
+# 놓치는 것을 허용")로 임계값을 정한다. 라벨된 Include 문헌들의 교차검증 확률을
+# 오름차순 정렬해서, 가장 낮은 N개까지만 컷오프 아래로 떨어지도록 컷오프를 잡으면
+# "이 컷오프를 쓰는 한 최대 N개까지만 놓친다"는 것이 라벨 데이터 위에서 수학적으로
+# 보장된다. 안전 제외 후보 판정에 쓰이는 5개 신호 모두 같은 방식으로 컷오프를 잡고
+# "모두 동의(교집합)"할 때만 안전 제외로 인정하므로, 안전 제외 후보 버킷의 FN 개수는
+# 항상 이 허용치 이하로 유지된다 (교집합이므로 개별 신호의 FN 개수를 넘을 수 없다).
+# ---------------------------------------------------------------------------
+
+def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int) -> float:
+    inc_probs = np.sort(np.asarray(cv_probs, dtype=float)[np.asarray(y) == 1])
+    if len(inc_probs) == 0:
         return 0.5
-    valid = np.where(recall[:-1] >= float(target_recall))[0]
-    return float(thresholds[valid[-1]]) if len(valid) else float(thresholds[0])
+    allowed_fn = max(0, int(allowed_fn))
+    if allowed_fn >= len(inc_probs):
+        return 0.0  # 전부 놓쳐도 된다면 사실상 컷오프 없음 (거의 모든 문헌이 후보가 될 수 있음)
+    return float(inc_probs[allowed_fn])
 
 
-def _recompute_unanimous_exclude(pred_df: pd.DataFrame, target_recall: float):
+def _recompute_unanimous_exclude(pred_df: pd.DataFrame, allowed_fn: int):
     """저장된 각 신호의 (라벨 데이터 교차검증 확률, 전체 데이터 확률) 컬럼으로부터
-    신호별 안전 컷오프를 다시 계산하고, 모든 신호의 확률이 각자의 컷오프보다
+    신호별 '허용 FN' 컷오프를 다시 계산하고, 모든 신호의 확률이 각자의 컷오프보다
     낮을 때만 안전 제외 후보로 인정한다. 모델을 재학습하지 않고 저장된 확률만
-    사용하므로 재현율 슬라이더를 움직여도 즉시 재계산된다.
+    사용하므로 허용 FN 값을 바꿔도 즉시 재계산된다.
     """
     signal_names = [c[len("Prob_"):] for c in pred_df.columns if c.startswith("Prob_")]
     mask = pred_df["Human_Label_Normalized"].isin([0, 1])
@@ -254,7 +262,7 @@ def _recompute_unanimous_exclude(pred_df: pd.DataFrame, target_recall: float):
     safety_terms = []
     for name in signal_names:
         cv_probs = pd.to_numeric(pred_df.loc[mask, f"CV_Prob_{name}"], errors="coerce").to_numpy()
-        cutoff = _signal_safe_cutoff(cv_probs, y, target_recall) if len(cv_probs) else 0.5
+        cutoff = _fn_budget_cutoff(cv_probs, y, allowed_fn) if len(cv_probs) else 0.5
         all_probs = pd.to_numeric(pred_df[f"Prob_{name}"], errors="coerce").to_numpy()
         unanimous_all &= (all_probs < cutoff)
         unanimous_cv_labeled &= (cv_probs < cutoff)
@@ -271,7 +279,8 @@ def _priority_labels(probabilities: np.ndarray, threshold: float, unanimous_excl
 
     - 우선 검토: Include 확률이 임계값 이상 (흰색)
     - 안전 제외 후보: 임계값 미만이면서, Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM(메인 모델),
-      PICO 유사도(있는 경우) 등 서로 다른 근거를 가진 모든 모델이 Exclude 방향으로 동의 (진한 회색)
+      PICO 유사도(있는 경우) 등 서로 다른 근거를 가진 모든 모델이 "허용 FN 이하" 조건을
+      각자 만족하며 Exclude 방향으로 동의 (진한 회색)
     - 경계 문헌: 임계값 미만이지만 모델들의 의견이 갈리는 경우, 사람이 반드시 확인 (중간 회색)
     """
     probabilities = np.asarray(probabilities, dtype=float)
@@ -289,58 +298,58 @@ def _sort_by_priority(pred_df: pd.DataFrame) -> pd.DataFrame:
     ).drop(columns="_priority_order").reset_index(drop=True)
 
 
-def apply_recall_target(result: ScreeningResult, target_recall: float) -> ScreeningResult:
+def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult:
     """저장된 교차검증 확률(메인 모델 + 보조 신호들)을 사용해 재학습 없이
-    임계값과 화면 분류(우선 검토 / 경계 문헌 / 안전 제외 후보)를 갱신한다.
-    안전 제외 후보 조건(신호별 컷오프)도 새 목표 재현율에 맞춰 함께 다시 계산된다.
+    '허용 False Negative 개수'만 바꿔 임계값과 화면 분류(우선 검토 / 경계 문헌 /
+    안전 제외 후보)를 다시 계산한다.
     """
     updated = deepcopy(result)
-    precision = np.asarray(updated.pr_curve.get("precision", []), dtype=float)
-    recall = np.asarray(updated.pr_curve.get("recall", []), dtype=float)
-    thresholds = np.asarray(updated.pr_curve.get("thresholds", []), dtype=float)
-    if len(thresholds) == 0 or len(recall) < 2:
+    pred_df = updated.predictions.copy()
+
+    if not {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
         return updated
-    # 목표 재현율 이상(>=)을 만족하는 threshold 중 가장 높은 threshold를 선택한다.
-    valid = np.where(recall[:-1] >= float(target_recall))[0]
-    threshold = float(thresholds[valid[-1]]) if len(valid) else float(thresholds[0])
+
+    mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
+    y_labeled = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
+    cv_probs_main = pd.to_numeric(pred_df.loc[mask, "CV_Probability"], errors="coerce").to_numpy()
+    threshold = _fn_budget_cutoff(cv_probs_main, y_labeled, allowed_fn)
     updated.threshold = threshold
 
-    pred_df = updated.predictions.copy()
     probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
-
     unanimous_exclude, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn = _recompute_unanimous_exclude(
-        pred_df, target_recall
+        pred_df, allowed_fn
     )
     pred_df["Safety_Score"] = safety_score
     pred_df["Unanimous_Exclude"] = unanimous_exclude
     pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, unanimous_exclude)
+    updated.metrics["allowed_fn"] = int(allowed_fn)
     updated.metrics["safe_exclude_cv_n"] = safe_exclude_cv_n
     updated.metrics["safe_exclude_cv_false_negatives"] = safe_exclude_cv_fn
 
-    if {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
-        mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
-        cv_probs = pd.to_numeric(pred_df.loc[mask, "CV_Probability"], errors="coerce").to_numpy()
-        y = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
-        cv_pred = (cv_probs >= threshold).astype(int)
-        pred_df.loc[:, "CV_Prediction"] = np.nan
-        pred_df.loc[mask, "CV_Prediction"] = cv_pred
-        pred_df.loc[:, "False_Negative"] = False
-        pred_df.loc[mask, "False_Negative"] = (y == 1) & (cv_pred == 0)
-        tn, fp, fn, tp = confusion_matrix(y, cv_pred, labels=[0, 1]).ravel()
-        rec = float(recall_score(y, cv_pred, zero_division=0))
-        pre = float(precision_score(y, cv_pred, zero_division=0))
-        updated.confusion = {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
-        updated.metrics.update({
-            "recall": rec, "precision": pre,
-            "accuracy": float(accuracy_score(y, cv_pred)),
-            "f1": float(2 * pre * rec / (pre + rec)) if pre + rec > 0 else 0.0,
-        })
+    cv_pred = (cv_probs_main >= threshold).astype(int)
+    pred_df.loc[:, "CV_Prediction"] = np.nan
+    pred_df.loc[mask, "CV_Prediction"] = cv_pred
+    pred_df.loc[:, "False_Negative"] = False
+    pred_df.loc[mask, "False_Negative"] = (y_labeled == 1) & (cv_pred == 0)
+    tn, fp, fn, tp = confusion_matrix(y_labeled, cv_pred, labels=[0, 1]).ravel()
+    rec = float(recall_score(y_labeled, cv_pred, zero_division=0))
+    pre = float(precision_score(y_labeled, cv_pred, zero_division=0))
+    updated.confusion = {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+    updated.metrics.update({
+        "recall": rec, "precision": pre,
+        "accuracy": float(accuracy_score(y_labeled, cv_pred)),
+        "f1": float(2 * pre * rec / (pre + rec)) if pre + rec > 0 else 0.0,
+        "measured_fn": int(fn),
+    })
 
     updated.predictions = _sort_by_priority(pred_df)
     return updated
 
 
-def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_text: str = "") -> ScreeningResult:
+def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str = "") -> ScreeningResult:
+    """allowed_fn: 라벨된 Include 문헌 중 '우선 검토' 밖으로 놓치는 것을 허용하는
+    최대 개수. 0이면 라벨 데이터에서 하나도 놓치지 않도록 임계값을 최대한 보수적으로 잡는다.
+    """
     data, _ = prepare_screening_data(df)
     labeled = data[data["Human_Label"].isin([0, 1])].copy()
     if len(labeled) < 20 or labeled["Human_Label"].nunique() < 2:
@@ -358,17 +367,23 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     # 처음부터 다시 학습한다. train만으로 학습하기 때문에 검증 성능이 부풀려지지 않는다.
     probs = cross_val_predict(_build_pipeline(criteria_text), texts, y, cv=cv, method="predict_proba")[:, 1]
 
-    precision, recall, thresholds = precision_recall_curve(y, probs)
-    # 목표 재현율 이상(>=)을 만족하는 threshold 중 가장 높은 threshold를 선택한다.
-    valid = np.where(recall[:-1] >= target_recall)[0]
-    threshold = float(thresholds[valid[-1]]) if len(valid) else 0.5
+    # Precision-Recall 곡선은 참고용 차트로만 계산해서 보여준다 (임계값 결정에는 쓰지 않음).
+    precision, recall, pr_thresholds = precision_recall_curve(y, probs)
+    fpr, tpr, _ = roc_curve(y, probs)
+
+    # 임계값은 '허용 FN 개수'로 직접 정한다: 라벨 Include 중 확률이 가장 낮은
+    # allowed_fn개까지만 임계값 아래로 떨어지도록 하는 가장 관대한(=검토량이 가장 적은)
+    # 임계값을 선택한다. allowed_fn=0이면 Include 중 가장 낮은 확률값이 곧 임계값이 되어
+    # 라벨 데이터에서 하나도 놓치지 않는다.
+    threshold = _fn_budget_cutoff(probs, y, allowed_fn)
     pred = (probs >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
-    fpr, tpr, _ = roc_curve(y, probs)
 
     recall_v = float(recall_score(y, pred, zero_division=0))
     precision_v = float(precision_score(y, pred, zero_division=0))
     metrics = {
+        "allowed_fn": int(allowed_fn),
+        "measured_fn": int(fn),
         "recall": recall_v,
         "precision": precision_v,
         "accuracy": float(accuracy_score(y, pred)),
@@ -385,9 +400,9 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
     final_pipeline.fit(texts, y)
     all_probs = final_pipeline.predict_proba(all_texts)[:, 1]
 
-    # --- Safety Score: 서로 다른 근거를 가진 여러 모델이, "각자의 기준으로도
-    # 목표 재현율을 지킬 수 있는 컷오프" 아래일 때만 안전 제외 후보로 인정한다.
-    # (Include 확률 하나만 보거나, 임의의 0.5 컷오프에 의존하지 않는다.)
+    # --- 안전 제외 후보: 서로 다른 근거를 가진 5개 신호가 "각자 같은 허용 FN
+    # 기준으로도 안전한" 컷오프 아래일 때만 인정한다. 최대한 많이 거르는 것이
+    # 아니라, 거의 틀리지 않는 것만 거른다.
     aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text)
     aux_signals["linear_svm"] = {"cv": probs, "all": all_probs}  # 메인 모델도 하나의 투표로 포함
 
@@ -408,10 +423,11 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
         result_df.loc[labeled.index, f"CV_Prob_{name}"] = sig["cv"]
 
     unanimous_exclude_all, safety_score_all, safe_exclude_cv_n, safe_exclude_cv_fn = _recompute_unanimous_exclude(
-        result_df, target_recall
+        result_df, allowed_fn
     )
     # 라벨 데이터에서 "안전 제외 후보로 분류되었지만 실제로는 Include였던" 건수를
-    # 교차검증 기준으로 집계해 이 버킷의 신뢰도를 투명하게 보여준다 (이상적으로는 0).
+    # 교차검증 기준으로 집계한다. 5개 신호 모두 같은 허용 FN 기준으로 컷오프를 잡고
+    # 교집합(모두 동의)만 인정하므로, 이 값은 수학적으로 allowed_fn을 넘을 수 없다.
     metrics["safe_exclude_cv_n"] = safe_exclude_cv_n
     metrics["safe_exclude_cv_false_negatives"] = safe_exclude_cv_fn
     metrics["safety_signal_count"] = len(aux_signals)
@@ -426,7 +442,7 @@ def train_and_predict(df: pd.DataFrame, target_recall: float = 0.95, criteria_te
         predictions=result_df,
         metrics=metrics,
         threshold=threshold,
-        pr_curve={"precision": precision.tolist(), "recall": recall.tolist(), "thresholds": thresholds.tolist()},
+        pr_curve={"precision": precision.tolist(), "recall": recall.tolist(), "thresholds": pr_thresholds.tolist()},
         roc_curve={"fpr": fpr.tolist(), "tpr": tpr.tolist()},
         confusion={"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
     )
