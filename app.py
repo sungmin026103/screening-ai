@@ -22,7 +22,13 @@ from projects import (
     rename_project, save_pico, save_records, project_progress,
     load_project_state, save_project_state, touch_project,
 )
-from screening import train_and_predict, apply_fn_budget, build_grouped_excel_bytes
+from screening import (
+    train_and_predict,
+    apply_recall_target,
+    build_grouped_excel_bytes,
+    RECALL_TARGET_PRESETS,
+    DEFAULT_RECALL_TARGET,
+)
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
 from utils import dataframe_to_excel_bytes
@@ -492,9 +498,17 @@ elif nav == "screen":
 
     st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label에는 1/0 또는 O/X를 사용할 수 있습니다. 검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다.")
     file = st.file_uploader("라벨링된 스크리닝 파일 업로드", type=["xlsx", "xls", "csv"])
-    allowed_fn_initial = st.number_input(
-        "허용 False Negative 수", min_value=0, max_value=50, value=0, step=1,
-        help="라벨된 Include 문헌 중 '우선 검토' 밖으로 놓치는 것을 허용하는 최대 개수입니다. 0이면 라벨 데이터에서 하나도 놓치지 않도록 임계값을 가장 보수적으로 잡습니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요.",
+    recall_pct_options = [int(r * 100) for r in RECALL_TARGET_PRESETS]
+    recall_pct_initial = st.selectbox(
+        "목표 재현율 (허용 FN은 이 값에서 자동 계산됩니다)",
+        options=recall_pct_options,
+        index=recall_pct_options.index(int(DEFAULT_RECALL_TARGET * 100)),
+        format_func=lambda v: f"{v}%",
+        help=(
+            "라벨 Include 문헌 중 최소 이 비율 이상은 반드시 '우선 검토' 또는 '경계 문헌'에 남도록 "
+            "임계값을 정합니다. '허용 FN 개수'를 직접 입력하지 않고, 고정된 재현율 목표에서 라벨 수에 맞춰 "
+            "자동으로 계산하므로 매번 기준이 흔들리지 않습니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요."
+        ),
     )
     if file:
         df = pd.read_excel(file) if Path(file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(file)
@@ -502,27 +516,32 @@ elif nav == "screen":
         if st.button("모델 학습 및 순위 매기기", type="primary", use_container_width=True):
             try:
                 with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
-                    result = train_and_predict(df, allowed_fn=int(allowed_fn_initial), criteria_text=criteria_text)
+                    result = train_and_predict(df, recall_target=recall_pct_initial / 100, criteria_text=criteria_text)
                 st.session_state["screening_result"] = result
                 save_project_state(active, "screening_result", result)
                 safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-                log_activity("🤖", "AI 스크리닝 완료", f"검토량 절감 {safe_n0:,}건, 허용 FN {result.metrics.get('allowed_fn', 0)} / 실측 FN {result.metrics.get('measured_fn', 0)}")
+                log_activity("🤖", "AI 스크리닝 완료", f"검토량 절감 {safe_n0:,}건, 목표 재현율 {recall_pct_initial}% (허용 FN {result.metrics.get('allowed_fn', 0)}) / 실측 FN {result.metrics.get('measured_fn', 0)}")
             except Exception as exc:
                 st.error(str(exc))
 
     result = st.session_state.get("screening_result")
     if result:
         st.markdown('<div class="section-title" style="margin-top:18px;">검토 기준 조정</div>', unsafe_allow_html=True)
-        allowed_fn = st.number_input(
-            "허용 False Negative 수",
-            min_value=0, max_value=max(50, int(result.metrics.get("include_n", 50))),
-            value=int(st.session_state.get("screening_allowed_fn", result.metrics.get("allowed_fn", 0))),
-            step=1,
-            help="라벨 데이터에서 Include 문헌을 최대 몇 편까지 놓쳐도 되는지 직접 정합니다. 0에 가까울수록 '우선 검토'와 '안전 제외 후보' 모두 더 보수적(안전)으로 잡히고, 검토량 절감률은 낮아질 수 있습니다.",
-            key="screening_allowed_fn_input",
+        recall_pct = st.selectbox(
+            "목표 재현율",
+            options=recall_pct_options,
+            index=recall_pct_options.index(
+                int(round(st.session_state.get("screening_recall_target", result.metrics.get("recall_target", DEFAULT_RECALL_TARGET)) * 100))
+            ),
+            format_func=lambda v: f"{v}% (허용 FN 자동 계산)",
+            help=(
+                "재학습 없이 정책만 바꿔 비교할 수 있습니다. '허용 FN 개수'를 직접 조정하는 게 아니라, "
+                "라벨 Include 수로부터 이 재현율 목표를 만족하는 허용 FN을 매번 동일한 규칙으로 자동 계산합니다."
+            ),
+            key="screening_recall_target_input",
         )
-        adjusted = apply_fn_budget(result, int(allowed_fn))
-        st.session_state["screening_allowed_fn"] = int(allowed_fn)
+        adjusted = apply_recall_target(result, recall_pct / 100)
+        st.session_state["screening_recall_target"] = recall_pct / 100
         if adjusted.threshold != result.threshold or not adjusted.predictions.equals(result.predictions):
             result = adjusted
             st.session_state["screening_result"] = result
@@ -536,8 +555,10 @@ elif nav == "screen":
         avg_safety_score = float(result.predictions.loc[
             result.predictions["AI_Recommendation"] == "안전 제외 후보", "Safety_Score"
         ].mean()) if safe_exclude_n else 0.0
+        recall_target_val = float(result.metrics.get("recall_target", DEFAULT_RECALL_TARGET))
         allowed_fn_val = int(result.metrics.get("allowed_fn", 0))
         measured_fn_val = int(result.metrics.get("measured_fn", result.confusion.get("fn", 0)))
+        recall_lower_ci_val = float(result.metrics.get("recall_lower_ci", 0.0))
         safe_cv_fn = result.metrics.get("safe_exclude_cv_false_negatives", 0)
         safe_cv_n = result.metrics.get("safe_exclude_cv_n", 0)
 
@@ -550,23 +571,24 @@ elif nav == "screen":
             <div style="font-size:.78rem; opacity:.8;">사람이 읽지 않아도 되는 '안전 제외 후보'의 비율</div>
           </div>
           <div style="flex:1; padding:20px; border-radius:14px; background:#1F2937; color:#fff;">
-            <div style="font-size:.85rem; opacity:.85;">허용 FN / 실측 FN</div>
-            <div style="font-size:2.4rem; font-weight:800; line-height:1.2;">{allowed_fn_val} / {measured_fn_val}</div>
-            <div style="font-size:.78rem; opacity:.8;">라벨 데이터에서 허용하기로 한 개수 대비 실제 측정치</div>
+            <div style="font-size:.85rem; opacity:.85;">목표 재현율 (허용 FN {allowed_fn_val}건 자동계산 / 실측 FN {measured_fn_val}건)</div>
+            <div style="font-size:2.4rem; font-weight:800; line-height:1.2;">{recall_target_val*100:.0f}%</div>
+            <div style="font-size:.78rem; opacity:.8;">95% 신뢰수준 재현율 하한 {recall_lower_ci_val*100:.1f}% (라벨 표본이 전체를 대표한다는 가정)</div>
           </div>
         </div>
         '''
         st.markdown(headline_html, unsafe_allow_html=True)
 
         d1, d2, d3 = st.columns(3)
-        d1.metric("AI Safety Score", f"{avg_safety_score:.3f}" if safe_exclude_n else "-", help="안전 제외 후보로 분류된 문헌들의 평균 안전 점수입니다. Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도 등 서로 다른 근거를 가진 모델들이 Exclude 방향으로 동의한 정도(1에 가까울수록 강한 합의)를 나타냅니다.")
+        embedding_note = "" if result.metrics.get("embedding_signal_used") else " (의미 임베딩 신호는 이 환경에 sentence-transformers가 없어 제외됨)"
+        d1.metric("AI Safety Score", f"{avg_safety_score:.3f}" if safe_exclude_n else "-", help=f"안전 제외 후보로 분류된 문헌들의 평균 안전 점수입니다. Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도, 의미 임베딩 등 서로 다른 근거를 가진 모델들이 Exclude 방향으로 동의한 정도(1에 가까울수록 강한 합의)를 나타냅니다{embedding_note}.")
         d2.metric("안전 제외 후보 수", f"{safe_exclude_n:,}편")
-        d3.metric("안전 제외 후보 중 실제 FN (교차검증)", f"{safe_cv_fn}건 / 후보 {safe_cv_n:,}건", help="안전 제외 후보 조건에 해당했던 라벨 문헌 중 실제로는 Include였던 건수입니다. 5개 신호가 모두 같은 허용 FN 기준을 지키며 동의한 경우만 인정하므로, 이 값은 항상 위의 '허용 FN' 이하로 유지됩니다.")
+        d3.metric("안전 제외 후보 중 실제 FN (교차검증)", f"{safe_cv_fn}건 / 후보 {safe_cv_n:,}건", help="안전 제외 후보 조건에 해당했던 라벨 문헌 중 실제로는 Include였던 건수입니다. 모든 신호 모델이 같은 (목표 재현율에서 자동 계산된) 허용 FN 기준을 지키며 동의한 경우만 인정하므로, 이 값은 항상 위의 자동계산된 허용 FN 이하로 유지됩니다.")
 
         if safe_cv_fn > 0:
             st.warning(
                 f"⚠️ 교차검증 기준으로, 안전 제외 후보 조건에 해당했던 라벨 문헌 {safe_cv_n:,}건 중 "
-                f"{safe_cv_fn:,}건이 실제로는 Include였습니다. 허용 FN을 더 낮추면 이 값도 함께 줄어듭니다."
+                f"{safe_cv_fn:,}건이 실제로는 Include였습니다. 목표 재현율을 더 높이면(예: 99%) 이 값도 함께 줄어듭니다."
             )
         else:
             st.success(

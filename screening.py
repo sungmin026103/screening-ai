@@ -28,6 +28,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.svm import LinearSVC
+from scipy.stats import beta as _beta_dist
+
+# 문장 임베딩(의미 기반) 신호는 선택적 의존성이다. requirements.txt에
+# sentence-transformers가 없거나 배포 환경에서 모델 다운로드가 막혀 있어도
+# 앱 전체가 죽지 않도록 임포트 실패를 흡수하고, 사용 가능 여부를 플래그로 남긴다.
+try:
+    from sentence_transformers import SentenceTransformer
+    _HAS_SENTENCE_TRANSFORMERS = True
+except Exception:  # pragma: no cover
+    SentenceTransformer = None
+    _HAS_SENTENCE_TRANSFORMERS = False
 
 # 화면에 표시되는 3단계 우선순위 (정렬 순서 그대로 사용)
 PRIORITY_ORDER = ["우선 검토", "경계 문헌", "안전 제외 후보"]
@@ -138,6 +149,63 @@ def prepare_screening_data(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return out, label_source
 
 
+# ---------------------------------------------------------------------------
+# 의미 기반(임베딩) 신호. TF-IDF 계열(word/char/PICO 유사도)은 결국 전부
+# 표면적 단어 일치에 의존하기 때문에 "서로 다른 근거"라고 보기 어렵다.
+# 사전학습된 문장 임베딩(SBERT 계열)은 동의어·다른 표현으로 쓰인 문헌도
+# 의미로 포착하므로, TF-IDF 신호들과 상관관계가 낮은 진짜 독립적인 근거가 된다.
+# 또한 이 인코더는 우리 데이터로 다시 학습(fit)되지 않는 고정 가중치이므로,
+# 전체 문헌에 대해 미리 한 번만 계산해도 검증 fold 누수가 전혀 발생하지 않는다
+# (TF-IDF는 데이터 의존적으로 fit되므로 fold마다 다시 학습해야 하는 것과 대조적).
+# ---------------------------------------------------------------------------
+
+EMBEDDING_MODEL_NAME = "pritamdeka/S-PubMedBert-MS-MARCO"  # 생의학 초록 특화. 배포 환경 리소스가 빠듯하면
+# "sentence-transformers/all-MiniLM-L6-v2" (가볍고 범용, CPU에서 훨씬 빠름)로 교체 가능.
+
+_embed_model_singleton: dict[str, "SentenceTransformer"] = {}
+
+
+def embeddings_available() -> bool:
+    return _HAS_SENTENCE_TRANSFORMERS
+
+
+def _get_embed_model():
+    if EMBEDDING_MODEL_NAME not in _embed_model_singleton:
+        _embed_model_singleton[EMBEDDING_MODEL_NAME] = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _embed_model_singleton[EMBEDDING_MODEL_NAME]
+
+
+def build_embedding_lookup(all_texts: np.ndarray) -> dict[str, np.ndarray] | None:
+    """전체 문헌 텍스트에 대해 임베딩을 한 번만 계산해 {텍스트: 벡터} 딕셔너리로 반환한다.
+    사전학습 인코더가 이 데이터로 학습되는 게 아니므로, CV fold 밖에서 한 번만
+    계산해도 안전하다 (TF-IDF 벡터라이저처럼 fold마다 다시 fit할 필요가 없음)."""
+    if not _HAS_SENTENCE_TRANSFORMERS:
+        return None
+    model = _get_embed_model()
+    unique_texts = list(dict.fromkeys(all_texts.tolist()))  # 중복 제거, 순서 보존
+    vectors = model.encode(unique_texts, batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+    return {t: v for t, v in zip(unique_texts, vectors)}
+
+
+class EmbeddingLookup(BaseEstimator, TransformerMixin):
+    """사전 계산된 임베딩을 텍스트로 조회만 하는 변환기. fit에서 아무것도 학습하지
+    않으므로(고정 가중치 인코더), Pipeline 안에 있어도 매 fold 재계산이 필요 없다."""
+
+    def __init__(self, lookup: dict[str, np.ndarray] | None = None, dim: int = 768):
+        self.lookup = lookup or {}
+        self.dim = dim
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if not self.lookup:
+            return np.zeros((len(X), self.dim))
+        any_vec = next(iter(self.lookup.values()))
+        dim = any_vec.shape[0]
+        return np.vstack([self.lookup.get(t, np.zeros(dim)) for t in X])
+
+
 class CriteriaSimilarity(BaseEstimator, TransformerMixin):
     """코사인 유사도 기반 PICO/배제기준 근접도 피처.
 
@@ -168,17 +236,19 @@ class CriteriaSimilarity(BaseEstimator, TransformerMixin):
 # 메인 랭킹 모델 (기존과 동일: Word+Char TF-IDF [+ PICO 유사도] -> Calibrated LinearSVC)
 # ---------------------------------------------------------------------------
 
-def _build_feature_union(criteria_text: str = "") -> FeatureUnion:
+def _build_feature_union(criteria_text: str = "", embedding_lookup: dict | None = None) -> FeatureUnion:
     word = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=50000, sublinear_tf=True)
     char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_features=50000, sublinear_tf=True)
     transformers = [("word", word), ("char", char)]
     if criteria_text and criteria_text.strip():
         transformers.append(("criteria", CriteriaSimilarity(criteria_text=criteria_text)))
+    if embedding_lookup:
+        transformers.append(("embedding", EmbeddingLookup(lookup=embedding_lookup)))
     return FeatureUnion(transformers)
 
 
-def _build_pipeline(criteria_text: str = "") -> Pipeline:
-    features = _build_feature_union(criteria_text)
+def _build_pipeline(criteria_text: str = "", embedding_lookup: dict | None = None) -> Pipeline:
+    features = _build_feature_union(criteria_text, embedding_lookup)
     base = LinearSVC(class_weight="balanced")
     model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
     return Pipeline([("features", features), ("model", model)])
@@ -209,17 +279,28 @@ def _build_pico_only_pipeline(criteria_text: str) -> Pipeline:
     ])
 
 
-def _build_logreg_full_pipeline(criteria_text: str = "") -> Pipeline:
-    features = _build_feature_union(criteria_text)
+def _build_embedding_only_pipeline(embedding_lookup: dict) -> Pipeline:
+    """의미 임베딩만으로 학습한 로지스틱 회귀. 어휘 중복(TF-IDF 계열)과 독립적인
+    '의미가 비슷한가'라는 근거를 안전 제외 후보 판정에 추가한다."""
+    return Pipeline([
+        ("embedding", EmbeddingLookup(lookup=embedding_lookup)),
+        ("model", LogisticRegression(max_iter=2000, class_weight="balanced")),
+    ])
+
+
+def _build_logreg_full_pipeline(criteria_text: str = "", embedding_lookup: dict | None = None) -> Pipeline:
+    features = _build_feature_union(criteria_text, embedding_lookup)
     return Pipeline([("features", features), ("model", LogisticRegression(max_iter=2000, class_weight="balanced"))])
 
 
 def _compute_safety_signals(
     texts: np.ndarray, y: np.ndarray, cv: StratifiedKFold, all_texts: np.ndarray, criteria_text: str = "",
+    embedding_lookup: dict | None = None,
 ) -> dict:
-    """Word TF-IDF, Character TF-IDF, 전체 피처 로지스틱 회귀, PICO 유사도 각각에
-    대해 (라벨 데이터의 교차검증 확률, 전체 데이터 확률)을 계산해 반환한다.
-    각 뷰는 fold마다 처음부터 다시 학습되므로 검증 fold 누수가 없다.
+    """Word TF-IDF, Character TF-IDF, 전체 피처 로지스틱 회귀, PICO 유사도, (가능하면)
+    의미 임베딩 각각에 대해 (라벨 데이터의 교차검증 확률, 전체 데이터 확률)을 계산해 반환한다.
+    TF-IDF 계열 뷰는 fold마다 처음부터 다시 학습되므로 검증 fold 누수가 없고,
+    임베딩 뷰는 고정 가중치 인코더라 애초에 데이터 의존적 fit이 없어 누수 자체가 불가능하다.
     """
     signals: dict[str, dict] = {}
 
@@ -231,9 +312,11 @@ def _compute_safety_signals(
 
     _run("word_tfidf", _build_word_only_pipeline())
     _run("char_tfidf", _build_char_only_pipeline())
-    _run("logistic_regression", _build_logreg_full_pipeline(criteria_text))
+    _run("logistic_regression", _build_logreg_full_pipeline(criteria_text, embedding_lookup))
     if criteria_text and criteria_text.strip():
         _run("pico_similarity", _build_pico_only_pipeline(criteria_text))
+    if embedding_lookup:
+        _run("semantic_embedding", _build_embedding_only_pipeline(embedding_lookup))
     return signals
 
 
@@ -248,6 +331,50 @@ def _compute_safety_signals(
 # "모두 동의(교집합)"할 때만 안전 제외로 인정하므로, 안전 제외 후보 버킷의 FN 개수는
 # 항상 이 허용치 이하로 유지된다 (교집합이므로 개별 신호의 FN 개수를 넘을 수 없다).
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 목표 재현율(recall target) 기반 정책. "허용 FN 개수"를 매번 사람이 감으로
+# 입력하는 대신, 문헌 스크리닝 자동화 분야에서 흔히 쓰는 고정된 재현율 목표
+# (예: 95%)를 정책으로 두고, 현재 라벨 수로부터 allowed_fn을 결정론적으로
+# 자동 계산한다. 같은 재현율 목표를 쓰는 한, 데이터셋이 달라져도 "무엇을
+# 보장하는가"의 의미는 항상 동일하다 (허용 FN의 절대 개수만 라벨 수에 따라
+# 달라질 뿐, 기준 자체가 흔들리는 게 아니다).
+# ---------------------------------------------------------------------------
+
+RECALL_TARGET_PRESETS = [0.99, 0.95, 0.90]
+DEFAULT_RECALL_TARGET = 0.95
+
+
+def allowed_fn_from_recall_target(n_include: int, recall_target: float) -> int:
+    """목표 재현율을 만족하는 가장 관대한(=검토량을 가장 많이 줄이는) 허용 FN 개수.
+    내림(floor)을 사용해 실제 달성 재현율이 목표를 절대 밑돌지 않도록 보수적으로 잡는다."""
+    if n_include <= 0:
+        return 0
+    # round()로 부동소수점 오차(예: 0.9*20이 1.9999999996이 되는 경우)를 먼저 보정한 뒤
+    # floor를 적용해, 0.90/0.95처럼 딱 떨어져야 할 값이 한 개씩 어긋나지 않도록 한다.
+    raw = round((1.0 - float(recall_target)) * n_include, 6)
+    allowed = int(np.floor(raw))
+    return max(0, min(n_include, allowed))
+
+
+def recall_lower_confidence_bound(n_include: int, allowed_fn: int, confidence: float = 0.95) -> float:
+    """Clopper-Pearson(정확 이항) 하한. 현재 라벨 표본에서 이 allowed_fn을 썼을 때
+    관측된 성공률(포착률)에 표본 크기 불확실성을 반영해, '모집단 재현율이 이 값
+    이상일 것이라고 confidence 신뢰수준으로 말할 수 있는' 하한선을 계산한다.
+    주의: 라벨 표본이 전체 문헌(라벨 없는 문헌 포함)을 대표한다는 가정이 전제이며,
+    라벨 수가 적을수록 이 하한은 크게 내려간다 (표본이 작을수록 불확실성이 크다는
+    사실을 감추지 않고 그대로 보여주기 위함)."""
+    n = int(n_include)
+    if n <= 0:
+        return 0.0
+    k = n - int(allowed_fn)  # 성공(=포착)한 라벨 Include 개수
+    if k <= 0:
+        return 0.0
+    if k >= n:
+        # 전부 포착(allowed_fn=0)한 경우의 하한: Jeffreys/Clopper-Pearson 상한쪽 특수 케이스
+        return float(_beta_dist.ppf(1 - confidence, n, 1))
+    return float(_beta_dist.ppf(1 - confidence, k, n - k + 1))
+
 
 def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int) -> float:
     inc_probs = np.sort(np.asarray(cv_probs, dtype=float)[np.asarray(y) == 1])
@@ -362,9 +489,28 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
     return updated
 
 
-def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str = "") -> ScreeningResult:
-    """allowed_fn: 라벨된 Include 문헌 중 '우선 검토' 밖으로 놓치는 것을 허용하는
-    최대 개수. 0이면 라벨 데이터에서 하나도 놓치지 않도록 임계값을 최대한 보수적으로 잡는다.
+def apply_recall_target(result: ScreeningResult, recall_target: float, confidence: float = 0.95) -> ScreeningResult:
+    """저장된 교차검증 확률을 재사용해(재학습 없이), '목표 재현율' 정책만 바꿔
+    화면 분류를 다시 계산한다. UI에는 99% / 95% / 90% 같은 고정된 정책 선택지만
+    노출하고, allowed_fn(절대 개수)은 항상 이 함수 안에서 라벨 수로부터 자동 계산되므로
+    사용자가 임의의 정수를 직접 입력할 일이 없다."""
+    n_include = int(result.metrics.get("include_n", 0))
+    allowed_fn = allowed_fn_from_recall_target(n_include, recall_target)
+    updated = apply_fn_budget(result, allowed_fn)
+    updated.metrics["recall_target"] = float(recall_target)
+    updated.metrics["recall_lower_ci"] = recall_lower_confidence_bound(n_include, allowed_fn, confidence)
+    return updated
+
+
+def train_and_predict(
+    df: pd.DataFrame,
+    recall_target: float = DEFAULT_RECALL_TARGET,
+    allowed_fn: int | None = None,
+    criteria_text: str = "",
+) -> ScreeningResult:
+    """recall_target: 목표 재현율(예: 0.95 = 95%). 라벨 Include 중 이 비율 이상을
+    반드시 '우선 검토' 또는 '경계 문헌'에 남기도록 allowed_fn을 자동으로 계산한다.
+    allowed_fn을 직접 넘기면(고급 사용/하위 호환) recall_target 대신 그 값을 그대로 쓴다.
     """
     data, _ = prepare_screening_data(df)
     labeled = data[data["Human_Label"].isin([0, 1])].copy()
@@ -374,14 +520,26 @@ def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str 
     y = labeled["Human_Label"].astype(int).to_numpy()
     texts = labeled["Text"].to_numpy()
     all_texts = data["Text"].to_numpy()
+    n_include = int(y.sum())
+
+    if allowed_fn is None:
+        allowed_fn = allowed_fn_from_recall_target(n_include, recall_target)
 
     min_class = int(labeled["Human_Label"].value_counts().min())
     folds = max(2, min(5, min_class))
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
 
-    # 메인 랭킹 모델(전체 파이프라인: TF-IDF + PICO 유사도 + 선형 SVM)을 fold마다
+    # 의미 임베딩은 전체 문헌 텍스트에 대해 한 번만 계산한다 (고정 가중치 인코더라
+    # fold별 재계산이 필요 없고, 데이터로 다시 학습되지 않으므로 fold 밖에서 계산해도
+    # 검증 누수가 생기지 않는다). sentence-transformers가 없는 환경에서는 None이 되어
+    # 자동으로 이 신호 없이 나머지 모델들로만 동작한다 (기능 저하 없이 안전하게 폴백).
+    embedding_lookup = build_embedding_lookup(all_texts)
+
+    # 메인 랭킹 모델(전체 파이프라인: TF-IDF + PICO 유사도 + [임베딩] + 선형 SVM)을 fold마다
     # 처음부터 다시 학습한다. train만으로 학습하기 때문에 검증 성능이 부풀려지지 않는다.
-    probs = cross_val_predict(_build_pipeline(criteria_text), texts, y, cv=cv, method="predict_proba")[:, 1]
+    probs = cross_val_predict(
+        _build_pipeline(criteria_text, embedding_lookup), texts, y, cv=cv, method="predict_proba"
+    )[:, 1]
 
     # Precision-Recall 곡선은 참고용 차트로만 계산해서 보여준다 (임계값 결정에는 쓰지 않음).
     precision, recall, pr_thresholds = precision_recall_curve(y, probs)
@@ -389,8 +547,8 @@ def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str 
 
     # 임계값은 '허용 FN 개수'로 직접 정한다: 라벨 Include 중 확률이 가장 낮은
     # allowed_fn개까지만 임계값 아래로 떨어지도록 하는 가장 관대한(=검토량이 가장 적은)
-    # 임계값을 선택한다. allowed_fn=0이면 Include 중 가장 낮은 확률값이 곧 임계값이 되어
-    # 라벨 데이터에서 하나도 놓치지 않는다.
+    # 임계값을 선택한다. allowed_fn은 위에서 recall_target으로부터 자동 계산되었으므로,
+    # "몇 편 놓쳐도 되는가"를 매번 감으로 정하는 게 아니라 고정된 재현율 정책에서 유도된다.
     threshold = _fn_budget_cutoff(probs, y, allowed_fn)
     pred = (probs >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
@@ -398,8 +556,10 @@ def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str 
     recall_v = float(recall_score(y, pred, zero_division=0))
     precision_v = float(precision_score(y, pred, zero_division=0))
     metrics = {
+        "recall_target": float(recall_target),
         "allowed_fn": int(allowed_fn),
         "measured_fn": int(fn),
+        "recall_lower_ci": recall_lower_confidence_bound(n_include, allowed_fn),
         "recall": recall_v,
         "precision": precision_v,
         "accuracy": float(accuracy_score(y, pred)),
@@ -407,19 +567,21 @@ def train_and_predict(df: pd.DataFrame, allowed_fn: int = 0, criteria_text: str 
         "roc_auc": float(roc_auc_score(y, probs)),
         "average_precision": float(average_precision_score(y, probs)),
         "labeled_n": int(len(labeled)),
-        "include_n": int(y.sum()),
+        "include_n": n_include,
+        "embedding_signal_used": embedding_lookup is not None,
     }
 
     # 메인 모델을 전체 라벨 데이터로 최종 학습해 전체 문헌(라벨 없는 것 포함)에
     # 대한 확률을 계산한다.
-    final_pipeline = _build_pipeline(criteria_text)
+    final_pipeline = _build_pipeline(criteria_text, embedding_lookup)
     final_pipeline.fit(texts, y)
     all_probs = final_pipeline.predict_proba(all_texts)[:, 1]
 
-    # --- 안전 제외 후보: 서로 다른 근거를 가진 5개 신호가 "각자 같은 허용 FN
+    # --- 안전 제외 후보: 서로 다른 근거를 가진 신호들이 "각자 같은 허용 FN
     # 기준으로도 안전한" 컷오프 아래일 때만 인정한다. 최대한 많이 거르는 것이
-    # 아니라, 거의 틀리지 않는 것만 거른다.
-    aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text)
+    # 아니라, 거의 틀리지 않는 것만 거른다. (word/char TF-IDF, 로지스틱 회귀,
+    # PICO 유사도, 의미 임베딩, 선형 SVM 최대 6개 신호)
+    aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text, embedding_lookup)
     aux_signals["linear_svm"] = {"cv": probs, "all": all_probs}  # 메인 모델도 하나의 투표로 포함
 
     result_df = df.copy().reset_index(drop=True)
@@ -527,9 +689,9 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
     legend_ws["B1"].font = Font(bold=True)
     legend_rows = [
         ("우선 검토", "Include 확률이 임계값 이상인 문헌. 사람이 우선적으로 확인해야 합니다."),
-        ("경계 문헌", "임계값 미만이지만 5개 모델(Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도)의 의견이 갈리는 문헌. 반드시 사람이 확인해야 합니다."),
+        ("경계 문헌", "임계값 미만이지만 Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도, (가능한 경우) 의미 임베딩 모델들의 의견이 갈리는 문헌. 반드시 사람이 확인해야 합니다."),
         ("False Negative", "실제 라벨은 Include였지만 교차검증에서 임계값 아래로 예측된 문헌. 모델 개선 및 재확인이 필요합니다."),
-        ("안전 제외 후보", "5개 모델 모두, 설정한 허용 FN 기준을 지키면서 Exclude 방향으로 동의한 문헌. 사람이 읽지 않아도 되는 문헌입니다."),
+        ("안전 제외 후보", "모든 신호 모델이, 목표 재현율로부터 자동 계산된 허용 FN 기준을 각자 지키면서 Exclude 방향으로 동의한 문헌. 사람이 읽지 않아도 되는 문헌입니다."),
     ]
     for i, (name, desc) in enumerate(legend_rows, start=2):
         legend_ws.append([name, desc])
