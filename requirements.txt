@@ -8,3 +8,5 @@ plotly>=5.20,<7
 matplotlib>=3.8,<4
 xlrd>=2.0,<3
 rapidfuzz>=3.9,<4
+
+pypdf>=5.0,<7

@@ -32,6 +32,7 @@ from screening import (
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
 from utils import dataframe_to_excel_bytes
+from pdf_analyzer import FIELD_LABELS, analyze_pdf_bytes, extraction_to_dataframe
 
 st.set_page_config(page_title="SR Studio · 문헌 스크리닝 워크스페이스", page_icon="◈", layout="wide")
 apply_styles()
@@ -47,7 +48,7 @@ if "activity_log" not in st.session_state:
 
 
 PROJECT_SCOPED_STATE_KEYS = [
-    "screening_result", "import_stats", "meta_raw", "meta_result", "meta_r_result",
+    "screening_result", "import_stats", "pdf_extractions", "meta_raw", "meta_result", "meta_r_result",
 ]
 
 
@@ -137,6 +138,7 @@ NAV_ITEMS = [
     ("import", "문헌 가져오기 · 중복 제거"),
     ("pico", "PICO 설정"),
     ("screen", "AI 스크리닝"),
+    ("pdf_analysis", "PDF 분석"),
     ("analytics", "문헌 분석"),
     ("meta", "메타분석 Figure"),
     ("export", "내보내기"),
@@ -693,7 +695,99 @@ elif nav == "screen":
         )
 
 # ===========================================================================
-# 5. 문헌 분석
+# 5. PDF 분석 — 1단계 연구 특성 자동 추출
+# ===========================================================================
+elif nav == "pdf_analysis":
+    hero(
+        "PDF 분석",
+        "논문 PDF에서 연구 기본정보를 자동으로 찾아 구조화합니다. 자동 추출 결과는 반드시 원문 근거와 함께 확인하세요.",
+        eyebrow="PDF STUDY PARSER",
+    )
+    st.info("현재 1단계는 텍스트형 PDF를 지원합니다. 스캔 PDF, 복잡한 표, Figure 수치 추출은 지원하지 않습니다.")
+    pdf_files = st.file_uploader(
+        "PDF 업로드", type=["pdf"], accept_multiple_files=True, key="pdf_stage1_upload"
+    )
+    run_pdf = st.button(
+        "PDF 기본정보 추출", type="primary", use_container_width=True,
+        disabled=not pdf_files, key="run_pdf_stage1"
+    )
+    if run_pdf and pdf_files:
+        results = []
+        progress = st.progress(0.0, text="PDF 분석 중")
+        for idx, pdf in enumerate(pdf_files, start=1):
+            try:
+                results.append(analyze_pdf_bytes(pdf.getvalue(), pdf.name))
+            except Exception as exc:
+                results.append({"filename": pdf.name, "warning": str(exc), "fields": {}, "pages": 0, "text_length": 0})
+            progress.progress(idx / len(pdf_files), text=f"PDF 분석 중 ({idx}/{len(pdf_files)})")
+        progress.empty()
+        st.session_state["pdf_extractions"] = results
+        if active:
+            save_project_state(active, "pdf_extractions", results)
+        log_activity("📄", "PDF 기본정보 추출", f"{len(results)}개 PDF")
+        st.rerun()
+
+    pdf_results = st.session_state.get("pdf_extractions", [])
+    if not pdf_results:
+        empty_state("PDF", "분석된 PDF가 없습니다", "논문 PDF를 업로드하고 기본정보 추출을 실행하세요.")
+    else:
+        all_rows = []
+        for doc_idx, result_doc in enumerate(pdf_results):
+            all_rows.append(extraction_to_dataframe(result_doc))
+            with st.expander(f"{doc_idx + 1}. {result_doc.get('filename', 'PDF')}", expanded=(doc_idx == 0)):
+                if result_doc.get("warning"):
+                    st.warning(result_doc["warning"])
+                st.caption(f"{result_doc.get('pages', 0)}페이지 · 추출 텍스트 {result_doc.get('text_length', 0):,}자")
+                fields = result_doc.get("fields", {})
+                edited_values = {}
+                groups = [
+                    ("논문 정보", ["first_author", "year", "doi", "journal"]),
+                    ("실험동물", ["species", "strain", "sex", "age", "model"]),
+                    ("중재 정보", ["intervention", "dose", "duration", "route"]),
+                    ("군 및 통계", ["control_groups", "treat_groups", "sample_size", "dispersion"]),
+                ]
+                for section, keys in groups:
+                    st.markdown(f"#### {section}")
+                    for row_start in range(0, len(keys), 2):
+                        cols = st.columns(2)
+                        for col, key in zip(cols, keys[row_start:row_start + 2]):
+                            item = fields.get(key, {})
+                            conf = float(item.get("confidence", 0.0) or 0.0)
+                            with col:
+                                edited_values[key] = st.text_input(
+                                    FIELD_LABELS[key], value=str(item.get("value", "")),
+                                    key=f"pdf_edit_{doc_idx}_{key}"
+                                )
+                                st.caption(f"자동 추출 신뢰도 {conf * 100:.0f}%")
+                                evidence = str(item.get("evidence", "")).strip()
+                                if evidence:
+                                    with st.popover("원문 근거"):
+                                        st.write(evidence)
+                if st.button("수정 내용 저장", key=f"save_pdf_edit_{doc_idx}", use_container_width=True):
+                    for key, value in edited_values.items():
+                        result_doc.setdefault("fields", {}).setdefault(key, {})["value"] = value
+                    st.session_state["pdf_extractions"] = pdf_results
+                    if active:
+                        save_project_state(active, "pdf_extractions", pdf_results)
+                    st.success("수정 내용을 저장했습니다.")
+
+        if all_rows:
+            combined_extract = pd.concat(all_rows, ignore_index=True)
+            st.download_button(
+                "PDF 기본정보 추출표 다운로드",
+                dataframe_to_excel_bytes(combined_extract),
+                "PDF_Study_Characteristics.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary", use_container_width=True,
+            )
+        if st.button("PDF 분석 결과 초기화", use_container_width=True):
+            st.session_state.pop("pdf_extractions", None)
+            if active:
+                save_project_state(active, "pdf_extractions", [])
+            st.rerun()
+
+# ===========================================================================
+# 6. 문헌 분석
 # ===========================================================================
 elif nav == "analytics":
     hero("문헌 분석", "현재 프로젝트에 담긴 문헌의 구성과 완성도를 살펴봅니다.", eyebrow="문헌 분석")

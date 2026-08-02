@@ -89,3 +89,16 @@ Projects are saved under `data/projects/` on the running machine. Streamlit Comm
 - Full-row gray shading and optional hiding of low-priority records.
 - Real-time recall threshold adjustment and false-negative review table.
 - Forest-plot axis label spacing, balanced funnel geometry, and non-overlapping influence labels.
+
+## PDF 분석 — 1단계
+
+텍스트형 논문 PDF에서 다음 항목을 자동 추출하고 사용자가 수정·저장할 수 있습니다.
+
+- 1저자, 연도, DOI, 저널
+- 동물종, 계통, 성별, 주령, 실험 모델
+- 중재물질, 용량, 기간, 투여경로
+- 대조군·중재군 후보, n수, SD/SE 유형
+- 항목별 자동 추출 신뢰도와 원문 근거 문장
+- Excel 추출표 다운로드
+
+스캔 PDF, 표·Figure 수치 자동 추출은 현재 지원하지 않습니다. 자동 추출 결과는 반드시 원문과 대조해야 합니다.
