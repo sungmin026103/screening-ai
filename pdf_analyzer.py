@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import Any
 
@@ -16,13 +17,12 @@ class ExtractionField:
     evidence: str = ""
 
 
+# 최종적으로 화면/엑셀에 노출되는 필드. DOI·저널은 제거하고,
+# 1저자+연도는 "Study" 한 컬럼(예: "Vitadello (2014)")으로,
+# 동물종은 계통까지 합쳐 한 컬럼(예: "SD rats")으로 출력한다.
 FIELD_LABELS = {
-    "first_author": "1저자",
-    "year": "연도",
-    "doi": "DOI",
-    "journal": "저널",
+    "study": "1저자(연도)",
     "species": "동물종",
-    "strain": "계통",
     "sex": "성별",
     "age": "주령/연령",
     "model": "질환·실험 모델",
@@ -35,6 +35,39 @@ FIELD_LABELS = {
     "sample_size": "n수",
     "dispersion": "SD/SE 유형",
 }
+
+_YEAR_RANGE = range(1990, 2027)
+
+# 저자 후보 줄에서 사람 이름이 아닌 것으로 흔히 섞여 들어오는 단어들 (오탐 방지용 불용어)
+_AUTHOR_STOPWORDS = {
+    "abstract", "introduction", "keywords", "university", "department",
+    "school", "institute", "college", "faculty", "hospital", "center",
+    "centre", "laboratory", "received", "accepted", "published", "available",
+    "online", "journal", "correspondence", "author", "authors", "affiliation",
+    "email", "correspondingauthor", "graduate", "research", "national",
+    "science", "sciences", "medicine", "medical", "china", "korea", "japan",
+    "usa", "india", "iran", "germany", "france", "italy", "canada",
+}
+
+_STRAIN_SPECIES_PATTERNS = [
+    # (원문에서 찾을 패턴, 표준화된 계통명, 종 단어)
+    (r"\b(?:Sprague[- ]?Dawley|SD)\s+rats?\b", "SD", "rats"),
+    (r"\bWistar\s+rats?\b", "Wistar", "rats"),
+    (r"\b(?:Fischer\s*344|F344)\s+rats?\b", "F344", "rats"),
+    (r"\bLong[- ]Evans\s+rats?\b", "Long-Evans", "rats"),
+    (r"\bZucker\s+rats?\b", "Zucker", "rats"),
+    (r"\b(?:SHR|spontaneously hypertensive)\s+rats?\b", "SHR", "rats"),
+    (r"\bC57BL/?6J?\s+(?:mice|mouse)\b", "C57BL/6J", "mice"),
+    (r"\bBALB/?c\s+(?:mice|mouse)\b", "BALB/c", "mice"),
+    (r"\bICR\s+(?:mice|mouse)\b", "ICR", "mice"),
+    (r"\bCD-?1\s+(?:mice|mouse)\b", "CD-1", "mice"),
+    (r"\bKK-?Ay\s+(?:mice|mouse)\b", "KK-Ay", "mice"),
+    (r"\bdb/db\s+(?:mice|mouse)\b", "db/db", "mice"),
+    (r"\bob/ob\s+(?:mice|mouse)\b", "ob/ob", "mice"),
+    (r"\bApoE-?/?-?\s+(?:mice|mouse)\b", "ApoE-/-", "mice"),
+    (r"\bDBA/?2\s+(?:mice|mouse)\b", "DBA/2", "mice"),
+    (r"\b(?:New Zealand White|NZW)\s+rabbits?\b", "New Zealand White", "rabbits"),
+]
 
 
 def extract_pdf_text(data: bytes) -> tuple[str, int]:
@@ -76,7 +109,186 @@ def _field(value: str, confidence: float, evidence: str = "") -> ExtractionField
     return ExtractionField(value=value.strip(), confidence=confidence if value.strip() else 0.0, evidence=evidence.strip())
 
 
+# ---------------------------------------------------------------------------
+# 1저자 / 연도 추출
+# ---------------------------------------------------------------------------
+
+def _surname_from_name_token(token: str) -> str | None:
+    """'Smith J.' 또는 'J. Smith' 또는 'Smith, J.' 형태에서 성(surname)만 추출."""
+    token = token.strip(" .,;")
+    token = re.sub(r"[\*\u2020\u2021\d\u00a0]+$", "", token).strip()  # 위첨자·소속번호 제거
+    if not token:
+        return None
+    parts = token.split()
+    if not parts:
+        return None
+    # 'Surname, F.' 형태
+    if "," in token:
+        head = token.split(",")[0].strip()
+        if re.match(r"^[A-Z][A-Za-z'\-]{1,30}$", head):
+            return head
+        return None
+    # 이니셜 뒤에 성이 오는 경우: 'J. Smith' / 'J.M. Smith'
+    if re.match(r"^([A-Z]\.\s?){1,3}[A-Z][A-Za-z'\-]{1,30}$", token):
+        return parts[-1]
+    # 성 뒤에 이니셜이 오는 경우: 'Smith J.' / 'Smith JM'
+    if re.match(r"^[A-Z][A-Za-z'\-]{1,30}(\s([A-Z]\.?){1,3})$", token):
+        return parts[0]
+    # 'First Last' 형태 (이니셜 없음) — 마지막 단어를 성으로 간주
+    if len(parts) >= 2 and all(re.match(r"^[A-Z][A-Za-z'\-]*$", p) for p in parts):
+        return parts[-1]
+    if len(parts) == 1 and re.match(r"^[A-Z][A-Za-z'\-]{1,30}$", parts[0]):
+        return parts[0]
+    return None
+
+
+def _extract_authors_from_metadata(reader: PdfReader) -> tuple[str, str, float]:
+    try:
+        meta_author = (reader.metadata.author or "").strip() if reader.metadata else ""
+    except Exception:
+        meta_author = ""
+    if not meta_author or len(meta_author) > 200:
+        return "", "", 0.0
+    # 생성 소프트웨어 이름 등 저자가 아닌 값 필터링
+    if re.search(r"(microsoft|adobe|latex|word|acrobat|elsevier|springer|pdf)", meta_author, re.I):
+        return "", "", 0.0
+    first_chunk = re.split(r";| and |&|\n", meta_author)[0].strip()
+    surname = _surname_from_name_token(first_chunk)
+    if not surname or surname.lower() in _AUTHOR_STOPWORDS:
+        return "", "", 0.0
+    return surname, meta_author, 0.55  # 메타데이터는 참고용으로 중간 신뢰도
+
+
+def _extract_first_author_from_text(text: str) -> tuple[str, str]:
+    """제목 이후 ~ 'Abstract' 이전 저자 블록에서 첫 저자를 찾는다."""
+    lower = text.lower()
+    abstract_pos = lower.find("abstract")
+    head = text[: abstract_pos if abstract_pos != -1 else 3500]
+    lines = [ln.strip() for ln in head.split("\n") if ln.strip()]
+
+    candidates: list[tuple[str, str]] = []
+    for line in lines[:40]:
+        low_line = line.lower()
+        if len(line) > 300 or len(line) < 4:
+            continue
+        # 소속/이메일/URL 등 저자 줄이 아닌 것은 제외
+        if re.search(r"@|https?://|doi\.org|www\.", low_line):
+            continue
+        if any(sw in low_line for sw in ("university", "department", "institute", "school of",
+                                          "received", "accepted", "published", "correspondence",
+                                          "keywords", "abstract")):
+            continue
+        # 쉼표/&/and 로 구분된 이름 리스트 형태인지 확인
+        if not re.search(r",|\band\b|&", line):
+            continue
+        tokens = re.split(r",|\band\b|&", line)
+        surnames = []
+        for tok in tokens:
+            tok = tok.strip()
+            if not tok:
+                continue
+            if tok.lower() in _AUTHOR_STOPWORDS:
+                surnames = []
+                break
+            surname = _surname_from_name_token(tok)
+            if surname is None or surname.lower() in _AUTHOR_STOPWORDS:
+                surnames = []
+                break
+            surnames.append(surname)
+        if surnames and len(surnames) <= 12:
+            candidates.append((surnames[0], line[:300]))
+
+    if candidates:
+        # 여러 줄이 후보가 되면, 저자 수가 2명 이상인(=진짜 저자 목록일 가능성이 높은) 첫 줄을 우선
+        return candidates[0]
+    return "", ""
+
+
+def _extract_year(head: str) -> tuple[str, str]:
+    """저작권/게재 정보 근처 연도를 우선하고, 없으면 최다 빈출 연도를 사용."""
+    priority_patterns = [
+        r"(?:©|copyright)\s*(?:\(c\)\s*)?(\d{4})",
+        r"published(?:\s+online)?[^.\n]{0,40}?(\d{4})",
+        r"accepted[^.\n]{0,40}?(\d{4})",
+        r"received[^.\n]{0,60}?(\d{4})",
+    ]
+    for p in priority_patterns:
+        m = re.search(p, head, re.I)
+        if m and int(m.group(1)) in _YEAR_RANGE:
+            return m.group(1), m.group(0)[:200]
+
+    years = [y for y in re.findall(r"\b(19\d{2}|20\d{2})\b", head) if int(y) in _YEAR_RANGE]
+    if years:
+        most_common, count = Counter(years).most_common(1)[0]
+        ev = _evidence(_sentences(head), [most_common]) or most_common
+        conf = "high" if count > 1 else "low"
+        return most_common, ev
+    return "", ""
+
+
+def _build_study_field(text: str, reader: PdfReader) -> ExtractionField:
+    head = text[:6000]
+
+    meta_surname, meta_evidence, meta_conf = _extract_authors_from_metadata(reader)
+    text_surname, text_evidence = _extract_first_author_from_text(head)
+    year, year_evidence = _extract_year(head)
+
+    surname = ""
+    evidence = ""
+    confidence = 0.0
+    if text_surname:
+        surname, evidence, confidence = text_surname, text_evidence, 0.68
+    elif meta_surname:
+        surname, evidence, confidence = meta_surname, meta_evidence, meta_conf
+
+    if surname and year:
+        value = f"{surname} ({year})"
+        combined_evidence = f"저자: {evidence} | 연도: {year_evidence}"
+        confidence = min(confidence + 0.15, 0.85)
+    elif surname:
+        value = surname
+        combined_evidence = evidence
+    elif year:
+        value = f"({year})"
+        combined_evidence = year_evidence
+        confidence = 0.3
+    else:
+        value, combined_evidence, confidence = "", "", 0.0
+
+    return _field(value, confidence, combined_evidence)
+
+
+# ---------------------------------------------------------------------------
+# 동물종 (계통 + 종)
+# ---------------------------------------------------------------------------
+
+def _extract_species(flat: str, sentences: list[str]) -> ExtractionField:
+    for pattern, strain_label, species_word in _STRAIN_SPECIES_PATTERNS:
+        m = re.search(pattern, flat, re.I)
+        if m:
+            value = f"{strain_label} {species_word}"
+            ev = _evidence(sentences, [m.group(0)]) or m.group(0)
+            return _field(value, 0.9, ev)
+
+    # 계통까지는 못 찾았지만 종은 특정 가능한 경우
+    species_map = [
+        ("mice", [r"\bmice\b", r"\bmouse\b"]),
+        ("rats", [r"\brats?\b"]),
+        ("rabbits", [r"\brabbits?\b"]),
+        ("guinea pigs", [r"\bguinea pigs?\b"]),
+        ("human participants", [r"\b(participants|subjects|volunteers|patients)\b"]),
+    ]
+    for species_word, pats in species_map:
+        for p in pats:
+            m = re.search(p, flat, re.I)
+            if m:
+                ev = _evidence(sentences, [m.group(0)]) or m.group(0)
+                return _field(species_word, 0.55, ev)
+    return _field("", 0.0)
+
+
 def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
+    reader = PdfReader(io.BytesIO(data))
     text, pages = extract_pdf_text(data)
     if len(text) < 300:
         return {
@@ -92,53 +304,8 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
     sentences = _sentences(text)
     head = flat[:8000]
 
-    doi, doi_ev = _match(flat, [r"\b(10\.\d{4,9}/[-._;()/:A-Z0-9]+)\b"])
-    if doi:
-        doi = doi.rstrip(".,;)")
-
-    year, year_ev = _match(head, [r"(?:received|accepted|published online|copyright|©)?\s*((?:19|20)\d{2})"])
-
-    # First author: first plausible surname before comma/initials in first page area.
-    first_author = ""
-    first_author_ev = ""
-    author_patterns = [
-        r"\n\s*([A-Z][A-Za-z'\-]{1,30})\s+(?:[A-Z]\.?\s*){1,3}(?:,|\band\b)",
-        r"\n\s*([A-Z][A-Za-z'\-]{1,30}),\s*(?:[A-Z]\.?\s*){1,3}",
-    ]
-    for p in author_patterns:
-        m = re.search(p, text[:5000])
-        if m:
-            first_author = m.group(1)
-            first_author_ev = m.group(0).strip()
-            break
-
-    journal, journal_ev = _match(head, [
-        r"(?:Journal|J\.)\s+of\s+([A-Z][A-Za-z &\-]{3,80})",
-        r"\b((?:Nutrients|Nutrition|Bone|Muscle & Nerve|Scientific Reports|PLOS ONE|Frontiers in [A-Za-z ]+))\b",
-    ])
-
-    species = ""
-    species_ev = ""
-    species_map = [
-        ("Mouse", [r"\b(mice|mouse)\b"]),
-        ("Rat", [r"\b(rats?|Sprague[- ]Dawley|Wistar)\b"]),
-        ("Rabbit", [r"\brabbits?\b"]),
-        ("Guinea pig", [r"\bguinea pigs?\b"]),
-        ("Human", [r"\b(participants|subjects|volunteers|patients)\b"]),
-    ]
-    for label, pats in species_map:
-        for p in pats:
-            m = re.search(p, flat, re.I)
-            if m:
-                species, species_ev = label, _evidence(sentences, [m.group(0)]) or m.group(0)
-                break
-        if species:
-            break
-
-    strain, strain_ev = _match(flat, [
-        r"\b(C57BL/6J|C57BL/6|BALB/c|ICR|CD-1|KK-Ay|db/db|ob/ob|ApoE\-?/?\-?|Sprague[- ]Dawley|Wistar|Fischer 344|F344)\b",
-        r"\b([A-Z][A-Za-z0-9/\-]{2,20})\s+(?:mice|mouse|rats?)\b",
-    ])
+    study_field = _build_study_field(text, reader)
+    species_field = _extract_species(flat, sentences)
 
     sex, sex_ev = _match(flat, [r"\b(male and female|female and male|male|female)\s+(?:mice|mouse|rats?|animals?|participants|subjects)\b"])
     if sex:
@@ -167,7 +334,7 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
     model = "; ".join(dict.fromkeys(models))
     model_ev = " | ".join(model_evs[:3])
 
-    # Intervention phrase: prioritize treatment/supplement/administered/fed sentences.
+    # 중재물질: treatment/supplement/administered/fed 문장 우선
     intervention = ""
     intervention_ev = ""
     intervention_patterns = [
@@ -210,7 +377,7 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
             route_ev = _evidence(sentences, [m.group(0)]) or m.group(0)
             break
 
-    # Group sentences and names.
+    # 군(group) 문장 및 명칭
     group_sentences = [s for s in sentences if re.search(r"\b(groups?|divided|assigned|randomized|control|vehicle|sham|treated)\b", s, re.I)]
     group_blob = " ".join(group_sentences[:20])
     names = []
@@ -225,7 +392,7 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
     treat_groups = "; ".join(treats)
     group_ev = group_sentences[0][:700] if group_sentences else ""
 
-    # N values: retain all explicit n= values and common allocation phrasing.
+    # n수: 명시적 n= 값 및 배정 표현
     n_values = []
     n_evidence = []
     for m in re.finditer(r"\b[nN]\s*=\s*(\d{1,3})\b", flat):
@@ -252,12 +419,8 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
             break
 
     fields = {
-        "first_author": _field(first_author, 0.70, first_author_ev),
-        "year": _field(year, 0.82, year_ev),
-        "doi": _field(doi, 0.99, doi_ev),
-        "journal": _field(journal, 0.60, journal_ev),
-        "species": _field(species, 0.93, species_ev),
-        "strain": _field(strain, 0.96, strain_ev),
+        "study": study_field,
+        "species": species_field,
         "sex": _field(sex, 0.91, sex_ev),
         "age": _field(age, 0.92, age_ev),
         "model": _field(model, 0.88, model_ev),

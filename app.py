@@ -741,8 +741,8 @@ elif nav == "pdf_analysis":
                 fields = result_doc.get("fields", {})
                 edited_values = {}
                 groups = [
-                    ("논문 정보", ["first_author", "year", "doi", "journal"]),
-                    ("실험동물", ["species", "strain", "sex", "age", "model"]),
+                    ("논문 정보", ["study"]),
+                    ("실험동물", ["species", "sex", "age", "model"]),
                     ("중재 정보", ["intervention", "dose", "duration", "route"]),
                     ("군 및 통계", ["control_groups", "treat_groups", "sample_size", "dispersion"]),
                 ]
