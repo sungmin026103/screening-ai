@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 from dataclasses import dataclass, field
 from copy import deepcopy
 
@@ -42,6 +43,11 @@ except Exception:  # pragma: no cover
 
 # 화면에 표시되는 3단계 우선순위 (정렬 순서 그대로 사용)
 PRIORITY_ORDER = ["우선 검토", "경계 문헌", "안전 제외 후보"]
+
+# 지도학습(재현율 통계적 보장) 모드로 전환되는 최소 라벨 수. 이 미만이면 앱은
+# 자동으로 zero-shot 모드로 동작한다 — 사람이 매번 "어느 모드로 할지" 고르는 게
+# 아니라, 라벨 존재 여부라는 데이터 상태로 결정되는 고정 기준이다.
+MIN_LABELS_FOR_SUPERVISED = 20
 
 # 엑셀 다운로드 시 구간 순서와 배경색. False Negative는 실제 라벨이 Include인데
 # 컷오프 밖으로 밀려난, 눈에 띄어야 하는 문헌이라 원래 버킷에서 따로 떼어내
@@ -149,6 +155,17 @@ def prepare_screening_data(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return out, label_source
 
 
+def detect_label_count(df: pd.DataFrame) -> int:
+    """업로드된 파일에 유효 라벨(Include/Exclude 둘 다 있는)이 몇 개 있는지 반환한다.
+    라벨 열이 아예 없거나 형식이 안 맞으면 0을 반환한다 (예외를 던지지 않음).
+    app.py가 이 값으로 지도학습/zero-shot 모드를 자동 판별하는 데 쓴다."""
+    try:
+        data, _ = prepare_screening_data(df)
+        return int(data["Human_Label"].isin([0, 1]).sum())
+    except Exception:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # 의미 기반(임베딩) 신호. TF-IDF 계열(word/char/PICO 유사도)은 결국 전부
 # 표면적 단어 일치에 의존하기 때문에 "서로 다른 근거"라고 보기 어렵다.
@@ -230,6 +247,241 @@ class CriteriaSimilarity(BaseEstimator, TransformerMixin):
     def transform(self, X):
         doc_vecs = self.vectorizer_.transform(X)
         return cosine_similarity(doc_vecs, self.criteria_vec_)
+
+
+# ---------------------------------------------------------------------------
+# PICO 섹션 파서. 사용자가 기준 텍스트를 'P: ...' / 'I: ...' / 'C: ...' / 'O: ...'
+# (또는 한글 '대상:'/'중재:'/'대조:'/'결과:') 형식으로 쓰면 항목별로 분리한다.
+# 인식되는 접두어가 하나도 없으면 전체를 "criteria"라는 단일 키로 반환해
+# 기존(통짜 유사도) 동작과 완전히 호환된다. LLM 호출 없이 문자열 파싱만 사용.
+# ---------------------------------------------------------------------------
+_PICO_PREFIXES = [
+    ("P", ["p:", "population:", "patient:", "대상:", "환자:", "인구집단:"]),
+    ("I", ["i:", "intervention:", "중재:", "노출:"]),
+    ("C", ["c:", "comparison:", "comparator:", "대조:", "비교:"]),
+    ("O", ["o:", "outcome:", "결과:", "결과지표:"]),
+]
+
+
+def _parse_pico_sections(criteria_text: str) -> dict[str, str]:
+    text = (criteria_text or "").strip()
+    if not text:
+        return {"criteria": ""}
+    sections: dict[str, list[str]] = {}
+    current = None
+    matched_any = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        found_key, remainder = None, stripped
+        for key, prefixes in _PICO_PREFIXES:
+            for p in prefixes:
+                if lowered.startswith(p):
+                    found_key = key
+                    remainder = stripped[len(p):].strip()
+                    break
+            if found_key:
+                break
+        if found_key:
+            matched_any = True
+            current = found_key
+            sections.setdefault(current, []).append(remainder)
+        elif current is not None and stripped:
+            sections[current].append(stripped)
+    if not matched_any:
+        return {"criteria": text}
+    return {k: " ".join(v).strip() for k, v in sections.items() if " ".join(v).strip()}
+
+
+# ---------------------------------------------------------------------------
+# Zero-shot 스크리닝: 라벨링된 문헌이 하나도 없는 프로젝트 초기 단계를 위한 모드.
+# 지도학습 파이프라인(train_and_predict)은 최소 20개 이상의 라벨이 있어야 재현율을
+# 통계적으로 보장할 수 있다. 이 함수는 PICO 기준 + 배제기준 텍스트만으로 모든
+# 문헌에 순위를 매긴다 — 다만 정답(라벨)이 전혀 없으므로 "재현율 X% 보장" 같은
+# 통계적 검증은 원리적으로 불가능하다는 점이 지도학습 모드와의 근본적 차이다.
+#
+# 대신 다음 두 가지로 최대한 원칙 있게 동작하게 했다:
+#   1) PICO 각 항목(P/I/C/O)·배제기준 각 항목에 대한 의미 유사도를 따로 계산
+#      (뭉뚱그린 유사도 하나보다 어느 항목이 안 맞는지 설명 가능)
+#   2) Otsu 임계값 방법(영상 이진화 기법을 1차원 점수 분포에 적용)으로 임의의
+#      퍼센트/임계값을 사용자가 고르지 않아도 "안전 제외 / 경계 / 우선 검토"
+#      3단계를 점수 분포 스스로 자연스럽게 나누게 한다 — 이번 요청에서 강조하신
+#      "매번 선택하게 하지 말고 고정" 원칙을 그대로 따른 것.
+#
+# 중요: 안전 제외 후보 중 일부(예: 20~30편)를 무작위로 뽑아 사람이 직접 확인하고,
+# 그 판정을 Human_Label로 입력해 지도학습 모드로 넘어가는 것을 강력히 권장한다.
+# 그래야 비로소 재현율 보장이 통계적으로 성립한다.
+# ---------------------------------------------------------------------------
+
+ZERO_SHOT_DISCLAIMER = (
+    "Zero-shot 모드는 라벨(정답) 없이 PICO/배제기준 텍스트 유사도만으로 순위를 매깁니다. "
+    "재현율 목표를 통계적으로 보장하지 않습니다. 안전 제외 후보 중 일부를 무작위로 "
+    "직접 확인한 뒤 그 판정을 라벨로 입력하면, 지도학습 모드(train_and_predict)로 넘어가 "
+    "통계적으로 검증된 재현율 보장을 받을 수 있습니다."
+)
+
+
+def prepare_unlabeled_data(df: pd.DataFrame) -> pd.DataFrame:
+    """라벨 열이 전혀 없어도 되는 zero-shot 전용 데이터 준비 함수.
+    prepare_screening_data와 달리 라벨 열을 요구하지 않는다."""
+    title_col = _find_col(df, ["title", "제목"])
+    abstract_col = _find_col(df, ["abstract", "초록"])
+    if not title_col:
+        raise ValueError("제목(Title/제목) 열이 필요합니다.")
+    out = pd.DataFrame()
+    out["Title"] = df[title_col].fillna("").astype(str)
+    out["Abstract"] = df[abstract_col].fillna("").astype(str) if abstract_col else ""
+    out["Text"] = (out["Title"] + " " + out["Abstract"]).str.strip()
+    return out
+
+
+def _split_bullet_items(text: str) -> list[str]:
+    """배제기준처럼 여러 항목이 줄바꿈/불릿으로 나열된 텍스트를 개별 항목으로 분리.
+    분리되는 항목이 없으면(불릿 없는 한 문단) 전체를 항목 하나로 취급한다."""
+    if not text or not text.strip():
+        return []
+    items = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        stripped = re.sub(r"^[\-\*\u2022\u25CF\u25AA]\s*", "", stripped)
+        stripped = re.sub(r"^\d+[\.\)]\s*", "", stripped)
+        if stripped:
+            items.append(stripped)
+    return items or [text.strip()]
+
+
+def _cosine_sim_matrix(doc_texts: list[str], query_texts: list[str]) -> np.ndarray:
+    """문헌 목록과 질의(PICO 항목/배제기준 항목) 사이의 코사인 유사도 행렬
+    (n_docs, n_queries). 임베딩 모델이 있으면 의미 기반, 없으면 TF-IDF로 대체
+    (둘 다 무료·로컬, API 비용 없음)."""
+    if not query_texts:
+        return np.zeros((len(doc_texts), 0))
+    if embeddings_available():
+        model = _get_embed_model()
+        doc_vecs = model.encode(list(doc_texts), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+        query_vecs = model.encode(list(query_texts), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+        return doc_vecs @ query_vecs.T
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
+    vectorizer.fit(list(doc_texts) + list(query_texts))
+    doc_vecs = vectorizer.transform(doc_texts)
+    query_vecs = vectorizer.transform(query_texts)
+    return cosine_similarity(doc_vecs, query_vecs)
+
+
+def _otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
+    """1차원 점수 분포를 두 그룹으로 가장 잘 가르는 임계값 (Otsu, 1979).
+    영상 이진화 기법을 연속값 분포에 그대로 적용한다 — '몇 %를 자를지'를
+    사람이 정하는 대신, 그룹 간 분산이 최대가 되는 지점을 데이터 스스로
+    찾게 한다. 라벨이 전혀 없는 zero-shot 모드에서 임계값을 고정 상수로
+    하드코딩하지 않기 위한 용도."""
+    values = np.asarray(values, dtype=float)
+    if len(values) < 2 or np.allclose(values.min(), values.max()):
+        return float(np.median(values)) if len(values) else 0.0
+    hist, edges = np.histogram(values, bins=bins)
+    hist = hist.astype(float)
+    total = hist.sum()
+    if total == 0:
+        return float(np.median(values))
+    prob = hist / total
+    bin_centers = (edges[:-1] + edges[1:]) / 2
+    cumulative_prob = np.cumsum(prob)
+    cumulative_mean = np.cumsum(prob * bin_centers)
+    global_mean = cumulative_mean[-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between_var = (global_mean * cumulative_prob - cumulative_mean) ** 2 / (
+            cumulative_prob * (1 - cumulative_prob)
+        )
+    between_var = np.nan_to_num(between_var, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    best_idx = int(np.argmax(between_var))
+    return float(bin_centers[best_idx])
+
+
+@dataclass
+class ZeroShotResult:
+    predictions: pd.DataFrame
+    metrics: dict = field(default_factory=dict)
+
+
+def zero_shot_screen(
+    df: pd.DataFrame,
+    criteria_text: str,
+    exclusion_text: str = "",
+) -> ZeroShotResult:
+    """라벨 없이 PICO 기준 + 배제기준 텍스트만으로 문헌을 3단계로 자동 분류한다.
+
+    사용 예:
+        result = zero_shot_screen(
+            df,
+            criteria_text="P: 우주비행/미세중력 동물 또는 인체 모델\\nI: 영양 중재(비타민/미네랄/단백질 등)\\nO: 근골격계 지표(근위축, 골밀도 등)",
+            exclusion_text="식물 대상 연구\\n미생물/세포주만 대상\\n운동/기구 중재만 있고 영양 중재 없음",
+        )
+        result.predictions  # AI_Recommendation 열 포함, 우선순위 정렬된 DataFrame
+        result.metrics["disclaimer"]  # 통계적 보장이 없다는 안내 문구
+    """
+    if not criteria_text or not criteria_text.strip():
+        raise ValueError("PICO 기준 텍스트가 필요합니다.")
+
+    data = prepare_unlabeled_data(df)
+    doc_texts = data["Text"].tolist()
+
+    sections = _parse_pico_sections(criteria_text)
+    section_names = list(sections.keys())
+    section_texts = [sections[k] if sections[k].strip() else " " for k in section_names]
+    pico_sims = _cosine_sim_matrix(doc_texts, section_texts)  # (n_docs, n_sections)
+
+    for i, name in enumerate(section_names):
+        data[f"Similarity_{name}"] = pico_sims[:, i]
+
+    # PICO 각 항목은 AND 조건(전부 맞아야 진짜 관련) -> 최솟값을 대표 점수로 사용.
+    # 평균을 쓰면 한 항목만 매우 높아도 다른 항목이 안 맞는 문헌이 높은 점수를
+    # 받는 왜곡이 생긴다.
+    pico_score = pico_sims.min(axis=1) if pico_sims.shape[1] else np.zeros(len(doc_texts))
+    data["PICO_Score"] = pico_score
+
+    exclusion_items = _split_bullet_items(exclusion_text)
+    if exclusion_items:
+        excl_sims = _cosine_sim_matrix(doc_texts, exclusion_items)  # (n_docs, n_items)
+        # 배제기준은 OR 조건(하나라도 걸리면 제외) -> 최댓값
+        exclusion_score = excl_sims.max(axis=1)
+    else:
+        exclusion_score = np.zeros(len(doc_texts))
+    data["Exclusion_Score"] = exclusion_score
+
+    combined_score = pico_score - exclusion_score
+    data["Combined_Score"] = combined_score
+
+    # Otsu 임계값으로 자동 3단계 분류: 먼저 전체를 안전제외/나머지로 나누고,
+    # 나머지를 다시 우선검토/경계문헌으로 재귀적으로 나눈다 (임의의 퍼센트나
+    # 임계값을 사용자가 매번 고를 필요가 없다).
+    threshold_1 = _otsu_threshold(combined_score)
+    rest_mask = combined_score >= threshold_1
+    rest_scores = combined_score[rest_mask]
+    threshold_2 = _otsu_threshold(rest_scores) if len(rest_scores) >= 2 else threshold_1
+
+    recommendation = np.full(len(doc_texts), "우선 검토", dtype=object)
+    recommendation[~rest_mask] = "안전 제외 후보"
+    borderline_mask = rest_mask & (combined_score < threshold_2)
+    recommendation[borderline_mask] = "경계 문헌"
+    data["AI_Recommendation"] = pd.Categorical(recommendation, categories=PRIORITY_ORDER, ordered=True)
+
+    data = data.sort_values(
+        ["AI_Recommendation", "Combined_Score"], ascending=[True, False]
+    ).reset_index(drop=True)
+
+    metrics = {
+        "mode": "zero_shot",
+        "n_total": int(len(data)),
+        "embedding_signal_used": embeddings_available(),
+        "sections_detected": [n for n in section_names if n != "criteria"],
+        "exclusion_items_n": len(exclusion_items),
+        "safe_exclude_n": int((data["AI_Recommendation"] == "안전 제외 후보").sum()),
+        "borderline_n": int((data["AI_Recommendation"] == "경계 문헌").sum()),
+        "priority_n": int((data["AI_Recommendation"] == "우선 검토").sum()),
+        "otsu_threshold_exclude": float(threshold_1),
+        "otsu_threshold_priority": float(threshold_2),
+        "disclaimer": ZERO_SHOT_DISCLAIMER,
+    }
+    return ZeroShotResult(predictions=data, metrics=metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +596,19 @@ def _compute_safety_signals(
 RECALL_TARGET_PRESETS = [0.99, 0.95, 0.90]
 DEFAULT_RECALL_TARGET = 0.95
 
+# ---------------------------------------------------------------------------
+# 안전 제외 정족수(quorum). 예전에는 모든 신호(최대 6개)가 전부 동의해야만 안전
+# 제외로 인정했다(엄격한 AND). 신호 수가 늘어날수록 교집합이 기하급수적으로
+# 줄어들어, 신호를 추가할수록 오히려 실제 절감 효과가 작아지는 역설이 생긴다.
+# 대신 "서로 다른 근거를 가진 신호들 중 80% 이상이 각자의 허용 FN 기준을
+# 지키며 Exclude로 동의"하면 인정하도록 고정한다. 사용자가 매번 고를 수 있는
+# 옵션이 아니라 코드에 고정된 값이다 (항상 같은 기준으로 동작해야 신뢰할 수
+# 있고, 쓰는 사람 입장에서도 헷갈릴 옵션이 없어야 한다).
+# 100%(만장일치)보다 완화됐지만 여전히 압도적 다수의 동의를 요구하므로 안전성은
+# 크게 훼손하지 않으면서, 안전 제외 후보 수(=검토 절감량)를 늘린다.
+# ---------------------------------------------------------------------------
+SAFETY_QUORUM_RATIO = 0.8
+
 
 def allowed_fn_from_recall_target(n_include: int, recall_target: float) -> int:
     """목표 재현율을 만족하는 가장 관대한(=검토량을 가장 많이 줄이는) 허용 FN 개수.
@@ -376,6 +641,24 @@ def recall_lower_confidence_bound(n_include: int, allowed_fn: int, confidence: f
     return float(_beta_dist.ppf(1 - confidence, k, n - k + 1))
 
 
+def work_saved_over_sampling(tn: int, fn: int, tp: int, fp: int) -> float:
+    """WSS (Work Saved over Sampling), Cohen et al. 2006 정의.
+
+    WSS = (TN+FN)/N - (1 - 실제 달성 재현율)
+
+    무작위로 문헌을 훑는 것 대비, 이 스크리닝 파이프라인이 실제로 절감한 검토 비율을
+    나타내는 SR 자동화 스크리닝 분야의 표준 지표다 (ASReview, CLEF eHealth TAR 등에서
+    보고하는 방식). 목표 재현율(recall_target) 자체가 아니라 라벨 데이터에서 '실제 측정된'
+    재현율을 쓴다 — allowed_fn은 floor로 보수적으로 잡히므로 실제 달성 재현율이 목표보다
+    같거나 높을 수 있고, WSS 정의는 항상 실측 재현율을 기준으로 하기 때문이다.
+    """
+    n = tn + fp + fn + tp
+    if n <= 0:
+        return 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return float((tn + fn) / n - (1.0 - recall))
+
+
 def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int) -> float:
     inc_probs = np.sort(np.asarray(cv_probs, dtype=float)[np.asarray(y) == 1])
     if len(inc_probs) == 0:
@@ -388,9 +671,10 @@ def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int) -> f
 
 def _recompute_unanimous_exclude(pred_df: pd.DataFrame, allowed_fn: int):
     """저장된 각 신호의 (라벨 데이터 교차검증 확률, 전체 데이터 확률) 컬럼으로부터
-    신호별 '허용 FN' 컷오프를 다시 계산하고, 모든 신호의 확률이 각자의 컷오프보다
-    낮을 때만 안전 제외 후보로 인정한다. 모델을 재학습하지 않고 저장된 확률만
-    사용하므로 허용 FN 값을 바꿔도 즉시 재계산된다.
+    신호별 '허용 FN' 컷오프를 다시 계산하고, 신호들 중 SAFETY_QUORUM_RATIO(80%) 이상이
+    각자의 컷오프보다 낮을 때 안전 제외 후보로 인정한다 (만장일치가 아닌 고정 정족수).
+    모델을 재학습하지 않고 저장된 확률만 사용하므로 허용 FN 값을 바꿔도 즉시 재계산된다.
+    함수/컬럼 이름은 하위 호환을 위해 유지한다.
     """
     signal_names = [c[len("Prob_"):] for c in pred_df.columns if c.startswith("Prob_")]
     mask = pred_df["Human_Label_Normalized"].isin([0, 1])
@@ -400,21 +684,30 @@ def _recompute_unanimous_exclude(pred_df: pd.DataFrame, allowed_fn: int):
     y = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
 
     n = len(pred_df)
-    unanimous_all = np.ones(n, dtype=bool)
-    unanimous_cv_labeled = np.ones(int(mask.sum()), dtype=bool)
+    n_signals = len(signal_names)
+    # 정족수: 신호 수의 80% 이상이 동의해야 안전 제외 인정 (SAFETY_QUORUM_RATIO, 고정값).
+    # ceil을 써서 예를 들어 신호가 6개면 5개 이상, 5개면 4개 이상 동의를 요구한다
+    # (80%의 소수점 결과를 내림하면 요구 조건이 실질적으로 더 느슨해져 버리므로 올림 사용).
+    quorum_needed = int(np.ceil(SAFETY_QUORUM_RATIO * n_signals)) if n_signals else 0
+
+    agree_all = np.zeros(n, dtype=int)
+    agree_cv_labeled = np.zeros(int(mask.sum()), dtype=int)
     safety_terms = []
     for name in signal_names:
         cv_probs = pd.to_numeric(pred_df.loc[mask, f"CV_Prob_{name}"], errors="coerce").to_numpy()
         cutoff = _fn_budget_cutoff(cv_probs, y, allowed_fn) if len(cv_probs) else 0.5
         all_probs = pd.to_numeric(pred_df[f"Prob_{name}"], errors="coerce").to_numpy()
-        unanimous_all &= (all_probs < cutoff)
-        unanimous_cv_labeled &= (cv_probs < cutoff)
+        agree_all += (all_probs < cutoff).astype(int)
+        agree_cv_labeled += (cv_probs < cutoff).astype(int)
         safety_terms.append(1.0 - all_probs)
 
+    quorum_all = agree_all >= quorum_needed
+    quorum_cv_labeled = agree_cv_labeled >= quorum_needed
+
     safety_score = np.mean(safety_terms, axis=0) if safety_terms else np.zeros(n)
-    safe_exclude_cv_n = int(unanimous_cv_labeled.sum())
-    safe_exclude_cv_fn = int(((y == 1) & unanimous_cv_labeled).sum())
-    return unanimous_all, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn
+    safe_exclude_cv_n = int(quorum_cv_labeled.sum())
+    safe_exclude_cv_fn = int(((y == 1) & quorum_cv_labeled).sum())
+    return quorum_all, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn
 
 
 def _priority_labels(probabilities: np.ndarray, threshold: float, unanimous_exclude: np.ndarray) -> np.ndarray:
@@ -422,8 +715,8 @@ def _priority_labels(probabilities: np.ndarray, threshold: float, unanimous_excl
 
     - 우선 검토: Include 확률이 임계값 이상 (흰색)
     - 안전 제외 후보: 임계값 미만이면서, Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM(메인 모델),
-      PICO 유사도(있는 경우) 등 서로 다른 근거를 가진 모든 모델이 "허용 FN 이하" 조건을
-      각자 만족하며 Exclude 방향으로 동의 (진한 회색)
+      PICO 유사도(있는 경우) 등 서로 다른 근거를 가진 신호들 중 80% 이상(고정 정족수)이
+      "허용 FN 이하" 조건을 각자 만족하며 Exclude 방향으로 동의 (진한 회색)
     - 경계 문헌: 임계값 미만이지만 모델들의 의견이 갈리는 경우, 사람이 반드시 확인 (중간 회색)
     """
     probabilities = np.asarray(probabilities, dtype=float)
@@ -483,6 +776,7 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
         "accuracy": float(accuracy_score(y_labeled, cv_pred)),
         "f1": float(2 * pre * rec / (pre + rec)) if pre + rec > 0 else 0.0,
         "measured_fn": int(fn),
+        "wss": work_saved_over_sampling(tn, fn, tp, fp),
     })
 
     updated.predictions = _sort_by_priority(pred_df)
@@ -514,8 +808,8 @@ def train_and_predict(
     """
     data, _ = prepare_screening_data(df)
     labeled = data[data["Human_Label"].isin([0, 1])].copy()
-    if len(labeled) < 20 or labeled["Human_Label"].nunique() < 2:
-        raise ValueError("학습을 위해 Include와 Exclude가 모두 포함된 최소 20개 라벨이 필요합니다.")
+    if len(labeled) < MIN_LABELS_FOR_SUPERVISED or labeled["Human_Label"].nunique() < 2:
+        raise ValueError(f"학습을 위해 Include와 Exclude가 모두 포함된 최소 {MIN_LABELS_FOR_SUPERVISED}개 라벨이 필요합니다.")
 
     y = labeled["Human_Label"].astype(int).to_numpy()
     texts = labeled["Text"].to_numpy()
@@ -569,6 +863,7 @@ def train_and_predict(
         "labeled_n": int(len(labeled)),
         "include_n": n_include,
         "embedding_signal_used": embedding_lookup is not None,
+        "wss": work_saved_over_sampling(tn, fn, tp, fp),
     }
 
     # 메인 모델을 전체 라벨 데이터로 최종 학습해 전체 문헌(라벨 없는 것 포함)에
@@ -691,7 +986,7 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
         ("우선 검토", "Include 확률이 임계값 이상인 문헌. 사람이 우선적으로 확인해야 합니다."),
         ("경계 문헌", "임계값 미만이지만 Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도, (가능한 경우) 의미 임베딩 모델들의 의견이 갈리는 문헌. 반드시 사람이 확인해야 합니다."),
         ("False Negative", "실제 라벨은 Include였지만 교차검증에서 임계값 아래로 예측된 문헌. 모델 개선 및 재확인이 필요합니다."),
-        ("안전 제외 후보", "모든 신호 모델이, 목표 재현율로부터 자동 계산된 허용 FN 기준을 각자 지키면서 Exclude 방향으로 동의한 문헌. 사람이 읽지 않아도 되는 문헌입니다."),
+        ("안전 제외 후보", "서로 다른 근거를 가진 신호 모델들 중 80% 이상이, 목표 재현율로부터 자동 계산된 허용 FN 기준을 각자 지키면서 Exclude 방향으로 동의한 문헌. 사람이 읽지 않아도 되는 문헌입니다."),
     ]
     for i, (name, desc) in enumerate(legend_rows, start=2):
         legend_ws.append([name, desc])

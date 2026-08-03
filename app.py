@@ -28,6 +28,9 @@ from screening import (
     build_grouped_excel_bytes,
     RECALL_TARGET_PRESETS,
     DEFAULT_RECALL_TARGET,
+    zero_shot_screen,
+    detect_label_count,
+    MIN_LABELS_FOR_SUPERVISED,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -48,7 +51,7 @@ if "activity_log" not in st.session_state:
 
 
 PROJECT_SCOPED_STATE_KEYS = [
-    "screening_result", "import_stats", "pdf_extractions", "meta_raw", "meta_result", "meta_r_result",
+    "screening_result", "zero_shot_result", "import_stats", "pdf_extractions", "meta_raw", "meta_result", "meta_r_result",
 ]
 
 
@@ -489,42 +492,75 @@ elif nav == "pico":
 # 4. AI 스크리닝
 # ===========================================================================
 elif nav == "screen":
-    hero("AI 스크리닝", "사람의 판정을 학습해 확실한 배제 후보를 뒤로 보내고, 검토가 필요한 문헌을 우선 확인하도록 순위를 매깁니다.", eyebrow="AI 스크리닝")
+    hero("AI 스크리닝", "사람의 판정을 학습해 확실한 배제 후보를 뒤로 보내고, 검토가 필요한 문헌을 우선 확인하도록 순위를 매깁니다. 라벨이 아직 없다면 PICO/배제기준만으로 자동으로 Zero-shot 모드가 실행됩니다.", eyebrow="AI 스크리닝")
     criteria_text = " ".join(v for v in [pico.get("population", ""), pico.get("intervention", ""),
                                           pico.get("comparator", ""), pico.get("outcome", ""),
                                           pico.get("exclusion_criteria", "")] if v).strip()
+    # zero-shot 모드는 P:/I:/C:/O: 접두어로 항목을 구분해야 항목별 유사도를 계산할 수 있다.
+    pico_sectioned_text = "\n".join(
+        f"{prefix} {pico.get(key, '')}" for prefix, key in
+        [("P:", "population"), ("I:", "intervention"), ("C:", "comparator"), ("O:", "outcome")]
+        if pico.get(key, "").strip()
+    )
     if criteria_text:
         st.markdown('<div class="small-note">「🧬 PICO 설정」 탭에 저장된 기준이 유사도 피처로 자동 반영됩니다.</div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="small-note">PICO가 비어 있어 텍스트 분류기만으로 학습합니다. 「🧬 PICO 설정」 탭에서 입력하면 정확도에 도움이 됩니다.</div>', unsafe_allow_html=True)
 
-    st.info("「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일에 Human_Label에는 1/0 또는 O/X를 사용할 수 있습니다. 검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다.")
-    file = st.file_uploader("라벨링된 스크리닝 파일 업로드", type=["xlsx", "xls", "csv"])
-    recall_pct_options = [int(r * 100) for r in RECALL_TARGET_PRESETS]
-    recall_pct_initial = st.selectbox(
-        "목표 재현율 (허용 FN은 이 값에서 자동 계산됩니다)",
-        options=recall_pct_options,
-        index=recall_pct_options.index(int(DEFAULT_RECALL_TARGET * 100)),
-        format_func=lambda v: f"{v}%",
-        help=(
-            "라벨 Include 문헌 중 최소 이 비율 이상은 반드시 '우선 검토' 또는 '경계 문헌'에 남도록 "
-            "임계값을 정합니다. '허용 FN 개수'를 직접 입력하지 않고, 고정된 재현율 목표에서 라벨 수에 맞춰 "
-            "자동으로 계산하므로 매번 기준이 흔들리지 않습니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요."
-        ),
+    st.info(
+        "「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일을 업로드하세요. Human_Label에는 1/0 또는 O/X를 사용할 수 있고, "
+        f"검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다. 유효 라벨이 {MIN_LABELS_FOR_SUPERVISED}개 이상이면 "
+        "지도학습 모드(재현율 통계적 보장)로, 그 미만이면 Zero-shot 모드(PICO/배제기준 유사도만 사용, 통계적 보장 없음)로 자동 실행됩니다."
     )
+    file = st.file_uploader("스크리닝 파일 업로드 (라벨 있어도, 없어도 됩니다)", type=["xlsx", "xls", "csv"])
+    recall_pct_options = [int(r * 100) for r in RECALL_TARGET_PRESETS]
+
     if file:
         df = pd.read_excel(file) if Path(file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(file)
         st.dataframe(df.head(20), use_container_width=True)
-        if st.button("모델 학습 및 순위 매기기", type="primary", use_container_width=True):
-            try:
-                with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
-                    result = train_and_predict(df, recall_target=recall_pct_initial / 100, criteria_text=criteria_text)
-                st.session_state["screening_result"] = result
-                save_project_state(active, "screening_result", result)
-                safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-                log_activity("🤖", "AI 스크리닝 완료", f"검토량 절감 {safe_n0:,}건, 목표 재현율 {recall_pct_initial}% (허용 FN {result.metrics.get('allowed_fn', 0)}) / 실측 FN {result.metrics.get('measured_fn', 0)}")
-            except Exception as exc:
-                st.error(str(exc))
+        labeled_n = detect_label_count(df)
+
+        if labeled_n >= MIN_LABELS_FOR_SUPERVISED:
+            st.success(f"✅ 유효 라벨 {labeled_n:,}개 감지 — 지도학습 모드로 실행됩니다 (재현율을 통계적으로 보장).")
+            recall_pct_initial = st.selectbox(
+                "목표 재현율 (허용 FN은 이 값에서 자동 계산됩니다)",
+                options=recall_pct_options,
+                index=recall_pct_options.index(int(DEFAULT_RECALL_TARGET * 100)),
+                format_func=lambda v: f"{v}%",
+                help=(
+                    "라벨 Include 문헌 중 최소 이 비율 이상은 반드시 '우선 검토' 또는 '경계 문헌'에 남도록 "
+                    "임계값을 정합니다. '허용 FN 개수'를 직접 입력하지 않고, 고정된 재현율 목표에서 라벨 수에 맞춰 "
+                    "자동으로 계산하므로 매번 기준이 흔들리지 않습니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요."
+                ),
+            )
+            if st.button("모델 학습 및 순위 매기기", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
+                        result = train_and_predict(df, recall_target=recall_pct_initial / 100, criteria_text=criteria_text)
+                    st.session_state["screening_result"] = result
+                    st.session_state.pop("zero_shot_result", None)
+                    save_project_state(active, "screening_result", result)
+                    safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                    log_activity("🤖", "AI 스크리닝 완료", f"검토량 절감 {safe_n0:,}건, 목표 재현율 {recall_pct_initial}% (허용 FN {result.metrics.get('allowed_fn', 0)}) / 실측 FN {result.metrics.get('measured_fn', 0)}")
+                except Exception as exc:
+                    st.error(str(exc))
+        else:
+            st.warning(
+                f"⚠️ 유효 라벨이 {labeled_n:,}개뿐입니다 (지도학습에는 최소 {MIN_LABELS_FOR_SUPERVISED}개 필요) — "
+                "Zero-shot 모드로 실행됩니다. PICO/배제기준 유사도만으로 순위를 매기며, 재현율을 통계적으로 보장하지 않습니다."
+            )
+            if not pico_sectioned_text.strip():
+                st.error("PICO 기준이 비어 있습니다. 「🧬 PICO 설정」 탭에서 P/I/C/O를 먼저 입력해 주세요.")
+            elif st.button("Zero-shot 순위 매기기", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("PICO/배제기준 유사도를 계산하는 중입니다..."):
+                        zs_result = zero_shot_screen(df, pico_sectioned_text, pico.get("exclusion_criteria", ""))
+                    st.session_state["zero_shot_result"] = zs_result
+                    st.session_state.pop("screening_result", None)
+                    save_project_state(active, "zero_shot_result", zs_result)
+                    log_activity("🧭", "Zero-shot 스크리닝 완료", f"안전 제외 후보 {zs_result.metrics['safe_exclude_n']:,}건 / 전체 {zs_result.metrics['n_total']:,}건 (라벨 없음)")
+                except Exception as exc:
+                    st.error(str(exc))
 
     result = st.session_state.get("screening_result")
     if result:
@@ -581,11 +617,12 @@ elif nav == "screen":
         '''
         st.markdown(headline_html, unsafe_allow_html=True)
 
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         embedding_note = "" if result.metrics.get("embedding_signal_used") else " (의미 임베딩 신호는 이 환경에 sentence-transformers가 없어 제외됨)"
         d1.metric("AI Safety Score", f"{avg_safety_score:.3f}" if safe_exclude_n else "-", help=f"안전 제외 후보로 분류된 문헌들의 평균 안전 점수입니다. Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도, 의미 임베딩 등 서로 다른 근거를 가진 모델들이 Exclude 방향으로 동의한 정도(1에 가까울수록 강한 합의)를 나타냅니다{embedding_note}.")
         d2.metric("안전 제외 후보 수", f"{safe_exclude_n:,}편")
-        d3.metric("안전 제외 후보 중 실제 FN (교차검증)", f"{safe_cv_fn}건 / 후보 {safe_cv_n:,}건", help="안전 제외 후보 조건에 해당했던 라벨 문헌 중 실제로는 Include였던 건수입니다. 모든 신호 모델이 같은 (목표 재현율에서 자동 계산된) 허용 FN 기준을 지키며 동의한 경우만 인정하므로, 이 값은 항상 위의 자동계산된 허용 FN 이하로 유지됩니다.")
+        d3.metric("안전 제외 후보 중 실제 FN (교차검증)", f"{safe_cv_fn}건 / 후보 {safe_cv_n:,}건", help="안전 제외 후보 조건에 해당했던 라벨 문헌 중 실제로는 Include였던 건수입니다. 서로 다른 근거를 가진 신호 모델들 중 80% 이상이 같은 (목표 재현율에서 자동 계산된) 허용 FN 기준을 지키며 동의한 경우만 인정하므로, 이 값은 항상 위의 자동계산된 허용 FN 이하로 유지됩니다.")
+        d4.metric("WSS (절감 지표)", f"{result.metrics.get('wss', 0.0) * 100:.1f}%", help="Work Saved over Sampling. 무작위로 문헌을 훑는 것 대비, 목표 재현율을 지키면서 절감한 검토 노력의 비율입니다 (Cohen et al. 2006 방식, SR 자동화 스크리닝 분야 표준 지표). ASReview 등 다른 도구와 객관적으로 비교할 때 이 값을 기준으로 삼으면 됩니다.")
 
         if safe_cv_fn > 0:
             st.warning(
@@ -692,6 +729,60 @@ elif nav == "screen":
             "AI 순위 결과 다운로드 (AI_Screening_Ranked.xlsx)", build_grouped_excel_bytes(result.predictions),
             "AI_Screening_Ranked.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary", use_container_width=True,
+        )
+
+    zs_result = st.session_state.get("zero_shot_result")
+    if zs_result:
+        m = zs_result.metrics
+        st.markdown('<div class="section-title" style="margin-top:18px;">Zero-shot 결과 (라벨 없이 PICO·배제기준 유사도만 사용)</div>', unsafe_allow_html=True)
+        st.warning(m.get("disclaimer", ""))
+
+        total_zs = m.get("n_total", 0)
+        safe_zs = m.get("safe_exclude_n", 0)
+        reduction_zs = (safe_zs / total_zs * 100) if total_zs else 0.0
+        headline_zs = f'''
+        <div style="display:flex; gap:16px; margin-bottom:14px;">
+          <div style="flex:1; padding:20px; border-radius:14px; background:linear-gradient(135deg,#4A4E69,#22223B); color:#fff;">
+            <div style="font-size:.85rem; opacity:.85;">잠정 검토량 절감률</div>
+            <div style="font-size:2.4rem; font-weight:800; line-height:1.2;">{reduction_zs:.1f}%</div>
+            <div style="font-size:.78rem; opacity:.8;">라벨 검증 전 잠정치입니다. 통계적으로 보장된 값이 아닙니다.</div>
+          </div>
+        </div>
+        '''
+        st.markdown(headline_zs, unsafe_allow_html=True)
+
+        e1, e2, e3 = st.columns(3)
+        e1.metric("우선 검토", f"{m.get('priority_n', 0):,}편")
+        e2.metric("경계 문헌", f"{m.get('borderline_n', 0):,}편")
+        e3.metric("안전 제외 후보", f"{safe_zs:,}편")
+
+        embedding_note_zs = "의미 임베딩(PubMedBERT) 사용" if m.get("embedding_signal_used") else "TF-IDF로 대체 (이 환경에 sentence-transformers 없음)"
+        sections_note = f"PICO 섹션 인식됨: {', '.join(m['sections_detected'])}" if m.get("sections_detected") else "PICO 섹션이 인식되지 않아 통짜 유사도로 계산됨"
+        st.caption(f"{sections_note} · 배제기준 항목 {m.get('exclusion_items_n', 0)}개 · {embedding_note_zs}")
+
+        def _shade_priority_zs(row):
+            status = row.get("AI_Recommendation", "")
+            if status == "안전 제외 후보":
+                return ["background-color: #B8BDC6; color: #111827"] * len(row)
+            if status == "경계 문헌":
+                return ["background-color: #EEF0F3; color: #111827"] * len(row)
+            return ["background-color: #FFFFFF; color: #111827"] * len(row)
+
+        st.markdown('<div class="section-title">Zero-shot 순위 결과</div>', unsafe_allow_html=True)
+        st.dataframe(
+            zs_result.predictions.head(1000).style.apply(_shade_priority_zs, axis=1),
+            use_container_width=True, height=520,
+        )
+        st.download_button(
+            "Zero-shot 결과 다운로드 (Zero_Shot_Screening.xlsx)",
+            dataframe_to_excel_bytes(zs_result.predictions),
+            "Zero_Shot_Screening.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.info(
+            "안전 제외 후보 중 20~30편을 무작위로 뽑아 직접 확인한 뒤, 그 판정을 Human_Label 열로 입력한 파일을 "
+            f"다시 업로드하면(유효 라벨 {MIN_LABELS_FOR_SUPERVISED}개 이상) 지도학습 모드로 자동 전환되어 재현율을 통계적으로 보장받을 수 있습니다."
         )
 
 # ===========================================================================
