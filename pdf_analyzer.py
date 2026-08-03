@@ -51,7 +51,8 @@ _AUTHOR_STOPWORDS = {
 
 _STRAIN_SPECIES_PATTERNS = [
     # (원문에서 찾을 패턴, 표준화된 계통명, 종 단어)
-    (r"\b(?:Sprague[- ]?Dawley|SD)\s+rats?\b", "SD", "rats"),
+    (r"\bSprague[- ]?Dawley\s*(?:\(SD\))?\s*rats?\b", "SD", "rats"),
+    (r"\bSD\s+rats?\b", "SD", "rats"),
     (r"\bWistar\s+rats?\b", "Wistar", "rats"),
     (r"\b(?:Fischer\s*344|F344)\s+rats?\b", "F344", "rats"),
     (r"\bLong[- ]Evans\s+rats?\b", "Long-Evans", "rats"),
@@ -79,9 +80,22 @@ def extract_pdf_text(data: bytes) -> tuple[str, int]:
         except Exception:
             pages.append("")
     text = "\n".join(pages)
+    text = text.replace("\u00a0", " ")  # 줄바꿈 없는 공백(nbsp) 정규화
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip(), len(reader.pages)
+
+
+_REFERENCES_HEADING = re.compile(
+    r"\n\s*(?:[IVXLC]+\.\s*)?(references|bibliography|literature cited)\s*\n", re.I
+)
+
+
+def _truncate_before_references(text: str) -> str:
+    """참고문헌 목록 이전까지만 남긴다 (인용된 다른 논문의 제목·저자·연도가
+    본문 필드로 잘못 추출되는 것을 방지)."""
+    m = _REFERENCES_HEADING.search(text)
+    return text[: m.start()] if m else text
 
 
 def _sentences(text: str) -> list[str]:
@@ -128,9 +142,9 @@ def _surname_from_name_token(token: str) -> str | None:
         if re.match(r"^[A-Z][A-Za-z'\-]{1,30}$", head):
             return head
         return None
-    # 이니셜 뒤에 성이 오는 경우: 'J. Smith' / 'J.M. Smith'
-    if re.match(r"^([A-Z]\.\s?){1,3}[A-Z][A-Za-z'\-]{1,30}$", token):
-        return parts[-1]
+    # 이니셜 뒤에 성이 오는 경우: 'J. Smith' / 'J.M. Smith' / 'A.-S. Schreurs' / 'J. S. Alwood'
+    if re.match(r"^(?:[A-Z]\.[\s\-]?){1,4}[A-Z][A-Za-z'\-]{1,30}$", token):
+        return token.split()[-1]
     # 성 뒤에 이니셜이 오는 경우: 'Smith J.' / 'Smith JM'
     if re.match(r"^[A-Z][A-Za-z'\-]{1,30}(\s([A-Z]\.?){1,3})$", token):
         return parts[0]
@@ -178,24 +192,32 @@ def _extract_first_author_from_text(text: str) -> tuple[str, str]:
                                           "received", "accepted", "published", "correspondence",
                                           "keywords", "abstract")):
             continue
-        # 쉼표/&/and 로 구분된 이름 리스트 형태인지 확인
-        if not re.search(r",|\band\b|&", line):
+        # 쉼표/&/and/가운뎃점(·)으로 구분된 이름 리스트 형태인지 확인
+        if not re.search(r",|\band\b|&|·", line):
             continue
-        tokens = re.split(r",|\band\b|&", line)
+        tokens = re.split(r",|\band\b|&|·", line)
         surnames = []
+        aborted = False
         for tok in tokens:
             tok = tok.strip()
             if not tok:
                 continue
+            # 위첨자 숫자·기호(예: 소속 번호 '2', 공동 1저자 표시 '†')만 있는 토큰은 건너뛴다
+            bare = re.sub(r"[\*\u2020\u2021\d\s]", "", tok)
+            if not bare:
+                continue
             if tok.lower() in _AUTHOR_STOPWORDS:
-                surnames = []
+                aborted = True
                 break
             surname = _surname_from_name_token(tok)
-            if surname is None or surname.lower() in _AUTHOR_STOPWORDS:
-                surnames = []
+            if surname is None:
+                aborted = True
+                break
+            if surname.lower() in _AUTHOR_STOPWORDS:
+                aborted = True
                 break
             surnames.append(surname)
-        if surnames and len(surnames) <= 12:
+        if not aborted and surnames and len(surnames) <= 12:
             candidates.append((surnames[0], line[:300]))
 
     if candidates:
@@ -259,6 +281,74 @@ def _build_study_field(text: str, reader: PdfReader) -> ExtractionField:
 
 
 # ---------------------------------------------------------------------------
+# 중재물질 (intervention)
+# ---------------------------------------------------------------------------
+
+_TITLE_INTERVENTION_PATTERNS = [
+    r"(?:Effects?|Efficacy|Impact|Role)\s+of\s+([A-Za-z0-9][A-Za-z0-9\-\s]{1,40}?)\s+(?:supplementation|administration|treatment|therapy|diet|ingestion|feeding)\b",
+    r"High\s+Concentrations?\s+of\s+([A-Za-z0-9\-\s]{2,40}?)\s+(?:Prevent|Reduce|Attenuate|Improve|Protect|Inhibit)s?\b",
+    r"\b([A-Z][A-Za-z0-9\-]+(?:\s+[a-z][A-Za-z0-9\-]*){0,2})\s+diet\s+(?:protects?|prevents?|attenuates?|improves?|reduces?|reverses?)\b",
+    r"\b([A-Z][A-Za-z0-9\-]+(?:\s+[a-z][A-Za-z0-9\-]*){0,2})\s+supplementation\s+(?:attenuates?|prevents?|improves?|reduces?)\b",
+    r"(?:Effects?|Efficacy|Impact|Role)\s+of\s+([A-Za-z0-9][A-Za-z0-9\-\s]{1,40}?)\s+on\b",
+]
+
+
+_BOILERPLATE_LINE_RE = re.compile(
+    r"^\d+$|vol\.|doi[:.]|www\.|scientific reports|^issn|"
+    r"^(original (article|paper)|regular article|open)$|"
+    r"\d{4}\)\s*\d+[:\-–]",
+    re.I,
+)
+
+
+def _extract_title_block(text: str) -> str:
+    """저자 블록 이전, 즉 제목 영역으로 보이는 텍스트만 반환."""
+    lines = [ln.strip() for ln in text[:1500].split("\n") if ln.strip()]
+    title_lines: list[str] = []
+    for line in lines:
+        if _BOILERPLATE_LINE_RE.search(line):
+            # 저널명·DOI·페이지 표기 등은 제목이 아니므로 건너뛴다 (지금까지 모은
+            # 내용이 있어도 여전히 헤더 영역일 수 있으므로 초기화하지 않고 계속 skip)
+            continue
+        if re.search(r"received|accepted|published", line, re.I):
+            break
+        # 저자 줄 판별: 이름+소속번호(예: 'Smith1', 'Kanazashi1') 토큰이 2개 이상이고
+        # 쉼표/가운뎃점/&/and 로 구분되어 있으면 저자 목록으로 간주하고 중단
+        name_num_count = len(re.findall(r"[A-Za-z][a-z]{1,20}\d", line))
+        if re.search(r",|·|&|\band\b", line) and name_num_count >= 2:
+            break
+        title_lines.append(line)
+        if len(" ".join(title_lines)) > 250:
+            break
+    return " ".join(title_lines)
+
+
+def _extract_intervention(text_no_refs: str, flat: str, sentences: list[str]) -> ExtractionField:
+    title_block = _extract_title_block(text_no_refs)
+    for p in _TITLE_INTERVENTION_PATTERNS:
+        m = re.search(p, title_block)
+        if m:
+            candidate = re.sub(r"\s+", " ", m.group(1)).strip(" ,")
+            if candidate and candidate.lower() not in {"the", "a", "an", "effect", "effects"}:
+                return _field(candidate, 0.85, title_block[:300])
+
+    # 제목에서 못 찾으면 본문에서 탐색 (단, 게재/투고 일자 문장은 제외)
+    body = re.sub(r"Received[^\n]{0,120}?(?:19|20)\d{2}[^\n]{0,80}", " ", flat)
+    intervention_patterns = [
+        r"(?:supplemented with|treated with|administered|fed)\s+([A-Z][A-Za-z0-9α-ωΑ-Ω\-+' ]{2,60}?)(?=\s+(?:at|for|by|via|\(|\d)|[,.;])",
+        r"\b([A-Z][A-Za-z0-9α-ωΑ-Ω\-+' ]{2,40})\s+(?:supplementation|treatment)\b",
+    ]
+    for p in intervention_patterns:
+        m = re.search(p, body, re.I)
+        if m:
+            candidate = re.sub(r"\s+", " ", m.group(1)).strip(" ,")
+            if candidate.lower() not in {"the", "a", "an", "animals", "mice", "rats"}:
+                ev = _evidence(sentences, [m.group(0)[:25]]) or m.group(0)
+                return _field(candidate, 0.6, ev)
+    return _field("", 0.0)
+
+
+# ---------------------------------------------------------------------------
 # 동물종 (계통 + 종)
 # ---------------------------------------------------------------------------
 
@@ -300,14 +390,17 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
             "raw_text": text,
         }
 
-    flat = re.sub(r"\s+", " ", text)
-    sentences = _sentences(text)
-    head = flat[:8000]
-
     study_field = _build_study_field(text, reader)
+
+    text_no_refs = _truncate_before_references(text)
+    flat = re.sub(r"\s+", " ", text_no_refs)
+    sentences = _sentences(text_no_refs)
+
     species_field = _extract_species(flat, sentences)
 
-    sex, sex_ev = _match(flat, [r"\b(male and female|female and male|male|female)\s+(?:mice|mouse|rats?|animals?|participants|subjects)\b"])
+    sex, sex_ev = _match(flat, [
+        r"\b(male and female|female and male|male|female)\s+(?:[A-Z][A-Za-z0-9/\-]{1,20}\s+){0,2}(?:mice|mouse|rats?|rabbits?|animals?|participants|subjects)\b",
+    ])
     if sex:
         sex = sex.title()
 
@@ -320,40 +413,36 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
         ("Hindlimb unloading", r"\b(hindlimb unloading|hindlimb suspension|tail suspension|HLU|HLS)\b"),
         ("Head-down bed rest", r"\b(head[- ]down(?: tilt)? bed rest|HDBR)\b"),
         ("Microgravity", r"\b(simulated microgravity|microgravity|spaceflight)\b"),
-        ("Radiation", r"\b(proton irradiation|heavy ion|gamma irradiation|radiation exposure|GCR|SPE)\b"),
+        ("Ionizing radiation", r"\b(total body irradiation|TBI|gamma irradiation|gamma ray|ionizing radiation|proton irradiation|heavy ion|radiation exposure|GCR|SPE|137Cs|56Fe)\b"),
         ("High-fat diet", r"\b(high[- ]fat diet|HFD)\b"),
         ("Ovariectomy", r"\b(ovariectomized|ovariectomy|OVX)\b"),
     ]
-    models = []
-    model_evs = []
+    best_label, best_count, best_evidence = "", 0, ""
     for label, p in model_candidates:
-        m = re.search(p, flat, re.I)
-        if m:
-            models.append(label)
-            model_evs.append(_evidence(sentences, [m.group(0)]) or m.group(0))
-    model = "; ".join(dict.fromkeys(models))
-    model_ev = " | ".join(model_evs[:3])
+        matches = list(re.finditer(p, flat, re.I))
+        if len(matches) > best_count:
+            best_label = label
+            best_count = len(matches)
+            best_evidence = _evidence(sentences, [matches[0].group(0)]) or matches[0].group(0)
+    model = best_label
+    model_ev = best_evidence
 
-    # 중재물질: treatment/supplement/administered/fed 문장 우선
-    intervention = ""
-    intervention_ev = ""
-    intervention_patterns = [
-        r"(?:supplemented with|treated with|administered|received|fed)\s+([A-Z][A-Za-z0-9α-ωΑ-Ω\-+' ]{2,60}?)(?=\s+(?:at|for|by|via|\(|\d)|[,.;])",
-        r"\b([A-Z][A-Za-z0-9α-ωΑ-Ω\-+' ]{2,40})\s+(?:supplementation|treatment)\b",
+    intervention_field = _extract_intervention(text_no_refs, flat, sentences)
+
+    _dose_context_sentences = [
+        s for s in sentences
+        if re.search(r"\b(administ|inject|supplement|dose|dosage|received|gavage|twice daily|once daily|per day)\b", s, re.I)
+        and not re.search(r"\bweigh|anesthe|anaesthe|pentobarbital|euthaniz|euthanis|sacrific", s, re.I)
     ]
-    for p in intervention_patterns:
-        m = re.search(p, flat, re.I)
-        if m:
-            candidate = re.sub(r"\s+", " ", m.group(1)).strip(" ,")
-            if candidate.lower() not in {"the", "a", "an", "animals", "mice", "rats"}:
-                intervention = candidate
-                intervention_ev = _evidence(sentences, [m.group(0)[:25]]) or m.group(0)
-                break
-
-    dose, dose_ev = _match(flat, [
+    dose, dose_ev = _match(" ".join(_dose_context_sentences), [
         r"\b(\d+(?:\.\d+)?(?:\s*[–-]\s*\d+(?:\.\d+)?)?\s*(?:mg|g|µg|ug|IU|kcal|mmol|mol|%)\s*/?\s*(?:kg(?: body weight)?|g|day|d|diet|mL)?(?:\s*/\s*day)?)\b",
         r"\b(\d+(?:\.\d+)?\s*×\s*10\^?\d+\s*CFU(?:/day|/d)?)\b",
     ])
+    if not dose:
+        dose, dose_ev = _match(re.sub(r"\b\w*weigh\w*\b[^.]*?\d[\d.,–\- ]*(?:g|kg)\b", "", flat, flags=re.I), [
+            r"\b(\d+(?:\.\d+)?(?:\s*[–-]\s*\d+(?:\.\d+)?)?\s*(?:mg|g|µg|ug|IU|kcal|mmol|mol|%)\s*/?\s*(?:kg(?: body weight)?|g|day|d|diet|mL)?(?:\s*/\s*day)?)\b",
+            r"\b(\d+(?:\.\d+)?\s*×\s*10\^?\d+\s*CFU(?:/day|/d)?)\b",
+        ])
 
     duration, duration_ev = _match(flat, [
         r"\b(?:for|during)\s+((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|twelve)\s+(?:days?|weeks?|months?))\b",
@@ -363,34 +452,52 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
     route = ""
     route_ev = ""
     route_map = [
-        ("Oral gavage", r"\b(oral gavage|intragastric gavage|gavage)\b"),
-        ("Dietary admixture", r"\b(mixed into the diet|diet supplemented|supplemented diet|fed a diet containing)\b"),
+        ("Oral gavage", r"\b(oral gavage|intragastric gavage|gavage|feeding needle)\b"),
+        ("Dietary admixture", r"\b(mixed into the diet|diet supplemented|supplemented diet|fed a diet containing|"
+                               r"supplemental\s+[\d.]+%|%\s+nucleotide diets?|via an industrial procedure)\b"),
         ("Drinking water", r"\b(drinking water|in the water)\b"),
         ("Intraperitoneal injection", r"\b(intraperitoneal(?:ly)?|i\.p\.)\b"),
         ("Subcutaneous injection", r"\b(subcutaneous(?:ly)?|s\.c\.)\b"),
         ("Intravenous injection", r"\b(intravenous(?:ly)?|i\.v\.)\b"),
     ]
+    _route_context = " ".join(_dose_context_sentences) if _dose_context_sentences else flat
     for label, p in route_map:
-        m = re.search(p, flat, re.I)
+        m = re.search(p, _route_context, re.I)
         if m:
             route = label
             route_ev = _evidence(sentences, [m.group(0)]) or m.group(0)
             break
+    if not route:
+        _route_fallback = " ".join(
+            s for s in sentences
+            if not re.search(r"anesthe|anaesthe|pentobarbital|euthaniz|euthanis|sacrific", s, re.I)
+        )
+        for label, p in route_map:
+            m = re.search(p, _route_fallback, re.I)
+            if m:
+                route = label
+                route_ev = _evidence(sentences, [m.group(0)]) or m.group(0)
+                break
 
-    # 군(group) 문장 및 명칭
-    group_sentences = [s for s in sentences if re.search(r"\b(groups?|divided|assigned|randomized|control|vehicle|sham|treated)\b", s, re.I)]
-    group_blob = " ".join(group_sentences[:20])
+    # 군(group) 명칭: 논문에서 실제로 쓰는 "(CON; n=6)", "(HU+AX)" 같은
+    # 약어 정의 괄호를 찾는다. 자유 텍스트에서 명사구를 긁어오는 것보다 훨씬 안정적이다.
+    group_sentences = [s for s in sentences if re.search(r"\b(groups?|divided|assigned|randomized)\b", s, re.I)]
+    group_ev = group_sentences[0][:700] if group_sentences else ""
+
+    group_text = " ".join(group_sentences) if group_sentences else ""
     names = []
-    for m in re.finditer(r"(?:group(?:s)?(?: were|:)?\s*|the\s+)([A-Za-z0-9+\- /]{2,35}?)(?=\s+group|[,;.)])", group_blob, re.I):
-        val = re.sub(r"\s+", " ", m.group(1)).strip(" ,.;")
-        if val and len(val.split()) <= 6 and val.lower() not in {"experimental", "following", "same", "control and treatment"}:
+    for m in re.finditer(
+        r"\(([A-Z][A-Za-z0-9]{0,10}(?:\s*[+\-]\s*[A-Za-z0-9.%]{1,10}){0,4})(?:\s*;\s*n\s*=\s*\d+)?\)",
+        group_text,
+    ):
+        val = re.sub(r"\s+", "", m.group(1)).strip()
+        if 2 <= len(val) <= 20 and not val.isdigit():
             names.append(val)
-    names = list(dict.fromkeys(names))[:12]
-    controls = [n for n in names if re.search(r"control|vehicle|sham|normal|baseline|sedentary", n, re.I)]
+    names = list(dict.fromkeys(names))[:15]
+    controls = [n for n in names if re.search(r"^(con|ctrl|control|sham|vehicle|veh)\d*$", n, re.I)]
     treats = [n for n in names if n not in controls]
     control_groups = "; ".join(controls)
     treat_groups = "; ".join(treats)
-    group_ev = group_sentences[0][:700] if group_sentences else ""
 
     # n수: 명시적 n= 값 및 배정 표현
     n_values = []
@@ -424,7 +531,7 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
         "sex": _field(sex, 0.91, sex_ev),
         "age": _field(age, 0.92, age_ev),
         "model": _field(model, 0.88, model_ev),
-        "intervention": _field(intervention, 0.72, intervention_ev),
+        "intervention": intervention_field,
         "dose": _field(dose, 0.86, dose_ev),
         "duration": _field(duration, 0.88, duration_ev),
         "route": _field(route, 0.86, route_ev),
