@@ -15,18 +15,29 @@ CSS = r"""
 }
 *{box-sizing:border-box}
 html,body,[class*="css"]{font-family:'PretendardVariable','Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+/* 대시보드/메뉴 전반의 글씨를 살짝 키움 (요청: 피규어 제외, UI 텍스트만).
+   대부분의 자체 CSS가 rem 단위라 이 한 줄로 비례해서 함께 커진다. */
+html{font-size:17.5px}
 .stApp{background:var(--paper);color:var(--ink)}
 .block-container{max-width:1240px;padding-top:5.25rem;padding-bottom:3.5rem}
 header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);backdrop-filter:blur(12px);border-bottom:1px solid rgba(230,234,242,.9);z-index:999}
 [data-testid="stToolbar"]{z-index:1000}
 #MainMenu,footer{visibility:hidden}
 
+/* Streamlit 기본 위젯은 rem 스케일을 안 타는 요소가 많아 별도로 키운다 */
+[data-testid="stMetricValue"]{font-size:1.9rem !important}
+[data-testid="stMetricLabel"]{font-size:.95rem !important}
+[data-testid="stWidgetLabel"] p{font-size:.98rem !important}
+[data-testid="stMarkdownContainer"] p,[data-testid="stCaptionContainer"]{font-size:.98rem}
+[data-testid="stDataFrame"]{font-size:.97rem}
+.stSelectbox div[data-baseweb="select"] *,.stTextInput input,.stTextArea textarea{font-size:.98rem !important}
+
 /* Sidebar */
 [data-testid="stSidebar"]{background:var(--navy);border-right:0}
 [data-testid="stSidebar"] .block-container{padding-top:4.7rem}
 [data-testid="stSidebar"] p,[data-testid="stSidebar"] span,[data-testid="stSidebar"] label,[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#e9eefc}
 [data-testid="stSidebar"] hr{border-color:rgba(255,255,255,.12)}
-[data-testid="stSidebar"] .stButton>button{background:transparent;border:0;color:#c8d1ea;text-align:left;justify-content:flex-start;border-radius:9px;box-shadow:none;padding:.58rem .72rem}
+[data-testid="stSidebar"] .stButton>button{background:transparent;border:0;color:#c8d1ea;text-align:left;justify-content:flex-start;border-radius:9px;box-shadow:none;padding:.62rem .78rem;font-size:1rem}
 [data-testid="stSidebar"] .stButton>button:hover{background:rgba(255,255,255,.08);color:white}
 [data-testid="stSidebar"] .stButton>button[kind="primary"]{background:rgba(76,120,255,.17);color:#fff;border-left:3px solid #6f95ff}
 .brandbar{padding:.35rem .2rem 1rem;border-bottom:1px solid rgba(255,255,255,.14);margin-bottom:.75rem}
@@ -35,12 +46,12 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 /* Common */
 .section-title{font-size:1.08rem;font-weight:750;color:var(--ink);margin:.45rem 0 .15rem}
 .section-sub{font-size:.87rem;color:var(--muted);margin-bottom:.9rem}
-.stButton>button,.stDownloadButton>button{border-radius:10px;min-height:42px;font-weight:650;border-color:#d8deea}
+.stButton>button,.stDownloadButton>button{border-radius:10px;min-height:42px;font-weight:650;border-color:#d8deea;font-size:1rem}
 .stButton>button[kind="primary"],.stDownloadButton>button[kind="primary"]{background:var(--blue);border-color:var(--blue);color:white}
 .stButton>button[kind="primary"]:hover{background:#1d4ed8;border-color:#1d4ed8}
 [data-testid="stFileUploader"]{background:#fff;border:1.5px dashed #cbd3e2;border-radius:14px;padding:.45rem}
 [data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.small-note{padding:11px 14px;background:#f0f6ff;border:1px solid #d5e4ff;border-radius:10px;color:#36547f;font-size:.84rem}
+.small-note{padding:11px 14px;background:#f0f6ff;border:1px solid #d5e4ff;border-radius:10px;color:#36547f;font-size:.92rem}
 
 /* Landing top navigation */
 .landing-nav{display:flex;align-items:center;justify-content:space-between;padding:10px 2px 18px}

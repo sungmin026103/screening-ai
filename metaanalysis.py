@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless/thread-safe backend for Streamlit
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Polygon, Rectangle
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -660,8 +661,17 @@ def forest_plot_from_R(
     Y_AXIS_BASE = -0.62
     Y_TICKNUM = -0.92
     Y_SUBTITLE = -1.46
-    Y_NOTE = -2.02
-    Y_MIN = -3.20
+    # 이질성/τ²/p 노트는 오른쪽 열(R_START)에 있고, 그 사이(Y_POOL 아래)는 비어
+    # 있으므로 굳이 아래쪽 축 설명과 같은 높이까지 내릴 필요가 없다. 종합효과
+    # 행 바로 아래로 당겨서 시각적 간격을 줄인다.
+    Y_NOTE = Y_POOL - 0.5
+    # 범례는 왼쪽 열(XS)에 있고 축 눈금/부제 아래에 위치해야 하므로 기존 위치를
+    # 그대로 유지한다 (Y_NOTE와 분리된 별도 앵커).
+    Y_LEGEND_TOP = -2.02
+    n_legend_items = 3 if has_pi else 2
+    # 범례 항목이 늘어나도(예: 예측구간 추가) 마지막 항목이 캔버스 아래로 잘려서
+    # 안 보이는 일이 없도록, 항목 수에 맞춰 Y_MIN을 동적으로 넉넉히 잡는다.
+    Y_MIN = Y_LEGEND_TOP - 0.62 - (n_legend_items - 1) * 0.34 - 0.35
     Y_MAX = Y_TITLE + 0.35
 
     ax = fig.add_axes([0, 0, 1, 1])
@@ -752,11 +762,20 @@ def forest_plot_from_R(
         ax.plot([xf(summary.pi_lb)] * 2, [Y_PI - cap_pi, Y_PI + cap_pi], color=C_PI, lw=1.4, zorder=4)
         ax.plot([xf(summary.pi_ub)] * 2, [Y_PI - cap_pi, Y_PI + cap_pi], color=C_PI, lw=1.4, zorder=4)
 
-    # x축 눈금 (데이터 좌표 -> 인치 좌표 변환은 xf가 처리, 여기서는 라벨만)
-    ticks_data = np.linspace(xmin, xmax, 5)
+    # x축 눈금 (데이터 좌표 -> 인치 좌표 변환은 xf가 처리, 여기서는 라벨만).
+    # linspace로 5등분한 값을 그대로 반올림하면 -6/-4/-2/0/2처럼 우연히 깔끔한
+    # 경우도 있지만, 범위에 따라 -5/-3/-1/1/3처럼 어색하거나 중복되는 눈금이
+    # 나올 수 있다. MaxNLocator로 "보기 좋은" 값(1/2/2.5/5의 배수)을 고르고,
+    # 그 간격(step) 크기에 맞춰 소수점 자릿수를 적응적으로 정한다.
+    locator = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10])
+    ticks_data = np.array([t for t in locator.tick_values(xmin, xmax) if xmin <= t <= xmax])
+    if len(ticks_data) < 2:
+        ticks_data = np.linspace(xmin, xmax, 5)
+    step = float(ticks_data[1] - ticks_data[0]) if len(ticks_data) > 1 else 1.0
+    decimals = 0 if step >= 1 else (1 if step >= 0.1 else 2)
     for tv in ticks_data:
         ax.plot([xf(tv), xf(tv)], [Y_AXIS_BASE, Y_AXIS_BASE + 0.06], color=C_TEXT, lw=0.7, zorder=4, clip_on=False)
-        T(xf(tv), Y_TICKNUM, f"{tv:.0f}", ha="center", fs=fs_data - 0.3)
+        T(xf(tv), Y_TICKNUM, f"{tv:.{decimals}f}", ha="center", fs=fs_data - 0.3)
     ax.text((F_START + F_END) / 2, Y_SUBTITLE, subtitle, ha="center", va="center", fontsize=fs_data + 0.6, clip_on=False)
 
     if note_bits:
@@ -766,12 +785,12 @@ def forest_plot_from_R(
     leg_items = [("s", C_TEXT, "Individual study (95% CI)"), ("D", C_POOL, "Pooled effect (diamond, 95% CI)")]
     if has_pi:
         leg_items.append((None, C_PI, "Prediction interval (95%)"))
-    ly = Y_NOTE - 0.62
+    ly = Y_LEGEND_TOP - 0.62
     for marker, color, label in leg_items:
         if marker:
-            ax.scatter([XS + 0.05], [ly], s=26, marker=marker, color=color, zorder=5, linewidths=0)
+            ax.scatter([XS + 0.05], [ly], s=26, marker=marker, color=color, zorder=5, linewidths=0, clip_on=False)
         else:
-            ax.plot([XS, XS + 0.18], [ly, ly], color=color, lw=1.8, zorder=5)
+            ax.plot([XS, XS + 0.18], [ly, ly], color=color, lw=1.8, zorder=5, clip_on=False)
         T(XS + 0.28, ly, label, fs=fs_data - 0.6)
         ly -= 0.34
 
@@ -1048,7 +1067,12 @@ def influence_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col:
     fig.suptitle(f"Influence diagnostics — {title}", fontsize=13, fontweight="bold", x=0.04, ha="left")
     handles = [Patch(color=C_NORM, label="Non-influential"), Patch(color=C_PI, label="Influential")]
     fig.legend(handles=handles, loc="lower center", ncol=2, frameon=True, bbox_to_anchor=(0.5, 0.015))
-    max_chars = max([len(x) for x in studies], default=10)
-    left_margin = min(0.34, max(0.18, 0.012 * max_chars + 0.05))
+    # 왼쪽 여백을 "글자수 x 0.012"로 어림하던 방식은 실제 필요한 폭보다 훨씬
+    # 넉넉하게(거의 2배) 잡혀서 그래프 전체가 오른쪽으로 밀려 보이는 원인이었다.
+    # 실제 폰트로 렌더링했을 때의 텍스트 폭(인치)을 직접 측정해 정확한 여백만
+    # 확보한다 — Cook's Distance 패널이 좌측 상단 제목과 비슷한 열에 오도록.
+    fig_w_in = 12.8
+    label_w_in = max((_measure_inches(fig, s, 8.6) for s in studies), default=1.0) if studies else 1.0
+    left_margin = min(0.34, max(0.06, (label_w_in + 0.22) / fig_w_in))
     fig.subplots_adjust(left=left_margin, right=0.98, bottom=0.18, top=0.86, wspace=0.28)
     return fig
