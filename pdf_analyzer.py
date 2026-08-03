@@ -38,6 +38,35 @@ FIELD_LABELS = {
 
 _YEAR_RANGE = range(1990, 2027)
 
+# 정수를 나타내는 영단어 -> 숫자. 나이/기간 표기가 "Two-month-old"처럼 숫자가
+# 아닌 단어로 쓰이는 경우가 많아서 필요하다.
+_WORD_NUM = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+
+
+def _age_to_weeks_note(age_str: str) -> str:
+    """추출된 나이 문자열(예: 'Two-month-old', '8-week-old')의 단위가 개월/일이면
+    주 단위로 환산해 괄호로 덧붙인다. 논문마다 개월/주/일이 섞여 쓰이므로,
+    한눈에 비교할 수 있도록 통일하기 위함. 이미 주 단위면 그대로 둔다."""
+    if not age_str:
+        return age_str
+    m = re.search(r"(\d+(?:\.\d+)?|[a-zA-Z]+)[- ](week|weeks|wk|month|months|day|days)", age_str, re.I)
+    if not m:
+        return age_str
+    num_txt, unit = m.group(1), m.group(2).lower()
+    num = _WORD_NUM.get(num_txt.lower())
+    if num is None:
+        try:
+            num = float(num_txt)
+        except ValueError:
+            return age_str
+    if unit in ("week", "weeks", "wk"):
+        return age_str
+    weeks = num * 4 if unit.startswith("month") else num / 7.0
+    return f"{age_str} (약 {weeks:.0f}주)"
+
 # 저자 후보 줄에서 사람 이름이 아닌 것으로 흔히 섞여 들어오는 단어들 (오탐 방지용 불용어)
 _AUTHOR_STOPWORDS = {
     "abstract", "introduction", "keywords", "university", "department",
@@ -405,10 +434,11 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
         sex = sex.title()
 
     age, age_ev = _match(flat, [
-        r"\b((?:\d+(?:\.\d+)?|six|seven|eight|nine|ten|twelve)[- ](?:week|weeks|wk|month|months|day|days)[- ]old)\b",
+        r"\b((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|twelve)[- ](?:week|weeks|wk|month|months|day|days)[- ]old)\b",
         r"\b(aged\s+\d+(?:\s*[–-]\s*\d+)?\s+(?:weeks?|months?|days?))\b",
         r"\b(\d+(?:\.\d+)?\s*(?:wk|weeks?|months?|days?)\s+of\s+age)\b",
     ])
+    age = _age_to_weeks_note(age)
 
     model_candidates = [
         ("Hindlimb unloading", r"\b(hindlimb unloading|hindlimb suspension|tail suspension|HLU|HLS)\b"),

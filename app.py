@@ -838,22 +838,30 @@ elif nav == "pdf_analysis":
                     ("군 및 통계", ["control_groups", "treat_groups", "sample_size", "dispersion"]),
                 ]
                 for section, keys in groups:
-                    st.markdown(f"#### {section}")
+                    st.markdown(f'<div class="section-title" style="margin-top:16px;">{section}</div>', unsafe_allow_html=True)
                     for row_start in range(0, len(keys), 2):
                         cols = st.columns(2)
                         for col, key in zip(cols, keys[row_start:row_start + 2]):
                             item = fields.get(key, {})
                             conf = float(item.get("confidence", 0.0) or 0.0)
+                            conf_color = "#24a36a" if conf >= 0.85 else ("#f59e0b" if conf >= 0.5 else "#dc5a5a")
+                            conf_label = "높음" if conf >= 0.85 else ("보통" if conf >= 0.5 else "낮음")
                             with col:
                                 edited_values[key] = st.text_input(
                                     FIELD_LABELS[key], value=str(item.get("value", "")),
                                     key=f"pdf_edit_{doc_idx}_{key}"
                                 )
-                                st.caption(f"자동 추출 신뢰도 {conf * 100:.0f}%")
+                                st.markdown(
+                                    f'<span style="display:inline-block;padding:3px 11px;border-radius:999px;'
+                                    f'background:{conf_color}1a;color:{conf_color};font-size:.88rem;font-weight:700;">'
+                                    f'신뢰도 {conf * 100:.0f}% · {conf_label}</span>',
+                                    unsafe_allow_html=True,
+                                )
                                 evidence = str(item.get("evidence", "")).strip()
                                 if evidence:
                                     with st.popover("원문 근거"):
                                         st.write(evidence)
+                    st.markdown('<hr style="margin:10px 0;border-color:#eef0f6;">', unsafe_allow_html=True)
                 if st.button("수정 내용 저장", key=f"save_pdf_edit_{doc_idx}", use_container_width=True):
                     for key, value in edited_values.items():
                         result_doc.setdefault("fields", {}).setdefault(key, {})["value"] = value

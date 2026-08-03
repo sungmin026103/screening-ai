@@ -17,7 +17,7 @@ CSS = r"""
 html,body,[class*="css"]{font-family:'PretendardVariable','Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
 /* 대시보드/메뉴 전반의 글씨를 살짝 키움 (요청: 피규어 제외, UI 텍스트만).
    대부분의 자체 CSS가 rem 단위라 이 한 줄로 비례해서 함께 커진다. */
-html{font-size:17.5px}
+html{font-size:19px}
 .stApp{background:var(--paper);color:var(--ink)}
 .block-container{max-width:1240px;padding-top:5.25rem;padding-bottom:3.5rem}
 header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);backdrop-filter:blur(12px);border-bottom:1px solid rgba(230,234,242,.9);z-index:999}
@@ -44,8 +44,8 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 .brandbar .mark{font-size:1.35rem;font-weight:750;letter-spacing:-.02em;color:#fff}
 
 /* Common */
-.section-title{font-size:1.08rem;font-weight:750;color:var(--ink);margin:.45rem 0 .15rem}
-.section-sub{font-size:.87rem;color:var(--muted);margin-bottom:.9rem}
+.section-title{font-size:1.22rem;font-weight:750;color:var(--ink);margin:.45rem 0 .15rem}
+.section-sub{font-size:.96rem;color:var(--muted);margin-bottom:.9rem}
 .stButton>button,.stDownloadButton>button{border-radius:10px;min-height:42px;font-weight:650;border-color:#d8deea;font-size:1rem}
 .stButton>button[kind="primary"],.stDownloadButton>button[kind="primary"]{background:var(--blue);border-color:var(--blue);color:white}
 .stButton>button[kind="primary"]:hover{background:#1d4ed8;border-color:#1d4ed8}
@@ -97,11 +97,11 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 /* Summary strip */
 .summary-strip{position:relative;z-index:1;margin:0 0 30px;background:rgba(255,255,255,.97);border:1px solid rgba(226,231,241,.95);border-radius:17px;display:grid;grid-template-columns:repeat(4,1fr);box-shadow:0 18px 45px rgba(16,26,53,.11);overflow:hidden}
 .summary-item{padding:22px 25px;border-right:1px solid var(--line)}.summary-item:last-child{border-right:0}
-.summary-label{font-size:.76rem;color:var(--muted);margin-bottom:8px}.summary-value{font:700 1.65rem 'JetBrains Mono',monospace;color:var(--ink)}.summary-hint{font-size:.71rem;color:#929aae;margin-top:5px}
+.summary-label{font-size:.88rem;color:var(--muted);margin-bottom:8px}.summary-value{font:700 1.95rem 'JetBrains Mono',monospace;color:var(--ink)}.summary-hint{font-size:.8rem;color:#929aae;margin-top:5px}
 
 /* Recent projects */
 .recent-head{display:flex;justify-content:space-between;align-items:end;margin:8px 0 12px}
-.recent-head h2{font-size:1.12rem;margin:0}.recent-head span{font-size:.8rem;color:var(--muted)}
+.recent-head h2{font-size:1.28rem;margin:0}.recent-head span{font-size:.92rem;color:var(--muted)}
 .project-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:12px}
 .project-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 17px;min-height:132px;box-shadow:0 5px 18px rgba(16,26,53,.035);transition:.18s ease}
 .project-card:hover{transform:translateY(-2px);box-shadow:0 11px 28px rgba(16,26,53,.08);border-color:#d5dceb}
@@ -114,15 +114,15 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 .hero{position:relative;overflow:hidden;background:linear-gradient(120deg,#0a1834,#102b5c);border:0;border-radius:19px;padding:32px 36px;margin:8px 0 20px;color:#fff;box-shadow:0 14px 35px rgba(8,22,47,.14)}
 .hero:after{content:"";position:absolute;width:290px;height:290px;border-radius:50%;right:-80px;top:-110px;border:1px solid rgba(107,149,255,.24);box-shadow:0 0 0 42px rgba(107,149,255,.05),0 0 0 84px rgba(107,149,255,.035)}
 .hero-inner{position:relative;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:24px}.hero-text{max-width:760px}
-.hero .eyebrow{display:inline-block;color:#8fb4ff;font-size:.7rem;letter-spacing:.14em;text-transform:uppercase;font-weight:750;margin-bottom:10px}.hero h1{font-size:1.85rem;line-height:1.32;letter-spacing:-.025em;margin:0 0 8px}.hero p{font-size:.94rem;color:#bcc9df;margin:0;line-height:1.7}
+.hero .eyebrow{display:inline-block;color:#8fb4ff;font-size:.8rem;letter-spacing:.14em;text-transform:uppercase;font-weight:750;margin-bottom:10px}.hero h1{font-size:2.05rem;line-height:1.32;letter-spacing:-.025em;margin:0 0 8px}.hero p{font-size:1.05rem;color:#bcc9df;margin:0;line-height:1.7}
 .hero-visual{width:220px;max-width:30%}.hero-visual svg{width:100%;height:auto;display:block}
 .topbar{display:flex;justify-content:flex-end;align-items:center;gap:9px;padding:3px 0 8px}.topbar .avatar{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;background:var(--navy);color:#fff;font-size:.75rem;font-weight:700}
 
 /* KPI and workflow */
 .kpi{background:#fff;border:1px solid var(--line);border-radius:14px;padding:17px;min-height:108px;box-shadow:0 4px 16px rgba(16,26,53,.03)}
-.kpi .label{font-size:.76rem;color:var(--muted);margin-bottom:8px}.kpi .value{font:700 1.55rem 'JetBrains Mono',monospace;color:var(--ink)}.kpi .hint{font-size:.72rem;color:#939bae;margin-top:7px}
-.stepper{position:relative;background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px 16px 13px}.stepper-track{position:absolute;top:36px;left:8%;right:8%;height:2px;background:#e7ebf3}.stepper-fill{height:100%;background:var(--blue)}.stepper-items{position:relative;z-index:2;display:flex;justify-content:space-between}.step-item{flex:1;text-align:center}.step-circle{width:31px;height:31px;border-radius:50%;display:grid;place-items:center;margin:0 auto 9px;font-size:.75rem;font-weight:700;background:#fff}.step-circle.done{background:var(--blue);border:2px solid var(--blue);color:#fff}.step-circle.current{border:3px solid var(--blue);color:var(--blue)}.step-circle.pending{border:2px solid #dce2ed;color:#8b95aa}.step-label{font-size:.78rem;font-weight:650}.step-value{font:600 .76rem 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}.step-date{font-size:.68rem;color:#9aa2b3}
-.activity-row{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line)}.activity-row:last-child{border-bottom:0}.activity-icon{width:29px;height:29px;border-radius:8px;background:#eef4ff;display:grid;place-items:center;flex:0 0 auto}.activity-title{font-size:.82rem;font-weight:650}.activity-detail,.activity-time{font-size:.72rem;color:var(--muted)}.activity-time{margin-left:auto;white-space:nowrap}
+.kpi .label{font-size:.88rem;color:var(--muted);margin-bottom:8px}.kpi .value{font:700 1.85rem 'JetBrains Mono',monospace;color:var(--ink)}.kpi .hint{font-size:.84rem;color:#939bae;margin-top:7px}
+.stepper{position:relative;background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px 16px 13px}.stepper-track{position:absolute;top:36px;left:8%;right:8%;height:2px;background:#e7ebf3}.stepper-fill{height:100%;background:var(--blue)}.stepper-items{position:relative;z-index:2;display:flex;justify-content:space-between}.step-item{flex:1;text-align:center}.step-circle{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;margin:0 auto 9px;font-size:.85rem;font-weight:700;background:#fff}.step-circle.done{background:var(--blue);border:2px solid var(--blue);color:#fff}.step-circle.current{border:3px solid var(--blue);color:var(--blue)}.step-circle.pending{border:2px solid #dce2ed;color:#8b95aa}.step-label{font-size:.92rem;font-weight:650}.step-value{font:600 .88rem 'JetBrains Mono',monospace;color:var(--muted);margin-top:3px}.step-date{font-size:.8rem;color:#9aa2b3}
+.activity-row{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line)}.activity-row:last-child{border-bottom:0}.activity-icon{width:29px;height:29px;border-radius:8px;background:#eef4ff;display:grid;place-items:center;flex:0 0 auto}.activity-title{font-size:.95rem;font-weight:650}.activity-detail,.activity-time{font-size:.84rem;color:var(--muted)}.activity-time{margin-left:auto;white-space:nowrap}
 .empty-state{background:#fff;border:1.5px dashed #d7deea;border-radius:14px;padding:38px 25px;text-align:center;color:var(--muted)}.empty-state .big{font-size:1.4rem}.empty-state .title{font-weight:700;color:var(--ink);margin:6px 0}
 
 /* Legacy funnel components */
