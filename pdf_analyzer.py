@@ -405,8 +405,9 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
         sex = sex.title()
 
     age, age_ev = _match(flat, [
-        r"\b((?:\d+(?:\.\d+)?|six|seven|eight|nine|ten|twelve)[- ](?:week|weeks|month|months|day|days)[- ]old)\b",
+        r"\b((?:\d+(?:\.\d+)?|six|seven|eight|nine|ten|twelve)[- ](?:week|weeks|wk|month|months|day|days)[- ]old)\b",
         r"\b(aged\s+\d+(?:\s*[–-]\s*\d+)?\s+(?:weeks?|months?|days?))\b",
+        r"\b(\d+(?:\.\d+)?\s*(?:wk|weeks?|months?|days?)\s+of\s+age)\b",
     ])
 
     model_candidates = [
@@ -485,16 +486,23 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
     group_ev = group_sentences[0][:700] if group_sentences else ""
 
     group_text = " ".join(group_sentences) if group_sentences else ""
+    _GROUP_BLACKLIST = {
+        "bnl", "nasa", "arc", "iacuc", "usa", "uk", "nih", "fda", "pbs", "rna", "dna",
+        "pcr", "anova", "sd", "sem", "nsrl", "jl", "iso", "ml", "mm", "kg", "mg",
+    }
     names = []
     for m in re.finditer(
         r"\(([A-Z][A-Za-z0-9]{0,10}(?:\s*[+\-]\s*[A-Za-z0-9.%]{1,10}){0,4})(?:\s*;\s*n\s*=\s*\d+)?\)",
         group_text,
     ):
+        preceding = group_text[max(0, m.start() - 30): m.start()]
+        if re.search(r"laborator|universit|institut|center|centre|hospital|college", preceding, re.I):
+            continue
         val = re.sub(r"\s+", "", m.group(1)).strip()
-        if 2 <= len(val) <= 20 and not val.isdigit():
+        if 2 <= len(val) <= 20 and not val.isdigit() and val.lower() not in _GROUP_BLACKLIST:
             names.append(val)
     names = list(dict.fromkeys(names))[:15]
-    controls = [n for n in names if re.search(r"^(con|ctrl|control|sham|vehicle|veh)\d*$", n, re.I)]
+    controls = [n for n in names if re.search(r"^(con|ctrl|cd|control|sham|vehicle|veh)\d*$", n, re.I)]
     treats = [n for n in names if n not in controls]
     control_groups = "; ".join(controls)
     treat_groups = "; ".join(treats)
