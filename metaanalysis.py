@@ -874,22 +874,77 @@ def leave_one_out(effect_df: pd.DataFrame, cluster_col: str = "study") -> pd.Dat
 
 def leave_one_out_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_col: str = "study",
                        title: str = "Leave-one-out sensitivity") -> "plt.Figure":
+    """forest_plot_from_R()과 같은 톤(하단 0/5/10 스타일 눈금 + 실선 축, 회색 배경 밴드)으로
+    맞춘 leave-one-out 민감도 플롯. 범례는 좌측 상단, 이질성/PI 노트는 우측 하단에 배치."""
     loo = leave_one_out(effect_df, cluster_col).iloc[::-1].reset_index(drop=True)
     k = len(loo)
     y = np.arange(k, 0, -1)
-    fig, ax = plt.subplots(figsize=(9.4, max(3.4, 0.36 * k + 1.5)), dpi=100)
+    fig, ax = plt.subplots(figsize=(9.6, max(4.3, 0.36 * k + 1.9)), dpi=100)
+
     xerr = np.vstack([loo["g"] - loo["ci_lo"], loo["ci_hi"] - loo["g"]])
+    xv = np.concatenate([loo["ci_lo"].to_numpy(), loo["ci_hi"].to_numpy(), np.array([0.0, pooled.beta])])
+    xv = xv[~np.isnan(xv)]
+    xspan = xv.max() - xv.min() if len(xv) else 2.0
+    pad = max(0.4, xspan * 0.1)
+    xmin, xmax = xv.min() - pad, xv.max() + pad
+    ax.set_xlim(xmin, xmax)
+
+    # 포레스트 플롯과 동일한 회색 배경 밴드 + 영(0) 기준 점선
+    ax.axvspan(xmin, xmax, color=C_BAND, zorder=0)
+    ax.axvline(0.0, color=C_ZERO, lw=1.0, ls="--", zorder=1)
     ax.errorbar(loo["g"], y, xerr=xerr, fmt="s", color=C_NORM, ecolor=C_NORM,
                elinewidth=1.2, capsize=3, markersize=6, zorder=3)
-    ax.axvline(pooled.beta, color=C_POOL, lw=1.4, ls="--", label=f"Overall model (g = {pooled.beta:.2f})", zorder=2)
+    ax.axvline(pooled.beta, color=C_POOL, lw=1.6, ls="--", zorder=2,
+              label=f"Overall model (g = {pooled.beta:.2f})")
+
     ax.set_yticks(y)
     ax.set_yticklabels(loo["study"])
-    ax.set_xlabel("Hedges' g (95% CI) with study omitted")
-    ax.set_title(title, fontsize=13, loc="left", fontweight="bold")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9, frameon=True)
+    ax.set_ylim(0.3, k + 0.7)
+
+    # x축 눈금: forest plot과 동일하게 "보기 좋은" 값(1/2/2.5/5의 배수)으로 고정
+    locator = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10])
+    ax.xaxis.set_major_locator(locator)
+    ax.set_xlabel("Hedges' g (95% CI) with study omitted", labelpad=10)
+    ax.set_title(title, fontsize=13.5, loc="left", fontweight="bold", pad=14)
+
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    fig.tight_layout(rect=[0.0, 0.0, 0.85, 1.0])
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_color(C_TEXT)
+    ax.spines["bottom"].set_linewidth(1.0)
+    ax.tick_params(axis="x", colors=C_TEXT)
+    ax.tick_params(axis="y", length=0)
+    ax.grid(False)
+
+    handles, labels = ax.get_legend_handles_labels()
+
+    note_bits = []
+    if pooled.i2 is not None and not pd.isna(pooled.i2):
+        note_bits.append(f"Heterogeneity: I² = {pooled.i2:.1f}%")
+    pi = pooled.prediction_interval
+    if pi is not None and not (pd.isna(pi[0]) or pd.isna(pi[1])):
+        note_bits.append(f"95% PI: [{pi[0]:.2f}, {pi[1]:.2f}]")
+
+    # 먼저 x축 라벨까지 반영한 기본 레이아웃을 잡은 뒤, 그 아래에 범례/노트를 위한
+    # 여백을 그림 "인치" 단위로 추가 확보한다 (그림 높이에 무관하게 항상 같은
+    # 절대 간격을 확보하기 위해 figure-fraction 좌표를 직접 계산해서 쓴다).
+    fig.tight_layout()
+    fig_h_in = fig.get_size_inches()[1]
+    extra_in = 0.62
+    fig.subplots_adjust(bottom=fig.subplotpars.bottom + extra_in / fig_h_in)
+
+    # 범례/노트는 axes가 아니라 figure 좌표에 고정 배치 — 아래로 새로 확보한
+    # 여백(그림 맨 아래에서 일정 인치만큼) 안에 좌(범례)/우(노트)로 나눠 넣는다.
+    row_y_in = 0.30  # 그림 하단에서부터의 절대 거리(인치)
+    row_y = row_y_in / fig_h_in
+    if handles:
+        fig.legend(handles, labels, loc="center left", bbox_to_anchor=(0.09, row_y),
+                  bbox_transform=fig.transFigure, fontsize=9, frameon=True,
+                  framealpha=0.92, edgecolor=C_LINE, borderaxespad=0.6)
+    if note_bits:
+        fig.text(0.985, row_y, "  ".join(note_bits), transform=fig.transFigure,
+                 ha="right", va="center", fontsize=9, color="#444444", zorder=6,
+                 bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=C_LINE, lw=0.8))
     return fig
 
 

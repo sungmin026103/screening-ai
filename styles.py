@@ -15,9 +15,14 @@ CSS = r"""
 }
 *{box-sizing:border-box}
 html,body,[class*="css"]{font-family:'PretendardVariable','Pretendard',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
-/* 대시보드/메뉴 전반의 글씨를 살짝 키움 (요청: 피규어 제외, UI 텍스트만).
+/* 대시보드/메뉴 전반의 글씨를 키움 (요청: 피규어 제외, UI 텍스트만).
    대부분의 자체 CSS가 rem 단위라 이 한 줄로 비례해서 함께 커진다. */
-html{font-size:19px}
+html{font-size:21px}
+/* 글씨가 커지며 줄바꿈이 잦아지는데, 한글은 기본적으로 글자 단위(음절 단위)로
+   잘려 줄바꿈되어 보기 안 좋다. word-break:keep-all로 어절(단어) 단위에서만
+   줄바꿈되게 하고, overflow-wrap으로 너무 긴 단일 토큰(URL 등)만 예외적으로
+   줄바꿈을 허용한다. */
+body,p,span,div,label,h1,h2,h3,h4,h5,h6,button,li,td,th{word-break:keep-all;overflow-wrap:break-word}
 .stApp{background:var(--paper);color:var(--ink)}
 .block-container{max-width:1240px;padding-top:5.25rem;padding-bottom:3.5rem}
 header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);backdrop-filter:blur(12px);border-bottom:1px solid rgba(230,234,242,.9);z-index:999}
@@ -103,9 +108,9 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 .recent-head{display:flex;justify-content:space-between;align-items:end;margin:8px 0 12px}
 .recent-head h2{font-size:1.28rem;margin:0}.recent-head span{font-size:.92rem;color:var(--muted)}
 .project-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:12px}
-.project-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 17px;min-height:132px;box-shadow:0 5px 18px rgba(16,26,53,.035);transition:.18s ease}
+.project-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 17px;min-height:148px;box-shadow:0 5px 18px rgba(16,26,53,.035);transition:.18s ease}
 .project-card:hover{transform:translateY(-2px);box-shadow:0 11px 28px rgba(16,26,53,.08);border-color:#d5dceb}
-.project-card .name{font-weight:720;font-size:.92rem;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.project-card .name{font-weight:720;font-size:.92rem;color:var(--ink);word-break:keep-all;overflow-wrap:break-word;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35}
 .project-card .meta{font-size:.72rem;color:var(--muted);margin:5px 0 18px}.project-card .stats{display:flex;justify-content:space-between;font-size:.75rem;color:#4e5b74}.project-card .pct{font-family:'JetBrains Mono',monospace;font-weight:700}
 .progress-shell{height:5px;border-radius:999px;background:#edf0f6;overflow:hidden;margin-top:11px}.progress-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#2b66ec,#7359ed)}
 .hub-note{text-align:center;color:#9aa2b3;font-size:.73rem;margin-top:23px}
