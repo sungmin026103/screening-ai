@@ -767,14 +767,20 @@ def forest_plot_from_R(
     # 경우도 있지만, 범위에 따라 -5/-3/-1/1/3처럼 어색하거나 중복되는 눈금이
     # 나올 수 있다. MaxNLocator로 "보기 좋은" 값(1/2/2.5/5의 배수)을 고르고,
     # 그 간격(step) 크기에 맞춰 소수점 자릿수를 적응적으로 정한다.
-    locator = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10])
+    # nbins을 5→8로 늘려 0/5/10처럼 성긴 눈금 대신 0/2/4/6/8/10처럼 촘촘한
+    # 눈금이 자동으로 나오게 한다 (데이터 범위에 따라 적응적으로 세분화됨).
+    locator = MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10])
     ticks_data = np.array([t for t in locator.tick_values(xmin, xmax) if xmin <= t <= xmax])
     if len(ticks_data) < 2:
         ticks_data = np.linspace(xmin, xmax, 5)
     step = float(ticks_data[1] - ticks_data[0]) if len(ticks_data) > 1 else 1.0
     decimals = 0 if step >= 1 else (1 if step >= 0.1 else 2)
+    # 참고 이미지처럼 눈금 아래에 실선 축이 이어지도록 가로선을 먼저 그리고,
+    # 그 위에 각 눈금마다 세로 눈금선을 덧붙인다 (기존에는 세로 눈금선만 있고
+    # 축 자체를 잇는 선이 없어서 눈금이 거의 안 보이는 것처럼 보였다).
+    ax.plot([F_START, F_END], [Y_AXIS_BASE, Y_AXIS_BASE], color=C_TEXT, lw=1.1, zorder=4, clip_on=False)
     for tv in ticks_data:
-        ax.plot([xf(tv), xf(tv)], [Y_AXIS_BASE, Y_AXIS_BASE + 0.06], color=C_TEXT, lw=0.7, zorder=4, clip_on=False)
+        ax.plot([xf(tv), xf(tv)], [Y_AXIS_BASE - 0.09, Y_AXIS_BASE], color=C_TEXT, lw=1.1, zorder=4, clip_on=False)
         T(xf(tv), Y_TICKNUM, f"{tv:.{decimals}f}", ha="center", fs=fs_data - 0.3)
     ax.text((F_START + F_END) / 2, Y_SUBTITLE, subtitle, ha="center", va="center", fontsize=fs_data + 0.6, clip_on=False)
 
@@ -901,8 +907,9 @@ def leave_one_out_plot(effect_df: pd.DataFrame, pooled: "PooledResult", cluster_
     ax.set_yticklabels(loo["study"])
     ax.set_ylim(0.3, k + 0.7)
 
-    # x축 눈금: forest plot과 동일하게 "보기 좋은" 값(1/2/2.5/5의 배수)으로 고정
-    locator = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10])
+    # x축 눈금: forest plot과 동일하게 "보기 좋은" 값(1/2/2.5/5의 배수)으로,
+    # 촘촘하게(nbins=8) 고정
+    locator = MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10])
     ax.xaxis.set_major_locator(locator)
     ax.set_xlabel("Hedges' g (95% CI) with study omitted", labelpad=10)
     ax.set_title(title, fontsize=13.5, loc="left", fontweight="bold", pad=14)
