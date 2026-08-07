@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
@@ -29,8 +30,10 @@ from screening import (
     RECALL_TARGET_PRESETS,
     DEFAULT_RECALL_TARGET,
     zero_shot_screen,
+    llm_zero_label_screen,
     detect_label_count,
     MIN_LABELS_FOR_SUPERVISED,
+    DEFAULT_GEMINI_MODEL, DEFAULT_GROQ_MODEL, DEFAULT_NVIDIA_MODEL,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -492,27 +495,36 @@ elif nav == "pico":
 # 4. AI 스크리닝
 # ===========================================================================
 elif nav == "screen":
-    hero("AI 스크리닝", "사람의 판정을 학습해 확실한 배제 후보를 뒤로 보내고, 검토가 필요한 문헌을 우선 확인하도록 순위를 매깁니다. 라벨이 아직 없다면 PICO/배제기준만으로 자동으로 Zero-shot 모드가 실행됩니다.", eyebrow="AI 스크리닝")
+    hero(
+        "AI 스크리닝",
+        "라벨 없이 PICO와 배제기준으로 바로 선별하거나, 사용자의 O/X 라벨을 학습해 현재 리뷰에 맞춘 Adaptive Screening을 실행합니다.",
+        eyebrow="AI 스크리닝",
+    )
     criteria_text = " ".join(v for v in [pico.get("population", ""), pico.get("intervention", ""),
                                           pico.get("comparator", ""), pico.get("outcome", ""),
                                           pico.get("exclusion_criteria", "")] if v).strip()
-    # zero-shot 모드는 P:/I:/C:/O: 접두어로 항목을 구분해야 항목별 유사도를 계산할 수 있다.
     pico_sectioned_text = "\n".join(
         f"{prefix} {pico.get(key, '')}" for prefix, key in
         [("P:", "population"), ("I:", "intervention"), ("C:", "comparator"), ("O:", "outcome")]
         if pico.get(key, "").strip()
     )
-    if criteria_text:
-        st.markdown('<div class="small-note">「🧬 PICO 설정」 탭에 저장된 기준이 유사도 피처로 자동 반영됩니다.</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="small-note">PICO가 비어 있어 텍스트 분류기만으로 학습합니다. 「🧬 PICO 설정」 탭에서 입력하면 정확도에 도움이 됩니다.</div>', unsafe_allow_html=True)
 
-    st.info(
-        "「📥 가져오기 · 중복 제거」 탭에서 받은 ③ AI 스크리닝용 파일을 업로드하세요. Human_Label에는 1/0 또는 O/X를 사용할 수 있고, "
-        f"검토자별 열이 2개 이상이면 동일 판정 행을 자동 합의 라벨로 사용합니다. 유효 라벨이 {MIN_LABELS_FOR_SUPERVISED}개 이상이면 "
-        "지도학습 모드(재현율 통계적 보장)로, 그 미만이면 Zero-shot 모드(PICO/배제기준 유사도만 사용, 통계적 보장 없음)로 자동 실행됩니다."
+    mode = st.radio(
+        "Screening 방식",
+        ["AI Screening (라벨 없이)", "Adaptive Screening (라벨 사용)"],
+        horizontal=True,
+        help=(
+            "AI Screening은 PICO/배제기준을 LLM이 직접 해석합니다. Adaptive Screening은 Human_Label(O/X 또는 1/0)을 학습해 "
+            "현재 리뷰에 특화된 모델을 만듭니다."
+        ),
     )
-    file = st.file_uploader("스크리닝 파일 업로드 (라벨 있어도, 없어도 됩니다)", type=["xlsx", "xls", "csv"])
+
+    if criteria_text:
+        st.markdown('<div class="small-note">「PICO 설정」에 저장된 기준이 현재 Screening에 사용됩니다.</div>', unsafe_allow_html=True)
+    else:
+        st.warning("PICO가 비어 있습니다. 라벨 없는 AI Screening을 사용하려면 먼저 P/I/C/O를 입력해 주세요.")
+
+    file = st.file_uploader("스크리닝 파일 업로드", type=["xlsx", "xls", "csv"], key="screen_upload_v11")
     recall_pct_options = [int(r * 100) for r in RECALL_TARGET_PRESETS]
 
     if file:
@@ -520,47 +532,184 @@ elif nav == "screen":
         st.dataframe(df.head(20), use_container_width=True)
         labeled_n = detect_label_count(df)
 
-        if labeled_n >= MIN_LABELS_FOR_SUPERVISED:
-            st.success(f"✅ 유효 라벨 {labeled_n:,}개 감지 — 지도학습 모드로 실행됩니다 (재현율을 통계적으로 보장).")
-            recall_pct_initial = st.selectbox(
-                "목표 재현율 (허용 FN은 이 값에서 자동 계산됩니다)",
-                options=recall_pct_options,
-                index=recall_pct_options.index(int(DEFAULT_RECALL_TARGET * 100)),
-                format_func=lambda v: f"{v}%",
-                help=(
-                    "라벨 Include 문헌 중 최소 이 비율 이상은 반드시 '우선 검토' 또는 '경계 문헌'에 남도록 "
-                    "임계값을 정합니다. '허용 FN 개수'를 직접 입력하지 않고, 고정된 재현율 목표에서 라벨 수에 맞춰 "
-                    "자동으로 계산하므로 매번 기준이 흔들리지 않습니다. AI 결과만으로 문헌을 자동 영구 배제하지 마세요."
-                ),
+        if mode == "AI Screening (라벨 없이)":
+            st.info(
+                "기본 설정은 Gemini가 전체 문헌을 1차 판정하고, 고확신 Exclude 후보만 Groq가 독립 재검증합니다. "
+                "두 모델이 모두 고확신 Exclude인 경우에만 회색 Safe Exclude로 최하단에 보냅니다."
             )
-            if st.button("모델 학습 및 순위 매기기", type="primary", use_container_width=True):
+
+            def _secret_or_env(name: str) -> str:
+                value = os.getenv(name, "")
                 try:
-                    with st.spinner("교차검증으로 모델을 학습하는 중입니다..."):
-                        result = train_and_predict(df, recall_target=recall_pct_initial / 100, criteria_text=criteria_text)
-                    st.session_state["screening_result"] = result
-                    st.session_state.pop("zero_shot_result", None)
-                    save_project_state(active, "screening_result", result)
-                    safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-                    log_activity("🤖", "AI 스크리닝 완료", f"검토량 절감 {safe_n0:,}건, 목표 재현율 {recall_pct_initial}% (허용 FN {result.metrics.get('allowed_fn', 0)}) / 실측 FN {result.metrics.get('measured_fn', 0)}")
-                except Exception as exc:
-                    st.error(str(exc))
-        else:
-            st.warning(
-                f"⚠️ 유효 라벨이 {labeled_n:,}개뿐입니다 (지도학습에는 최소 {MIN_LABELS_FOR_SUPERVISED}개 필요) — "
-                "Zero-shot 모드로 실행됩니다. PICO/배제기준 유사도만으로 순위를 매기며, 재현율을 통계적으로 보장하지 않습니다."
+                    if not value and name in st.secrets:
+                        value = st.secrets[name]
+                except Exception:
+                    pass
+                return str(value or "")
+
+            provider_labels = {
+                "Gemini": "gemini",
+                "Groq GPT-OSS": "groq",
+                "NVIDIA NIM": "nvidia",
+            }
+            provider_defaults = {
+                "gemini": DEFAULT_GEMINI_MODEL,
+                "groq": DEFAULT_GROQ_MODEL,
+                "nvidia": DEFAULT_NVIDIA_MODEL,
+            }
+            provider_key_names = {
+                "gemini": "GEMINI_API_KEY",
+                "groq": "GROQ_API_KEY",
+                "nvidia": "NVIDIA_API_KEY",
+            }
+
+            st.markdown("#### 1차 Screening")
+            p1, p2 = st.columns([1.3, 2.2])
+            with p1:
+                primary_label = st.selectbox(
+                    "1차 AI provider", list(provider_labels.keys()), index=0, key="primary_llm_provider"
+                )
+                primary_provider = provider_labels[primary_label]
+            with p2:
+                primary_model = st.text_input(
+                    "1차 모델", value=provider_defaults[primary_provider], key=f"primary_model_{primary_provider}"
+                )
+            primary_key_name = provider_key_names[primary_provider]
+            primary_api_key = st.text_input(
+                f"{primary_label} API Key",
+                value=_secret_or_env(primary_key_name),
+                type="password",
+                key=f"primary_key_{primary_provider}",
+                help=f"현재 실행에만 사용합니다. Streamlit Secrets에 {primary_key_name}로 저장할 수도 있습니다.",
             )
+
+            verify_excludes = st.checkbox(
+                "서로 다른 모델로 Exclude 후보 2차 독립 검증", value=True, key="cross_model_verify"
+            )
+            secondary_provider = "groq"
+            secondary_model = DEFAULT_GROQ_MODEL
+            secondary_api_key = ""
+            secondary_label = "Groq GPT-OSS"
+
+            if verify_excludes:
+                st.markdown("#### 2차 독립 검증")
+                verifier_options = [x for x in provider_labels.keys() if provider_labels[x] != primary_provider]
+                default_idx = verifier_options.index("Groq GPT-OSS") if "Groq GPT-OSS" in verifier_options else 0
+                q1, q2 = st.columns([1.3, 2.2])
+                with q1:
+                    secondary_label = st.selectbox(
+                        "2차 AI provider", verifier_options, index=default_idx, key="secondary_llm_provider"
+                    )
+                    secondary_provider = provider_labels[secondary_label]
+                with q2:
+                    secondary_model = st.text_input(
+                        "2차 모델", value=provider_defaults[secondary_provider], key=f"secondary_model_{secondary_provider}"
+                    )
+                secondary_key_name = provider_key_names[secondary_provider]
+                secondary_api_key = st.text_input(
+                    f"{secondary_label} API Key",
+                    value=_secret_or_env(secondary_key_name),
+                    type="password",
+                    key=f"secondary_key_{secondary_provider}",
+                    help=f"Safe Exclude 후보의 독립 검증에만 사용합니다. Streamlit Secrets: {secondary_key_name}",
+                )
+
+            m1, m2 = st.columns(2)
+            with m1:
+                safe_conf_pct = st.selectbox("Safe Exclude 최소 확신도", [99, 97, 95, 90], index=2)
+            with m2:
+                batch_size = st.selectbox("API batch", [4, 6, 8, 10], index=2)
+
+            with st.expander("고급 설정"):
+                nvidia_endpoint = st.text_input(
+                    "NVIDIA NIM endpoint (NVIDIA 선택 시만 사용)",
+                    value="https://integrate.api.nvidia.com/v1/chat/completions",
+                )
+                st.caption(
+                    "기본 권장 조합: Gemini 3.6 Flash → Groq GPT-OSS 120B. "
+                    "무료 API의 한도·정책은 provider에 따라 변경될 수 있습니다."
+                )
+
             if not pico_sectioned_text.strip():
-                st.error("PICO 기준이 비어 있습니다. 「🧬 PICO 설정」 탭에서 P/I/C/O를 먼저 입력해 주세요.")
-            elif st.button("Zero-shot 순위 매기기", type="primary", use_container_width=True):
-                try:
-                    with st.spinner("PICO/배제기준 유사도를 계산하는 중입니다..."):
-                        zs_result = zero_shot_screen(df, pico_sectioned_text, pico.get("exclusion_criteria", ""))
-                    st.session_state["zero_shot_result"] = zs_result
-                    st.session_state.pop("screening_result", None)
-                    save_project_state(active, "zero_shot_result", zs_result)
-                    log_activity("🧭", "Zero-shot 스크리닝 완료", f"안전 제외 후보 {zs_result.metrics['safe_exclude_n']:,}건 / 전체 {zs_result.metrics['n_total']:,}건 (라벨 없음)")
-                except Exception as exc:
-                    st.error(str(exc))
+                st.error("PICO 기준이 비어 있습니다. 「PICO 설정」 탭에서 P/I/C/O를 먼저 입력해 주세요.")
+            elif st.button("라벨 없이 AI Screening 실행", type="primary", use_container_width=True):
+                missing = []
+                if not primary_api_key.strip():
+                    missing.append(f"{primary_label} API Key")
+                if verify_excludes and not secondary_api_key.strip():
+                    missing.append(f"{secondary_label} API Key")
+                if missing:
+                    st.error("다음 항목을 입력해 주세요: " + ", ".join(missing))
+                else:
+                    try:
+                        progress = st.progress(0, text="AI screening 준비 중...")
+
+                        def _llm_progress(done, total, phase):
+                            frac = int(min(100, round(done / max(total, 1) * 100)))
+                            progress.progress(frac, text=f"{phase}: {done:,}/{total:,}")
+
+                        with st.spinner("PICO와 배제기준을 바탕으로 문헌을 선별하는 중입니다..."):
+                            zs_result = llm_zero_label_screen(
+                                df,
+                                pico_sectioned_text,
+                                pico.get("exclusion_criteria", ""),
+                                primary_api_key=primary_api_key,
+                                secondary_api_key=secondary_api_key,
+                                primary_provider=primary_provider,
+                                primary_model=primary_model,
+                                secondary_provider=secondary_provider,
+                                secondary_model=secondary_model,
+                                safe_exclude_confidence=safe_conf_pct / 100,
+                                batch_size=batch_size,
+                                verify_excludes=verify_excludes,
+                                nvidia_endpoint=nvidia_endpoint,
+                                progress_callback=_llm_progress,
+                            )
+                        progress.empty()
+                        st.session_state["zero_shot_result"] = zs_result
+                        st.session_state.pop("screening_result", None)
+                        save_project_state(active, "zero_shot_result", zs_result)
+                        safe_n0 = int(zs_result.metrics.get("safe_exclude_n", 0))
+                        pair = f"{primary_model} → {secondary_model}" if verify_excludes else primary_model
+                        log_activity(
+                            "🤖", "No-label AI Screening 완료",
+                            f"안전 제외 후보 {safe_n0:,}건 / 전체 {zs_result.metrics.get('n_total', 0):,}건 · {pair}"
+                        )
+                    except Exception as exc:
+                        st.error(str(exc))
+        else:
+            st.info(
+                f"Human_Label에 O/X 또는 1/0을 입력한 문헌을 학습합니다. Include와 Exclude가 모두 포함된 최소 "
+                f"{MIN_LABELS_FOR_SUPERVISED}개 라벨이 필요합니다. 현재 감지된 유효 라벨: {labeled_n:,}개"
+            )
+            if labeled_n < MIN_LABELS_FOR_SUPERVISED:
+                st.warning(f"Adaptive Screening을 실행하려면 최소 {MIN_LABELS_FOR_SUPERVISED}개의 유효 라벨이 필요합니다.")
+            else:
+                recall_pct_initial = st.selectbox(
+                    "목표 재현율",
+                    options=recall_pct_options,
+                    index=recall_pct_options.index(int(DEFAULT_RECALL_TARGET * 100)),
+                    format_func=lambda v: f"{v}%",
+                    help="라벨 Include 문헌을 최대한 보존하도록 임계값을 정합니다.",
+                )
+                if st.button("Adaptive 모델 학습 및 순위 매기기", type="primary", use_container_width=True):
+                    try:
+                        with st.spinner("교차검증으로 Adaptive 모델을 학습하는 중입니다..."):
+                            result = train_and_predict(
+                                df,
+                                recall_target=recall_pct_initial / 100,
+                                criteria_text=criteria_text,
+                            )
+                        st.session_state["screening_result"] = result
+                        st.session_state.pop("zero_shot_result", None)
+                        save_project_state(active, "screening_result", result)
+                        safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                        log_activity(
+                            "🧠", "Adaptive Screening 완료",
+                            f"안전 제외 후보 {safe_n0:,}건 · 목표 재현율 {recall_pct_initial}% · 라벨 {labeled_n:,}건"
+                        )
+                    except Exception as exc:
+                        st.error(str(exc))
 
     result = st.session_state.get("screening_result")
     if result:
@@ -734,31 +883,37 @@ elif nav == "screen":
     zs_result = st.session_state.get("zero_shot_result")
     if zs_result:
         m = zs_result.metrics
-        st.markdown('<div class="section-title" style="margin-top:18px;">Zero-shot 결과 (라벨 없이 PICO·배제기준 유사도만 사용)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title" style="margin-top:18px;">AI Screening 결과 (라벨 없음)</div>', unsafe_allow_html=True)
         st.warning(m.get("disclaimer", ""))
 
-        total_zs = m.get("n_total", 0)
-        safe_zs = m.get("safe_exclude_n", 0)
+        total_zs = int(m.get("n_total", len(zs_result.predictions)))
+        safe_zs = int(m.get("safe_exclude_n", 0))
+        review_required = total_zs - safe_zs
         reduction_zs = (safe_zs / total_zs * 100) if total_zs else 0.0
-        headline_zs = f'''
+
+        headline_zs = f"""
         <div style="display:flex; gap:16px; margin-bottom:14px;">
           <div style="flex:1; padding:20px; border-radius:14px; background:linear-gradient(135deg,#4A4E69,#22223B); color:#fff;">
             <div style="font-size:.85rem; opacity:.85;">잠정 검토량 절감률</div>
             <div style="font-size:2.4rem; font-weight:800; line-height:1.2;">{reduction_zs:.1f}%</div>
-            <div style="font-size:.78rem; opacity:.8;">라벨 검증 전 잠정치입니다. 통계적으로 보장된 값이 아닙니다.</div>
+            <div style="font-size:.78rem; opacity:.8;">회색 Safe Exclude를 제외한 {review_required:,}편은 사람이 확인하도록 남겨둡니다.</div>
           </div>
         </div>
-        '''
+        """
         st.markdown(headline_zs, unsafe_allow_html=True)
 
-        e1, e2, e3 = st.columns(3)
+        e1, e2, e3, e4 = st.columns(4)
         e1.metric("우선 검토", f"{m.get('priority_n', 0):,}편")
         e2.metric("경계 문헌", f"{m.get('borderline_n', 0):,}편")
-        e3.metric("안전 제외 후보", f"{safe_zs:,}편")
+        e3.metric("Safe Exclude", f"{safe_zs:,}편")
+        e4.metric("API 오류 문헌", f"{m.get('api_error_records', 0):,}편", help="오류 문헌은 자동 배제하지 않고 Review 영역에 남깁니다.")
 
-        embedding_note_zs = "의미 임베딩(PubMedBERT) 사용" if m.get("embedding_signal_used") else "TF-IDF로 대체 (이 환경에 sentence-transformers 없음)"
-        sections_note = f"PICO 섹션 인식됨: {', '.join(m['sections_detected'])}" if m.get("sections_detected") else "PICO 섹션이 인식되지 않아 통짜 유사도로 계산됨"
-        st.caption(f"{sections_note} · 배제기준 항목 {m.get('exclusion_items_n', 0)}개 · {embedding_note_zs}")
+        st.caption(
+            f"1차: {m.get('primary_provider', '—')} / {m.get('primary_model', '—')} · "
+            f"2차: {m.get('secondary_provider', '미사용')} / {m.get('secondary_model', '—')} · "
+            f"Safe Exclude 최소 확신도 {m.get('safe_exclude_confidence', 0)*100:.0f}% · "
+            f"1차 Exclude {m.get('first_pass_exclude_n', 0):,}편 · 검증 후보 {m.get('verification_candidate_n', 0):,}편"
+        )
 
         def _shade_priority_zs(row):
             status = row.get("AI_Recommendation", "")
@@ -768,21 +923,37 @@ elif nav == "screen":
                 return ["background-color: #EEF0F3; color: #111827"] * len(row)
             return ["background-color: #FFFFFF; color: #111827"] * len(row)
 
-        st.markdown('<div class="section-title">Zero-shot 순위 결과</div>', unsafe_allow_html=True)
+        hide_safe_zs = st.checkbox("Safe Exclude 숨기기", value=False, key="hide_safe_zs")
+        shown_zs = zs_result.predictions.copy()
+        if hide_safe_zs:
+            shown_zs = shown_zs[shown_zs["AI_Recommendation"] != "안전 제외 후보"]
+
+        preferred_cols = [
+            "AI_Recommendation", "Title", "Abstract",
+            "LLM_Decision", "LLM_Confidence_%", "LLM_Reason", "LLM_Evidence",
+            "LLM_Verification_Decision", "LLM_Verification_Confidence", "LLM_Verification_Reason",
+        ]
+        show_cols = [c for c in preferred_cols if c in shown_zs.columns]
+        extra_cols = [c for c in shown_zs.columns if c not in show_cols]
+        shown_zs = shown_zs[show_cols + extra_cols]
+
+        st.markdown('<div class="section-title">AI 순위 결과</div>', unsafe_allow_html=True)
         st.dataframe(
-            zs_result.predictions.head(1000).style.apply(_shade_priority_zs, axis=1),
-            use_container_width=True, height=520,
-        )
-        st.download_button(
-            "Zero-shot 결과 다운로드 (Zero_Shot_Screening.xlsx)",
-            dataframe_to_excel_bytes(zs_result.predictions),
-            "Zero_Shot_Screening.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            shown_zs.head(1000).style.apply(_shade_priority_zs, axis=1),
             use_container_width=True,
+            height=540,
         )
         st.info(
-            "안전 제외 후보 중 20~30편을 무작위로 뽑아 직접 확인한 뒤, 그 판정을 Human_Label 열로 입력한 파일을 "
-            f"다시 업로드하면(유효 라벨 {MIN_LABELS_FOR_SUPERVISED}개 이상) 지도학습 모드로 자동 전환되어 재현율을 통계적으로 보장받을 수 있습니다."
+            "회색 행은 최하단의 Safe Exclude 후보입니다. 기본 설정에서는 서로 다른 두 AI 모델이 모두 고확신 Exclude로 "
+            "동의한 경우에만 회색으로 내려갑니다. 모델 간 불일치, 저확신 또는 API 오류가 있으면 사람이 검토하도록 남깁니다."
+        )
+        st.download_button(
+            "AI Screening 결과 다운로드 (No_Label_AI_Screening.xlsx)",
+            build_grouped_excel_bytes(zs_result.predictions),
+            "No_Label_AI_Screening.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
         )
 
 # ===========================================================================

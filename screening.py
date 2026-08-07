@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import io
 import re
+import json
+import time
 from dataclasses import dataclass, field
 from copy import deepcopy
 
 import numpy as np
+import requests
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -401,6 +404,487 @@ class ZeroShotResult:
     predictions: pd.DataFrame
     metrics: dict = field(default_factory=dict)
 
+
+GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+NVIDIA_CHAT_COMPLETIONS_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+LLM_SAFE_EXCLUDE_CONFIDENCE = 0.95
+LLM_DEFAULT_BATCH_SIZE = 8
+
+_ALLOWED_LLM_DECISIONS = {"INCLUDE", "REVIEW", "EXCLUDE"}
+_ALLOWED_EXCLUSION_REASONS = {
+    "IN_VITRO", "EX_VIVO", "REVIEW_ARTICLE", "WRONG_POPULATION",
+    "WRONG_INTERVENTION", "WRONG_COMPARATOR", "WRONG_OUTCOME",
+    "WRONG_STUDY_DESIGN", "NON_ENGLISH", "DUPLICATE",
+    "OTHER_EXPLICIT_EXCLUSION", "NONE",
+}
+
+
+def _extract_json_payload(text: str):
+    """LLM 응답에서 JSON array/object를 최대한 보수적으로 추출한다."""
+    if not text:
+        raise ValueError("LLM 응답이 비어 있습니다.")
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\\s*", "", text, flags=re.I)
+        text = re.sub(r"\\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    starts = [i for i in [text.find("["), text.find("{")] if i >= 0]
+    if not starts:
+        raise ValueError("LLM 응답에서 JSON을 찾지 못했습니다.")
+    start = min(starts)
+    if text[start] == "[":
+        end = text.rfind("]")
+    else:
+        end = text.rfind("}")
+    if end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+    raise ValueError("LLM JSON 응답을 해석하지 못했습니다.")
+
+
+def _results_schema() -> dict:
+    """Gemini/Groq 모두에 사용할 screening 결과 JSON schema."""
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "decision": {"type": "string", "enum": ["INCLUDE", "REVIEW", "EXCLUDE"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reason": {
+                    "type": "string",
+                    "enum": sorted(_ALLOWED_EXCLUSION_REASONS),
+                },
+                "evidence": {"type": "string"},
+            },
+            "required": ["id", "decision", "confidence", "reason", "evidence"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _post_json(url: str, *, headers: dict, payload: dict, timeout: int = 120, max_retries: int = 3) -> dict:
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 429:
+                raise RuntimeError("API rate limit(429)에 도달했습니다.")
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"LLM API 호출 실패: {last_error}")
+
+
+def _call_gemini(api_key: str, model: str, system_prompt: str, user_prompt: str) -> str:
+    if not api_key.strip():
+        raise ValueError("Gemini API Key가 필요합니다.")
+    model = (model or DEFAULT_GEMINI_MODEL).strip()
+    url = GEMINI_GENERATE_URL.format(model=model)
+    payload = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": _results_schema(),
+            "maxOutputTokens": 8192,
+        },
+    }
+    body = _post_json(
+        url,
+        headers={"x-goog-api-key": api_key.strip(), "Content-Type": "application/json"},
+        payload=payload,
+    )
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini 응답에 candidates가 없습니다: {body}")
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    text = "".join(str(p.get("text", "")) for p in parts if isinstance(p, dict)).strip()
+    if not text:
+        raise RuntimeError("Gemini 응답 text가 비어 있습니다.")
+    return text
+
+
+def _call_openai_compatible_chat(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    endpoint: str,
+    strict_schema: bool = False,
+) -> str:
+    if not api_key.strip():
+        raise ValueError("API Key가 필요합니다.")
+    payload = {
+        "model": model.strip(),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 8192,
+        "stream": False,
+    }
+    # Groq GPT-OSS 계열은 strict JSON Schema를 지원한다. NVIDIA처럼 provider별
+    # 지원 범위가 다른 endpoint에는 JSON-only prompt + 보수적 parser를 사용한다.
+    if strict_schema:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "screening_results",
+                "strict": True,
+                "schema": _results_schema(),
+            },
+        }
+    body = _post_json(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        payload=payload,
+    )
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"LLM API 응답에 choices가 없습니다: {body}")
+    content = (choices[0].get("message") or {}).get("content")
+    if not content:
+        raise RuntimeError("LLM API 응답 content가 비어 있습니다.")
+    return str(content)
+
+
+def _call_provider(
+    provider: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    nvidia_endpoint: str = NVIDIA_CHAT_COMPLETIONS_URL,
+) -> str:
+    provider = (provider or "").strip().lower()
+    if provider == "gemini":
+        return _call_gemini(api_key, model, system_prompt, user_prompt)
+    if provider == "groq":
+        return _call_openai_compatible_chat(
+            api_key, model, system_prompt, user_prompt,
+            endpoint=GROQ_CHAT_COMPLETIONS_URL, strict_schema=True,
+        )
+    if provider == "nvidia":
+        return _call_openai_compatible_chat(
+            api_key, model, system_prompt, user_prompt,
+            endpoint=nvidia_endpoint, strict_schema=False,
+        )
+    raise ValueError(f"지원하지 않는 provider입니다: {provider}")
+
+
+def _screening_system_prompt(criteria_text: str, exclusion_text: str, verification: bool = False) -> str:
+    phase = "SECOND-PASS INDEPENDENT VERIFICATION" if verification else "FIRST-PASS SCREENING"
+    return f"""
+You are a conservative title/abstract screener for a systematic review.
+Your job is NOT to maximize exclusions. Your highest priority is to avoid false-negative exclusion of an eligible study.
+This is {phase}.
+
+ELIGIBILITY (PICO):
+{criteria_text.strip()}
+
+EXCLUSION CRITERIA:
+{(exclusion_text or 'No additional exclusion criteria provided.').strip()}
+
+Rules:
+1. Use only information explicitly present in the title/abstract. Do not infer missing facts.
+2. EXCLUDE only when the title/abstract clearly satisfies an explicit exclusion criterion or clearly violates eligibility.
+3. If eligibility cannot be determined, return REVIEW.
+4. If the study may satisfy eligibility, return INCLUDE.
+5. Missing outcome/comparator details alone should usually be REVIEW, not EXCLUDE, unless the criterion is clearly violated.
+6. Confidence is confidence that the decision is directly supported by title/abstract, from 0.00 to 1.00.
+7. For EXCLUDE, choose exactly one reason from the supplied reason enum.
+8. For INCLUDE or REVIEW, use reason NONE.
+9. evidence must be a short paraphrase of the title/abstract evidence. Do not quote long text.
+10. Return only the requested structured JSON result.
+""".strip()
+
+
+def _screen_batch_provider(
+    batch: list[dict],
+    criteria_text: str,
+    exclusion_text: str,
+    provider: str,
+    api_key: str,
+    model: str,
+    verification: bool = False,
+    nvidia_endpoint: str = NVIDIA_CHAT_COMPLETIONS_URL,
+) -> dict[int, dict]:
+    articles = [
+        {
+            "id": int(item["id"]),
+            "title": str(item.get("title", ""))[:1200],
+            "abstract": str(item.get("abstract", ""))[:7000],
+        }
+        for item in batch
+    ]
+    user_prompt = (
+        "Screen every article below. Return one result object per article with the same id. "
+        "Do not omit any article.\n\nARTICLES:\n" + json.dumps(articles, ensure_ascii=False)
+    )
+    content = _call_provider(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        system_prompt=_screening_system_prompt(criteria_text, exclusion_text, verification),
+        user_prompt=user_prompt,
+        nvidia_endpoint=nvidia_endpoint,
+    )
+    parsed = _extract_json_payload(content)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("results", parsed.get("articles", [parsed]))
+    if not isinstance(parsed, list):
+        raise ValueError("LLM 응답이 JSON 배열 형식이 아닙니다.")
+
+    out: dict[int, dict] = {}
+    valid_ids = {int(item["id"]) for item in batch}
+    for raw in parsed:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            idx = int(raw.get("id"))
+        except Exception:
+            continue
+        if idx not in valid_ids:
+            continue
+        decision = str(raw.get("decision", "REVIEW")).strip().upper()
+        if decision not in _ALLOWED_LLM_DECISIONS:
+            decision = "REVIEW"
+        try:
+            confidence = float(raw.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+        reason = str(raw.get("reason", "NONE")).strip().upper()
+        if reason not in _ALLOWED_EXCLUSION_REASONS:
+            reason = "OTHER_EXPLICIT_EXCLUSION" if decision == "EXCLUDE" else "NONE"
+        if decision != "EXCLUDE":
+            reason = "NONE"
+        evidence = str(raw.get("evidence", "")).strip()[:1000]
+        out[idx] = {
+            "decision": decision,
+            "confidence": confidence,
+            "reason": reason,
+            "evidence": evidence,
+        }
+
+    # 일부 article id가 응답에서 누락되면 안전을 위해 REVIEW로 강제한다.
+    for item in batch:
+        idx = int(item["id"])
+        out.setdefault(idx, {
+            "decision": "REVIEW", "confidence": 0.0, "reason": "NONE",
+            "evidence": "LLM 응답에서 해당 문헌 결과가 누락되어 자동 배제하지 않음",
+        })
+    return out
+
+
+def llm_zero_label_screen(
+    df: pd.DataFrame,
+    criteria_text: str,
+    exclusion_text: str,
+    primary_api_key: str,
+    secondary_api_key: str = "",
+    primary_provider: str = "gemini",
+    primary_model: str = DEFAULT_GEMINI_MODEL,
+    secondary_provider: str = "groq",
+    secondary_model: str = DEFAULT_GROQ_MODEL,
+    safe_exclude_confidence: float = LLM_SAFE_EXCLUDE_CONFIDENCE,
+    batch_size: int = LLM_DEFAULT_BATCH_SIZE,
+    verify_excludes: bool = True,
+    nvidia_endpoint: str = NVIDIA_CHAT_COMPLETIONS_URL,
+    progress_callback=None,
+) -> ZeroShotResult:
+    """라벨 없이 PICO/배제기준을 읽고, 서로 다른 LLM 합의로 Safe Exclude를 결정한다.
+
+    기본 정책:
+      1) Gemini 3.6 Flash가 전체 문헌을 1차 screening
+      2) 1차에서 고확신 EXCLUDE인 문헌만 Groq GPT-OSS 120B가 독립 재검증
+      3) 두 모델 모두 고확신 EXCLUDE인 문헌만 Safe Exclude
+    두 모델의 배제 사유가 달라도 둘 다 '명백한 배제'라고 판단했다면 Safe Exclude가
+    가능하지만, 어느 한쪽이라도 INCLUDE/REVIEW/저확신/API 오류이면 사람이 검토한다.
+    """
+    if not criteria_text or not criteria_text.strip():
+        raise ValueError("PICO 기준이 필요합니다.")
+    if not primary_api_key or not primary_api_key.strip():
+        raise ValueError("1차 모델 API Key가 필요합니다.")
+    if verify_excludes and (not secondary_api_key or not secondary_api_key.strip()):
+        raise ValueError("교차 모델 2차 검증을 사용하려면 2차 모델 API Key가 필요합니다.")
+    if not 0.5 <= float(safe_exclude_confidence) <= 1.0:
+        raise ValueError("Safe Exclude confidence는 0.5~1.0 사이여야 합니다.")
+    batch_size = max(1, min(int(batch_size), 20))
+
+    data = prepare_unlabeled_data(df)
+    n = len(data)
+    items = [
+        {"id": int(i), "title": data.loc[i, "Title"], "abstract": data.loc[i, "Abstract"]}
+        for i in range(n)
+    ]
+
+    first: dict[int, dict] = {}
+    api_errors = 0
+    for start in range(0, n, batch_size):
+        batch = items[start:start + batch_size]
+        try:
+            first.update(_screen_batch_provider(
+                batch, criteria_text, exclusion_text,
+                provider=primary_provider, api_key=primary_api_key, model=primary_model,
+                verification=False, nvidia_endpoint=nvidia_endpoint,
+            ))
+        except Exception:
+            api_errors += len(batch)
+            for item in batch:
+                first[item["id"]] = {
+                    "decision": "REVIEW", "confidence": 0.0, "reason": "NONE",
+                    "evidence": "1차 API/응답 오류로 자동 배제하지 않음",
+                }
+        if progress_callback:
+            progress_callback(min(start + len(batch), n), n, f"1차 {primary_provider} screening")
+
+    provisional = []
+    for item in items:
+        r = first.get(item["id"], {})
+        if (
+            r.get("decision") == "EXCLUDE"
+            and float(r.get("confidence", 0.0)) >= safe_exclude_confidence
+            and r.get("reason") not in {None, "", "NONE"}
+            and str(r.get("evidence", "")).strip()
+        ):
+            provisional.append(item)
+
+    second: dict[int, dict] = {}
+    if verify_excludes and provisional:
+        total_v = len(provisional)
+        for start in range(0, total_v, batch_size):
+            batch = provisional[start:start + batch_size]
+            try:
+                second.update(_screen_batch_provider(
+                    batch, criteria_text, exclusion_text,
+                    provider=secondary_provider, api_key=secondary_api_key, model=secondary_model,
+                    verification=True, nvidia_endpoint=nvidia_endpoint,
+                ))
+            except Exception:
+                api_errors += len(batch)
+                for item in batch:
+                    second[item["id"]] = {
+                        "decision": "REVIEW", "confidence": 0.0, "reason": "NONE",
+                        "evidence": "2차 독립 검증 오류로 Safe Exclude 승인하지 않음",
+                    }
+            if progress_callback:
+                progress_callback(min(start + len(batch), total_v), total_v, f"2차 {secondary_provider} 검증")
+
+    result_df = df.copy().reset_index(drop=True)
+    decisions, confidences, reasons, evidences = [], [], [], []
+    v_decisions, v_confidences, v_reasons, v_evidences = [], [], [], []
+    recommendations, safe_flags = [], []
+
+    for i in range(n):
+        r1 = first.get(i, {"decision": "REVIEW", "confidence": 0.0, "reason": "NONE", "evidence": ""})
+        r2 = second.get(i)
+        primary_safe = bool(
+            r1.get("decision") == "EXCLUDE"
+            and float(r1.get("confidence", 0.0)) >= safe_exclude_confidence
+            and r1.get("reason") not in {None, "", "NONE"}
+            and str(r1.get("evidence", "")).strip()
+        )
+        if verify_excludes:
+            safe = bool(
+                primary_safe and r2
+                and r2.get("decision") == "EXCLUDE"
+                and float(r2.get("confidence", 0.0)) >= safe_exclude_confidence
+                and r2.get("reason") not in {None, "", "NONE"}
+                and str(r2.get("evidence", "")).strip()
+            )
+        else:
+            safe = primary_safe
+
+        if safe:
+            rec = "안전 제외 후보"
+        elif r1.get("decision") == "INCLUDE" or (r2 and r2.get("decision") == "INCLUDE"):
+            rec = "우선 검토"
+        else:
+            rec = "경계 문헌"
+
+        decisions.append(r1.get("decision", "REVIEW"))
+        confidences.append(float(r1.get("confidence", 0.0)))
+        reasons.append(r1.get("reason", "NONE"))
+        evidences.append(r1.get("evidence", ""))
+        v_decisions.append(r2.get("decision") if r2 else "")
+        v_confidences.append(float(r2.get("confidence", 0.0)) if r2 else np.nan)
+        v_reasons.append(r2.get("reason") if r2 else "")
+        v_evidences.append(r2.get("evidence") if r2 else "")
+        recommendations.append(rec)
+        safe_flags.append(safe)
+
+    result_df["Primary_Provider"] = primary_provider
+    result_df["Primary_Model"] = primary_model
+    result_df["LLM_Decision"] = decisions
+    result_df["LLM_Confidence"] = confidences
+    result_df["LLM_Confidence_%"] = (np.asarray(confidences) * 100).round(1)
+    result_df["LLM_Reason"] = reasons
+    result_df["LLM_Evidence"] = evidences
+    result_df["Verifier_Provider"] = secondary_provider if verify_excludes else ""
+    result_df["Verifier_Model"] = secondary_model if verify_excludes else ""
+    result_df["LLM_Verification_Decision"] = v_decisions
+    result_df["LLM_Verification_Confidence"] = v_confidences
+    result_df["LLM_Verification_Reason"] = v_reasons
+    result_df["LLM_Verification_Evidence"] = v_evidences
+    result_df["Safe_Exclude_Verified"] = safe_flags
+    result_df["AI_Recommendation"] = pd.Categorical(recommendations, categories=PRIORITY_ORDER, ordered=True)
+
+    sort_score = np.where(
+        result_df["AI_Recommendation"].astype(str).eq("우선 검토"),
+        result_df["LLM_Confidence"],
+        np.where(result_df["AI_Recommendation"].astype(str).eq("경계 문헌"), 0.5, result_df["LLM_Confidence"]),
+    )
+    result_df["_sort_score"] = sort_score
+    result_df = result_df.sort_values(
+        ["AI_Recommendation", "_sort_score"], ascending=[True, False]
+    ).drop(columns="_sort_score").reset_index(drop=True)
+
+    safe_n = int((result_df["AI_Recommendation"] == "안전 제외 후보").sum())
+    priority_n = int((result_df["AI_Recommendation"] == "우선 검토").sum())
+    borderline_n = int((result_df["AI_Recommendation"] == "경계 문헌").sum())
+    metrics = {
+        "mode": "cross_model_zero_label",
+        "primary_provider": primary_provider,
+        "primary_model": primary_model,
+        "secondary_provider": secondary_provider if verify_excludes else "",
+        "secondary_model": secondary_model if verify_excludes else "",
+        "n_total": n,
+        "priority_n": priority_n,
+        "borderline_n": borderline_n,
+        "safe_exclude_n": safe_n,
+        "first_pass_exclude_n": int(sum(1 for r in first.values() if r.get("decision") == "EXCLUDE")),
+        "verification_candidate_n": int(len(provisional)),
+        "verification_enabled": bool(verify_excludes),
+        "cross_model_consensus": bool(verify_excludes and primary_provider.lower() != secondary_provider.lower()),
+        "safe_exclude_confidence": float(safe_exclude_confidence),
+        "api_error_records": int(api_errors),
+        "disclaimer": (
+            "라벨 없이 PICO/배제기준을 해석하는 보수적 AI screening입니다. 기본 설정에서는 서로 다른 두 모델이 "
+            "모두 고확신 EXCLUDE로 판단한 문헌만 Safe Exclude로 표시합니다. 이는 사람 판정을 완전히 대체하거나 "
+            "재현율 100%를 보장하지 않습니다. API 오류·판정 불일치·불확실 문헌은 자동 배제하지 않습니다."
+        ),
+    }
+    return ZeroShotResult(predictions=result_df, metrics=metrics)
 
 def zero_shot_screen(
     df: pd.DataFrame,
