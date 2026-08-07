@@ -53,7 +53,7 @@ PRIORITY_ORDER = ["우선 검토", "경계 문헌", "안전 제외 후보"]
 # 새 버전의 모델을 다시 검증하면 이 상수만 업데이트하면 된다.
 REFERENCE_BENCHMARK = {
     "name": "SpaceFood labeled benchmark",
-    "version_note": "Reference validation set; not current-project performance",
+    "version_note": "Legacy reference benchmark (pre-V16); V16 requires revalidation",
     "n": 2499,
     "recall": 0.9893,
     "precision": 0.1800,
@@ -172,6 +172,7 @@ def prepare_screening_data(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 
     out["Human_Label"] = pd.to_numeric(out["Human_Label"], errors="coerce")
     out["Text"] = (out["Title"] + " " + out["Abstract"]).str.strip()
+    out["StructuredText"] = [_serialize_structured(t, a) for t, a in zip(out["Title"], out["Abstract"])]
     return out, label_source
 
 
@@ -242,6 +243,96 @@ class EmbeddingLookup(BaseEstimator, TransformerMixin):
         dim = any_vec.shape[0]
         return np.vstack([self.lookup.get(t, np.zeros(dim)) for t in X])
 
+
+
+STRUCTURED_SEP = "\n<ABSTRACT>\n"
+
+
+def _serialize_structured(title: str, abstract: str) -> str:
+    return f"{str(title).strip()}{STRUCTURED_SEP}{str(abstract).strip()}"
+
+
+class TextPartExtractor(BaseEstimator, TransformerMixin):
+    """StructuredText에서 Title 또는 Abstract만 분리해 별도 TF-IDF가 학습되도록 한다."""
+    def __init__(self, part: str = "title"):
+        self.part = part
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        out = []
+        for x in X:
+            text = str(x)
+            if STRUCTURED_SEP in text:
+                title, abstract = text.split(STRUCTURED_SEP, 1)
+            else:
+                title, abstract = text, ""
+            out.append(title if self.part == "title" else abstract)
+        return np.asarray(out, dtype=object)
+
+
+class RuleSignalFeatures(BaseEstimator, TransformerMixin):
+    """초록에서 명백한 연구설계/비대상 신호를 숫자 feature로 변환한다.
+    단일 키워드만으로 자동 배제하지 않고 최종 분류기의 보조 feature로만 사용한다."""
+    PATTERNS = [
+        r"\bin\s*vitro\b|cell\s+culture|cultured\s+cells?|cell\s+line|c2c12|myoblast|osteoblast",
+        r"\breview\b|systematic\s+review|meta[- ]analysis|narrative\s+review",
+        r"protocol|study\s+protocol",
+        r"case\s+report|case\s+series",
+        r"plant\s+growth|seedling|arabidopsis|crop\s+plant",
+        r"no\s+(?:treatment|intervention)|observational\s+study|cross[- ]sectional",
+    ]
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        rows = []
+        for x in X:
+            t = str(x).lower()
+            vals = [1.0 if re.search(p, t, flags=re.I) else 0.0 for p in self.PATTERNS]
+            vals.append(float(sum(vals)))
+            rows.append(vals)
+        return np.asarray(rows, dtype=float)
+
+
+class PrototypeSimilarity(BaseEstimator, TransformerMixin):
+    """훈련 fold의 Include/Exclude 문헌 centroid와의 유사도를 계산한다.
+    fold 안에서만 prototype을 만들기 때문에 교차검증 누수가 없다."""
+    def __init__(self, max_features: int = 25000):
+        self.max_features = max_features
+
+    def fit(self, X, y=None):
+        self.vectorizer_ = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=self.max_features, sublinear_tf=True)
+        mat = self.vectorizer_.fit_transform(list(X))
+        y = np.asarray(y) if y is not None else np.zeros(mat.shape[0], dtype=int)
+        self.pos_ = np.asarray(mat[y == 1].mean(axis=0) if np.any(y == 1) else mat.mean(axis=0))
+        self.neg_ = np.asarray(mat[y == 0].mean(axis=0) if np.any(y == 0) else mat.mean(axis=0))
+        return self
+
+    def transform(self, X):
+        mat = self.vectorizer_.transform(list(X))
+        pos = cosine_similarity(mat, self.pos_).ravel()
+        neg = cosine_similarity(mat, self.neg_).ravel()
+        return np.column_stack([pos, neg, pos - neg])
+
+
+class NumericLookup(BaseEstimator, TransformerMixin):
+    """사전 계산된 고정 numeric features를 StructuredText key로 조회한다."""
+    def __init__(self, lookup=None, dim: int = 4):
+        self.lookup = lookup or {}
+        self.dim = dim
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if not self.lookup:
+            return np.zeros((len(X), self.dim), dtype=float)
+        any_vec = np.asarray(next(iter(self.lookup.values())), dtype=float)
+        dim = int(any_vec.size)
+        return np.vstack([np.asarray(self.lookup.get(str(x), np.zeros(dim)), dtype=float) for x in X])
 
 class CriteriaSimilarity(BaseEstimator, TransformerMixin):
     """코사인 유사도 기반 PICO/배제기준 근접도 피처.
@@ -352,6 +443,7 @@ def prepare_unlabeled_data(df: pd.DataFrame) -> pd.DataFrame:
     out["Title"] = df[title_col].fillna("").astype(str)
     out["Abstract"] = df[abstract_col].fillna("").astype(str) if abstract_col else ""
     out["Text"] = (out["Title"] + " " + out["Abstract"]).str.strip()
+    out["StructuredText"] = [_serialize_structured(t, a) for t, a in zip(out["Title"], out["Abstract"])]
     return out
 
 
@@ -416,6 +508,50 @@ def _otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
     return float(bin_centers[best_idx])
 
 
+
+def _split_sentences(text: str) -> list[str]:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
+    return [p.strip() for p in parts if len(p.strip()) >= 12] or [text]
+
+
+def build_sentence_pico_lookup(keys: np.ndarray, abstracts: np.ndarray, criteria_text: str) -> dict[str, np.ndarray] | None:
+    """각 Abstract 문장에서 P/I/C/O와 가장 유사한 문장을 찾아 4개 feature로 저장한다.
+    임베딩이 있으면 의미 유사도, 없으면 TF-IDF 유사도로 자동 폴백한다."""
+    sections = _parse_pico_sections(criteria_text)
+    pico_queries = [sections.get(k, "") for k in ["P", "I", "C", "O"]]
+    if not any(q.strip() for q in pico_queries):
+        return None
+    lookup = {}
+    for key, abstract in zip(keys, abstracts):
+        sents = _split_sentences(abstract)
+        if not sents:
+            lookup[str(key)] = np.zeros(4, dtype=float)
+            continue
+        vals = []
+        for q in pico_queries:
+            if not q.strip():
+                vals.append(0.0)
+            else:
+                sims = _cosine_sim_matrix(sents, [q])
+                vals.append(float(np.max(sims[:, 0])) if sims.size else 0.0)
+        lookup[str(key)] = np.asarray(vals, dtype=float)
+    return lookup
+
+
+def _obvious_exclusion_reason(title: str, abstract: str) -> str:
+    t = f"{title} {abstract}".lower()
+    checks = [
+        (r"\bin\s*vitro\b|cell\s+culture|cultured\s+cells?|cell\s+line|c2c12|myoblast|osteoblast", "In vitro / cell study signal"),
+        (r"systematic\s+review|meta[- ]analysis|narrative\s+review|\breview\b", "Review article signal"),
+        (r"study\s+protocol|\bprotocol\b", "Protocol signal"),
+        (r"case\s+report|case\s+series", "Case report/series signal"),
+    ]
+    reasons = [label for pattern, label in checks if re.search(pattern, t, flags=re.I)]
+    return "; ".join(reasons)
+
 @dataclass
 class ZeroShotResult:
     predictions: pd.DataFrame
@@ -447,7 +583,13 @@ def zero_shot_screen(
     sections = _parse_pico_sections(criteria_text)
     section_names = list(sections.keys())
     section_texts = [sections[k] if sections[k].strip() else " " for k in section_names]
-    pico_sims = _cosine_sim_matrix(doc_texts, section_texts)  # (n_docs, n_sections)
+    # Abstract가 있으면 문장 단위에서 각 PICO 항목과 가장 가까운 문장을 사용한다.
+    pico_sims = np.zeros((len(data), len(section_names)), dtype=float)
+    for r, abstract in enumerate(data["Abstract"].tolist()):
+        sents = _split_sentences(abstract) or [data.iloc[r]["Title"]]
+        for i, q in enumerate(section_texts):
+            sims = _cosine_sim_matrix(sents, [q])
+            pico_sims[r, i] = float(np.max(sims[:, 0])) if sims.size else 0.0
 
     for i, name in enumerate(section_names):
         data[f"Similarity_{name}"] = pico_sims[:, i]
@@ -483,6 +625,7 @@ def zero_shot_screen(
     borderline_mask = rest_mask & (combined_score < threshold_2)
     recommendation[borderline_mask] = "경계 문헌"
     data["AI_Recommendation"] = pd.Categorical(recommendation, categories=PRIORITY_ORDER, ordered=True)
+    data["AI_Exclusion_Signal"] = [_obvious_exclusion_reason(t, a) for t, a in zip(data["Title"], data["Abstract"])]
 
     data = data.sort_values(
         ["AI_Recommendation", "Combined_Score"], ascending=[True, False]
@@ -508,23 +651,51 @@ def zero_shot_screen(
 # 메인 랭킹 모델 (기존과 동일: Word+Char TF-IDF [+ PICO 유사도] -> Calibrated LinearSVC)
 # ---------------------------------------------------------------------------
 
-def _build_feature_union(criteria_text: str = "", embedding_lookup: dict | None = None) -> FeatureUnion:
-    word = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=50000, sublinear_tf=True)
-    char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_features=50000, sublinear_tf=True)
-    transformers = [("word", word), ("char", char)]
+def _build_feature_union(
+    criteria_text: str = "",
+    embedding_lookup: dict | None = None,
+    sentence_pico_lookup: dict | None = None,
+) -> FeatureUnion:
+    # Combined text
+    combined_word = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=45000, sublinear_tf=True)
+    combined_char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_features=40000, sublinear_tf=True)
+
+    # Title과 Abstract를 별도의 feature space로 학습한다.
+    title_pipe = Pipeline([
+        ("title", TextPartExtractor("title")),
+        ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=20000, sublinear_tf=True)),
+    ])
+    abstract_pipe = Pipeline([
+        ("abstract", TextPartExtractor("abstract")),
+        ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=35000, sublinear_tf=True)),
+    ])
+
+    transformers = [
+        ("combined_word", combined_word),
+        ("combined_char", combined_char),
+        ("title_word", title_pipe),
+        ("abstract_word", abstract_pipe),
+        ("rules", RuleSignalFeatures()),
+        ("prototype", PrototypeSimilarity()),
+    ]
     if criteria_text and criteria_text.strip():
         transformers.append(("criteria", CriteriaSimilarity(criteria_text=criteria_text)))
+    if sentence_pico_lookup:
+        transformers.append(("sentence_pico", NumericLookup(lookup=sentence_pico_lookup, dim=4)))
     if embedding_lookup:
         transformers.append(("embedding", EmbeddingLookup(lookup=embedding_lookup)))
     return FeatureUnion(transformers)
 
 
-def _build_pipeline(criteria_text: str = "", embedding_lookup: dict | None = None) -> Pipeline:
-    features = _build_feature_union(criteria_text, embedding_lookup)
+def _build_pipeline(
+    criteria_text: str = "",
+    embedding_lookup: dict | None = None,
+    sentence_pico_lookup: dict | None = None,
+) -> Pipeline:
+    features = _build_feature_union(criteria_text, embedding_lookup, sentence_pico_lookup)
     base = LinearSVC(class_weight="balanced")
     model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
     return Pipeline([("features", features), ("model", model)])
-
 
 # ---------------------------------------------------------------------------
 # 안전 제외 후보를 위한 보조 뷰 모델들.
@@ -560,14 +731,21 @@ def _build_embedding_only_pipeline(embedding_lookup: dict) -> Pipeline:
     ])
 
 
-def _build_logreg_full_pipeline(criteria_text: str = "", embedding_lookup: dict | None = None) -> Pipeline:
-    features = _build_feature_union(criteria_text, embedding_lookup)
+def _build_sentence_pico_only_pipeline(sentence_pico_lookup: dict) -> Pipeline:
+    return Pipeline([
+        ("sentence_pico", NumericLookup(lookup=sentence_pico_lookup, dim=4)),
+        ("model", LogisticRegression(max_iter=2000, class_weight="balanced")),
+    ])
+
+
+def _build_logreg_full_pipeline(criteria_text: str = "", embedding_lookup: dict | None = None, sentence_pico_lookup: dict | None = None) -> Pipeline:
+    features = _build_feature_union(criteria_text, embedding_lookup, sentence_pico_lookup)
     return Pipeline([("features", features), ("model", LogisticRegression(max_iter=2000, class_weight="balanced"))])
 
 
 def _compute_safety_signals(
     texts: np.ndarray, y: np.ndarray, cv: StratifiedKFold, all_texts: np.ndarray, criteria_text: str = "",
-    embedding_lookup: dict | None = None,
+    embedding_lookup: dict | None = None, sentence_pico_lookup: dict | None = None,
 ) -> dict:
     """Word TF-IDF, Character TF-IDF, 전체 피처 로지스틱 회귀, PICO 유사도, (가능하면)
     의미 임베딩 각각에 대해 (라벨 데이터의 교차검증 확률, 전체 데이터 확률)을 계산해 반환한다.
@@ -584,9 +762,11 @@ def _compute_safety_signals(
 
     _run("word_tfidf", _build_word_only_pipeline())
     _run("char_tfidf", _build_char_only_pipeline())
-    _run("logistic_regression", _build_logreg_full_pipeline(criteria_text, embedding_lookup))
+    _run("logistic_regression", _build_logreg_full_pipeline(criteria_text, embedding_lookup, sentence_pico_lookup))
     if criteria_text and criteria_text.strip():
         _run("pico_similarity", _build_pico_only_pipeline(criteria_text))
+    if sentence_pico_lookup:
+        _run("sentence_pico", _build_sentence_pico_only_pipeline(sentence_pico_lookup))
     if embedding_lookup:
         _run("semantic_embedding", _build_embedding_only_pipeline(embedding_lookup))
     return signals
@@ -627,7 +807,7 @@ DEFAULT_RECALL_TARGET = 0.95
 # 100%(만장일치)보다 완화됐지만 여전히 압도적 다수의 동의를 요구하므로 안전성은
 # 크게 훼손하지 않으면서, 안전 제외 후보 수(=검토 절감량)를 늘린다.
 # ---------------------------------------------------------------------------
-SAFETY_QUORUM_RATIO = 0.8
+SAFETY_QUORUM_RATIO = 2/3
 
 
 def allowed_fn_from_recall_target(n_include: int, recall_target: float) -> int:
@@ -677,6 +857,28 @@ def work_saved_over_sampling(tn: int, fn: int, tp: int, fp: int) -> float:
         return 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     return float((tn + fn) / n - (1.0 - recall))
+
+
+def _optimize_threshold_wss(cv_probs: np.ndarray, y: np.ndarray, recall_target: float = 0.95) -> tuple[float, dict]:
+    """교차검증 Recall 제약을 만족하는 threshold 중 WSS가 가장 높은 값을 자동 선택한다."""
+    probs = np.asarray(cv_probs, dtype=float)
+    y = np.asarray(y, dtype=int)
+    candidates = np.unique(np.r_[0.0, probs, 1.0])
+    best = None
+    for thr in candidates:
+        pred = (probs >= thr).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        if rec + 1e-12 < float(recall_target):
+            continue
+        wss = work_saved_over_sampling(tn, fn, tp, fp)
+        burden = (tp + fp) / len(y) if len(y) else 1.0
+        score = (wss, -burden, thr)
+        if best is None or score > best[0]:
+            best = (score, float(thr), {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp), "recall": float(rec), "wss": float(wss), "burden": float(burden)})
+    if best is None:
+        return 0.0, {"recall": 1.0, "wss": 0.0, "burden": 1.0}
+    return best[1], best[2]
 
 
 def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int) -> float:
@@ -797,6 +999,11 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
         "f1": float(2 * pre * rec / (pre + rec)) if pre + rec > 0 else 0.0,
         "measured_fn": int(fn),
         "wss": work_saved_over_sampling(tn, fn, tp, fp),
+        "threshold_strategy": "Recall-constrained WSS optimization",
+        "cv_screening_burden": float(threshold_info.get("burden", 1.0)),
+        "title_abstract_separate": True,
+        "sentence_pico_used": sentence_pico_lookup is not None,
+        "prototype_similarity_used": True,
     })
 
     updated.predictions = _sort_by_priority(pred_df)
@@ -832,8 +1039,9 @@ def train_and_predict(
         raise ValueError(f"학습을 위해 Include와 Exclude가 모두 포함된 최소 {MIN_LABELS_FOR_SUPERVISED}개 라벨이 필요합니다.")
 
     y = labeled["Human_Label"].astype(int).to_numpy()
-    texts = labeled["Text"].to_numpy()
-    all_texts = data["Text"].to_numpy()
+    texts = labeled["StructuredText"].to_numpy()
+    all_texts = data["StructuredText"].to_numpy()
+    all_plain_texts = data["Text"].to_numpy()
     n_include = int(y.sum())
 
     if allowed_fn is None:
@@ -847,12 +1055,18 @@ def train_and_predict(
     # fold별 재계산이 필요 없고, 데이터로 다시 학습되지 않으므로 fold 밖에서 계산해도
     # 검증 누수가 생기지 않는다). sentence-transformers가 없는 환경에서는 None이 되어
     # 자동으로 이 신호 없이 나머지 모델들로만 동작한다 (기능 저하 없이 안전하게 폴백).
-    embedding_lookup = build_embedding_lookup(all_texts)
+    # Embedding vector는 plain Title+Abstract에서 계산하되 StructuredText를 key로 사용한다.
+    embedding_lookup = None
+    if embeddings_available():
+        model = _get_embed_model()
+        vecs = model.encode(all_plain_texts.tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+        embedding_lookup = {str(k): v for k, v in zip(all_texts, vecs)}
+    sentence_pico_lookup = build_sentence_pico_lookup(all_texts, data["Abstract"].to_numpy(), criteria_text)
 
     # 메인 랭킹 모델(전체 파이프라인: TF-IDF + PICO 유사도 + [임베딩] + 선형 SVM)을 fold마다
     # 처음부터 다시 학습한다. train만으로 학습하기 때문에 검증 성능이 부풀려지지 않는다.
     probs = cross_val_predict(
-        _build_pipeline(criteria_text, embedding_lookup), texts, y, cv=cv, method="predict_proba"
+        _build_pipeline(criteria_text, embedding_lookup, sentence_pico_lookup), texts, y, cv=cv, method="predict_proba"
     )[:, 1]
 
     # Precision-Recall 곡선은 참고용 차트로만 계산해서 보여준다 (임계값 결정에는 쓰지 않음).
@@ -863,7 +1077,7 @@ def train_and_predict(
     # allowed_fn개까지만 임계값 아래로 떨어지도록 하는 가장 관대한(=검토량이 가장 적은)
     # 임계값을 선택한다. allowed_fn은 위에서 recall_target으로부터 자동 계산되었으므로,
     # "몇 편 놓쳐도 되는가"를 매번 감으로 정하는 게 아니라 고정된 재현율 정책에서 유도된다.
-    threshold = _fn_budget_cutoff(probs, y, allowed_fn)
+    threshold, threshold_info = _optimize_threshold_wss(probs, y, recall_target)
     pred = (probs >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
 
@@ -888,7 +1102,7 @@ def train_and_predict(
 
     # 메인 모델을 전체 라벨 데이터로 최종 학습해 전체 문헌(라벨 없는 것 포함)에
     # 대한 확률을 계산한다.
-    final_pipeline = _build_pipeline(criteria_text, embedding_lookup)
+    final_pipeline = _build_pipeline(criteria_text, embedding_lookup, sentence_pico_lookup)
     final_pipeline.fit(texts, y)
     all_probs = final_pipeline.predict_proba(all_texts)[:, 1]
 
@@ -896,7 +1110,7 @@ def train_and_predict(
     # 기준으로도 안전한" 컷오프 아래일 때만 인정한다. 최대한 많이 거르는 것이
     # 아니라, 거의 틀리지 않는 것만 거른다. (word/char TF-IDF, 로지스틱 회귀,
     # PICO 유사도, 의미 임베딩, 선형 SVM 최대 6개 신호)
-    aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text, embedding_lookup)
+    aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text, embedding_lookup, sentence_pico_lookup)
     aux_signals["linear_svm"] = {"cv": probs, "all": all_probs}  # 메인 모델도 하나의 투표로 포함
 
     result_df = df.copy().reset_index(drop=True)
@@ -928,6 +1142,7 @@ def train_and_predict(
     result_df["Safety_Score"] = safety_score_all
     result_df["Unanimous_Exclude"] = unanimous_exclude_all
     result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, unanimous_exclude_all)
+    result_df["AI_Exclusion_Signal"] = [_obvious_exclusion_reason(t, a) for t, a in zip(data["Title"], data["Abstract"])]
 
     result_df = _sort_by_priority(result_df)
 

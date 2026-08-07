@@ -168,7 +168,7 @@ def _render_reference_benchmark() -> None:
     d3.metric("검증 문헌", f"{int(b['n']):,}편")
     st.caption(
         f"기준 데이터: {b['name']}. 이 값은 현재 업로드한 프로젝트의 실시간 성능이 아니라 "
-        "사전에 라벨된 검증 데이터에서 얻은 참고 성능입니다. 현재 프로젝트의 성능은 사람 라벨이 쌓인 뒤 별도로 계산됩니다."
+        "이전 모델에서 사전에 라벨된 검증 데이터로 얻은 참고 성능입니다. V16 구조 변경 후에는 현재 프로젝트 교차검증 성능을 우선 해석하고, V16 독립 재검증 완료 후 기준 성능을 업데이트해야 합니다."
     )
 
 
@@ -325,6 +325,31 @@ topbar(active_meta["name"] if active_meta else active)
 # ===========================================================================
 # 1. 대시보드
 # ===========================================================================
+def _read_screening_upload(uploaded):
+    """초보자도 시트/열을 직접 맞출 필요 없이 Title+Abstract가 있는 시트를 자동 선택한다."""
+    suffix = Path(uploaded.name).suffix.lower()
+    if suffix not in {".xlsx", ".xls"}:
+        return pd.read_csv(uploaded), None
+    book = pd.ExcelFile(uploaded)
+    candidates = []
+    for sheet in book.sheet_names:
+        try:
+            tmp = pd.read_excel(book, sheet_name=sheet)
+        except Exception:
+            continue
+        cols = {str(c).strip().lower() for c in tmp.columns}
+        has_title = bool(cols & {"title", "제목"})
+        has_abs = bool(cols & {"abstract", "초록"})
+        if has_title:
+            candidates.append((1 if has_abs else 0, len(tmp), sheet, tmp))
+    if not candidates:
+        raise ValueError("Excel에서 Title/제목 열이 있는 시트를 찾지 못했습니다.")
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    _, _, sheet, frame = candidates[0]
+    return frame, sheet
+
+
+
 if nav == "dashboard":
     result = st.session_state.get("screening_result")
     stats = st.session_state.get("import_stats", {})
@@ -557,12 +582,14 @@ elif nav == "screen":
     file = st.file_uploader(
         "스크리닝 파일 업로드",
         type=["xlsx", "xls", "csv"],
-        help="Title과 Abstract 열이 있는 파일을 업로드하세요. Human_Label(O/X 또는 1/0)이 있으면 자동으로 반영됩니다.",
+        help="Title/제목 열을 자동으로 찾습니다. Abstract/초록이 있으면 문장 단위 PICO 분석까지 적용됩니다. Human_Label(O/X 또는 1/0)이 있으면 자동 반영됩니다.",
     )
 
     if file:
-        df = pd.read_excel(file) if Path(file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(file)
+        df, selected_sheet = _read_screening_upload(file)
         labeled_n = detect_label_count(df)
+        if selected_sheet:
+            st.caption(f"Excel 시트 자동 선택: {selected_sheet}")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("전체 문헌", f"{len(df):,}편")
@@ -581,8 +608,8 @@ elif nav == "screen":
             try:
                 if labeled_n >= MIN_LABELS_FOR_SUPERVISED:
                     # 자동배제 안전성을 우선해 지원 preset 중 가장 높은 목표 재현율을 사용한다.
-                    auto_recall_target = max(RECALL_TARGET_PRESETS)
-                    with st.spinner("사용자의 판정을 학습해 문헌 순위를 정리하는 중입니다..."):
+                    auto_recall_target = DEFAULT_RECALL_TARGET
+                    with st.spinner("Title·Abstract와 문장 단위 PICO를 분석해 문헌 우선순위를 최적화하는 중입니다..."):
                         result = train_and_predict(
                             df,
                             recall_target=auto_recall_target,
@@ -661,6 +688,7 @@ elif nav == "screen":
                     f"{int(m.get('safe_exclude_cv_false_negatives', 0))}편 확인되었습니다."
                 )
             st.caption("현재 프로젝트 성능은 사람이 판정한 라벨을 이용한 교차검증 결과이며, 아직 라벨되지 않은 문헌에 동일한 성능을 보장하지는 않습니다.")
+            st.caption(f"Threshold: {m.get('threshold_strategy', 'Recall-constrained policy')} · Title/Abstract 분리: {'ON' if m.get('title_abstract_separate') else 'OFF'} · Sentence-level PICO: {'ON' if m.get('sentence_pico_used') else 'OFF'} · Prototype similarity: {'ON' if m.get('prototype_similarity_used') else 'OFF'}")
 
         counts = result.predictions["AI_Recommendation"].value_counts()
         c1, c2, c3 = st.columns(3)
