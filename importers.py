@@ -213,9 +213,11 @@ def read_uploaded_file(uploaded) -> pd.DataFrame:
     raise ValueError(f"지원하지 않는 파일 형식입니다: {suffix}")
 
 
-def combine_uploads(files: Iterable) -> tuple[pd.DataFrame, list[str]]:
+def combine_uploads(files: Iterable, progress_callback=None) -> tuple[pd.DataFrame, list[str]]:
+    files = list(files)
     frames, errors = [], []
-    for f in files:
+    total = max(len(files), 1)
+    for idx, f in enumerate(files, start=1):
         try:
             frame = read_uploaded_file(f)
             if frame.empty:
@@ -224,5 +226,7 @@ def combine_uploads(files: Iterable) -> tuple[pd.DataFrame, list[str]]:
                 frames.append(frame)
         except Exception as exc:
             errors.append(f"{f.name}: {exc}")
+        if progress_callback:
+            progress_callback(f.name, idx, total)
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return combined, errors

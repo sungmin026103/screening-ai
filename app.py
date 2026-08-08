@@ -424,20 +424,69 @@ elif nav == "import":
         unsafe_allow_html=True,
     )
     if uploaded and st.button("업로드 및 중복 제거 실행", type="primary", use_container_width=True):
-        combined, errors = combine_uploads(uploaded)
-        for error in errors:
-            st.warning(error)
-        if combined.empty:
-            st.error("처리 가능한 레코드를 찾지 못했습니다. 파일 형식과 열 이름을 확인해주세요.")
-        else:
-            deduped, removed = deduplicate_records(combined)
-            st.session_state.records = deduped
-            st.session_state["import_stats"] = {"before": len(combined), "after": len(deduped), "removed": len(removed)}
-            if active:
-                save_records(active, deduped)
-            st.success(f"{len(combined):,}건을 통합하고, 중복 {len(removed):,}건을 제거했습니다.")
-            log_activity("📥", "문헌 가져오기 · 중복 제거 완료", f"{len(combined):,}건 → {len(deduped):,}건")
-            st.rerun()
+        # 처리 중 화면이 멈춘 것처럼 보이지 않도록 단계별 상태와 진행률을 표시한다.
+        status_box = st.status("문헌 파일을 읽는 중입니다...", expanded=True)
+        progress = st.progress(0, text="업로드 파일 확인 중")
+
+        try:
+            def _import_progress(filename, current, total):
+                pct = int((current / max(total, 1)) * 25)
+                progress.progress(min(pct, 25), text=f"파일 읽는 중 · {current}/{total} · {filename}")
+
+            combined, errors = combine_uploads(uploaded, progress_callback=_import_progress)
+            for error in errors:
+                st.warning(error)
+
+            if combined.empty:
+                progress.empty()
+                status_box.update(label="처리 가능한 문헌을 찾지 못했습니다.", state="error", expanded=True)
+                st.error("처리 가능한 레코드를 찾지 못했습니다. 파일 형식과 열 이름을 확인해주세요.")
+            else:
+                status_box.write(f"파일 병합 완료: **{len(combined):,}건**")
+                progress.progress(28, text=f"{len(combined):,}건 병합 완료 · DOI/제목 중복 확인 준비 중")
+
+                def _dedup_progress(stage, current, total):
+                    if stage == "준비":
+                        pct = 30
+                        text = "DOI 및 정확 제목 중복 확인 중"
+                    elif stage == "유사 제목 확인":
+                        pct = 35 + int((current / max(total, 1)) * 50)
+                        text = f"유사 제목 중복 확인 중 · {current}/{total} 연도 그룹"
+                    elif stage == "중복 그룹 정리":
+                        pct = 90
+                        text = "중복 그룹 정리 및 대표 문헌 선택 중"
+                    else:
+                        pct = 95
+                        text = "중복 제거 완료 · 프로젝트에 저장 중"
+                    progress.progress(min(pct, 95), text=text)
+
+                deduped, removed = deduplicate_records(combined, progress_callback=_dedup_progress)
+                st.session_state.records = deduped
+                st.session_state["import_stats"] = {
+                    "before": len(combined),
+                    "after": len(deduped),
+                    "removed": len(removed),
+                }
+                st.session_state["import_notice"] = (
+                    f"{len(combined):,}건을 통합하고, 중복 {len(removed):,}건을 제거했습니다. "
+                    f"최종 {len(deduped):,}건입니다."
+                )
+                if active:
+                    save_records(active, deduped)
+                    save_project_state(active, "import_stats", st.session_state["import_stats"])
+                log_activity("📥", "문헌 가져오기 · 중복 제거 완료", f"{len(combined):,}건 → {len(deduped):,}건")
+                progress.progress(100, text="완료")
+                status_box.update(label="문헌 가져오기 · 중복 제거 완료", state="complete", expanded=False)
+                st.rerun()
+
+        except Exception as exc:
+            progress.empty()
+            status_box.update(label="중복 제거 중 오류가 발생했습니다.", state="error", expanded=True)
+            st.error(f"오류: {type(exc).__name__}: {exc}")
+            st.exception(exc)
+
+    if st.session_state.get("import_notice"):
+        st.success(st.session_state["import_notice"])
 
     stats = st.session_state.get("import_stats", {})
     if not records.empty:

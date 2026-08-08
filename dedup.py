@@ -32,11 +32,13 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
-def deduplicate_records(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def deduplicate_records(df: pd.DataFrame, progress_callback=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     if df.empty:
         return df.copy(), df.copy()
 
     work = df.copy().reset_index(drop=True)
+    if progress_callback:
+        progress_callback("준비", 0, max(len(work), 1))
     for col in ("doi", "title", "abstract", "year"):
         if col not in work.columns:
             work[col] = ""
@@ -77,16 +79,33 @@ def deduplicate_records(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         if year and len(words) >= 20:
             by_year[year].append(idx)
 
-    for indices in by_year.values():
+    # Strict fuzzy title matching. Sorting by title length lets us stop scanning
+    # as soon as a pair can no longer satisfy the existing 0.65 length-ratio
+    # rule. This preserves the original duplicate rule while avoiding many
+    # unnecessary comparisons on large imports.
+    year_groups = list(by_year.values())
+    total_groups = max(len(year_groups), 1)
+    comparisons = 0
+    for group_no, indices in enumerate(year_groups, start=1):
+        indices = sorted(indices, key=lambda i: len(work.at[i, "_title_words"]))
         for pos, left in enumerate(indices):
             left_title = work.at[left, "_title_words"]
+            left_len = len(left_title)
             for right in indices[pos + 1:]:
                 right_title = work.at[right, "_title_words"]
-                length_ratio = min(len(left_title), len(right_title)) / max(len(left_title), len(right_title))
-                if length_ratio < 0.65:
-                    continue
+                right_len = len(right_title)
+                # Because the list is length-sorted, all later titles are at
+                # least this long; once the ratio drops below 0.65 we can break.
+                if left_len / max(right_len, 1) < 0.65:
+                    break
+                comparisons += 1
                 if token_set_ratio(left_title, right_title) >= FUZZY_TITLE_THRESHOLD:
                     uf.union(left, right)
+        if progress_callback:
+            progress_callback("유사 제목 확인", group_no, total_groups)
+
+    if progress_callback:
+        progress_callback("중복 그룹 정리", 1, 1)
 
     clusters: dict[int, list[int]] = defaultdict(list)
     for idx in range(len(work)):
@@ -114,6 +133,8 @@ def deduplicate_records(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if "year" in kept.columns:
         kept["_year_sort"] = pd.to_numeric(kept["year"], errors="coerce")
         kept = kept.sort_values("_year_sort", na_position="last", kind="stable").drop(columns="_year_sort").reset_index(drop=True)
+    if progress_callback:
+        progress_callback("완료", 1, 1)
     return kept, removed
 
 
