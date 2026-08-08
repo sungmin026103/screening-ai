@@ -67,7 +67,9 @@ REFERENCE_BENCHMARK = {
 # 지도학습(재현율 통계적 보장) 모드로 전환되는 최소 라벨 수. 이 미만이면 앱은
 # 자동으로 zero-shot 모드로 동작한다 — 사람이 매번 "어느 모드로 할지" 고르는 게
 # 아니라, 라벨 존재 여부라는 데이터 상태로 결정되는 고정 기준이다.
-MIN_LABELS_FOR_SUPERVISED = 20
+MIN_LABELS_FOR_SUPERVISED = 100
+TRAINING_SAMPLE_SIZE = 200
+MIN_INCLUDE_FOR_SUPERVISED = 10
 
 # 엑셀 다운로드 시 구간 순서와 배경색. False Negative는 실제 라벨이 Include인데
 # 컷오프 밖으로 밀려난, 눈에 띄어야 하는 문헌이라 원래 버킷에서 따로 떼어내
@@ -187,6 +189,148 @@ def detect_label_count(df: pd.DataFrame) -> int:
         return 0
 
 
+def build_training_sample(
+    df: pd.DataFrame,
+    criteria_text: str,
+    exclusion_text: str = "",
+    sample_size: int = TRAINING_SAMPLE_SIZE,
+) -> pd.DataFrame:
+    """전체 코퍼스에서 학습 가치가 높은 문헌을 빠르게 한 번에 뽑는다.
+
+    200편을 높은 PICO 적합도 50%, 경계 35%, 낮은 적합도 15%로 구성한다.
+    이 단계는 의도적으로 가벼운 TF-IDF만 사용해 8천~수만 편에서도 빠르게 끝나며,
+    실제 최종 지도학습 모델은 이후 200편 라벨을 이용해 별도로 학습한다.
+    """
+    if not criteria_text or not criteria_text.strip():
+        raise ValueError("학습용 문헌을 선정하려면 PICO 기준이 필요합니다.")
+    if len(df) == 0:
+        raise ValueError("문헌 데이터가 비어 있습니다.")
+
+    base = df.copy().reset_index(drop=True)
+    title_col = _find_col(base, ["title", "제목"])
+    abstract_col = _find_col(base, ["abstract", "초록"])
+    if title_col is None:
+        raise ValueError("제목(Title/제목) 열이 필요합니다.")
+    titles = base[title_col].fillna("").astype(str)
+    abstracts = base[abstract_col].fillna("").astype(str) if abstract_col else pd.Series([""] * len(base))
+    docs = (titles + " " + abstracts).str.strip().tolist()
+    base["_Source_Index"] = np.arange(len(base), dtype=int)
+
+    sections = _parse_pico_sections(criteria_text)
+    queries = [q.strip() for q in sections.values() if q and q.strip()]
+    if not queries:
+        queries = [criteria_text.strip()]
+    exclusion_items = _split_bullet_items(exclusion_text)
+    all_queries = queries + exclusion_items
+
+    # 샘플 선정은 속도가 핵심이므로 pretrained embedding 다운로드 없이 TF-IDF만 사용.
+    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=60000, sublinear_tf=True, stop_words="english")
+    mat = vec.fit_transform(docs + all_queries)
+    doc_mat = mat[:len(docs)]
+    query_mat = mat[len(docs):]
+    pico_q = query_mat[:len(queries)]
+    pico_sim = cosine_similarity(doc_mat, pico_q)
+    # 샘플 enrichment에서는 min만 쓰면 짧은 제목/초록에서 0이 과도하게 많아져
+    # 구분력이 사라질 수 있어 mean+min을 결합한다.
+    pico_score = 0.65 * pico_sim.mean(axis=1) + 0.35 * pico_sim.min(axis=1)
+    if exclusion_items:
+        excl_q = query_mat[len(queries):]
+        excl_score = cosine_similarity(doc_mat, excl_q).max(axis=1)
+    else:
+        excl_score = np.zeros(len(docs), dtype=float)
+    scores = np.asarray(pico_score - 0.75 * excl_score, dtype=float)
+
+    n = min(int(sample_size), len(base))
+    n_high = int(round(n * 0.50))
+    n_boundary = int(round(n * 0.35))
+    n_low = n - n_high - n_boundary
+    ranked = np.argsort(scores)
+
+    # 데이터 자체의 점수 분포에서 중앙 경계를 잡고 그 주변을 uncertainty 표본으로 사용.
+    boundary = float(_otsu_threshold(scores))
+    boundary_order = np.argsort(np.abs(scores - boundary))
+
+    selected: list[tuple[int, str]] = []
+    used_idx: set[int] = set()
+    used_titles: set[str] = set()
+
+    def add(indices, label, limit):
+        count = 0
+        for raw_idx in indices:
+            idx = int(raw_idx)
+            title_key = titles.iloc[idx].strip().casefold()
+            if idx in used_idx or not title_key or title_key in used_titles:
+                continue
+            used_idx.add(idx)
+            used_titles.add(title_key)
+            selected.append((idx, label))
+            count += 1
+            if count >= limit:
+                break
+
+    add(ranked[::-1], "High PICO relevance", n_high)
+    add(boundary_order, "Decision boundary", n_boundary)
+    add(ranked, "Low PICO relevance", n_low)
+    if len(selected) < n:
+        # 중복 제목 때문에 부족한 경우 전체 점수 순위에서 남은 문헌으로 보충.
+        add(ranked[::-1], "Supplemental", n - len(selected))
+
+    rows = []
+    for idx, stratum in selected[:n]:
+        row = base.iloc[idx].copy()
+        row["Training_Stratum"] = stratum
+        rows.append(row)
+    out = pd.DataFrame(rows).reset_index(drop=True)
+    out.insert(0, "Training_No", np.arange(1, len(out) + 1))
+    out["Human_Label"] = ""
+    return out
+
+
+def merge_training_labels(full_df: pd.DataFrame, labeled_sample_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """200편 라벨 파일을 원본 전체 문헌에 병합한다. _Source_Index를 우선 사용하고,
+    없으면 정규화한 제목으로 매칭한다. Human_Label은 O/X 또는 1/0을 허용한다.
+    """
+    full = full_df.copy().reset_index(drop=True)
+    sample = labeled_sample_df.copy().reset_index(drop=True)
+    sample_prepared, _ = prepare_screening_data(sample)
+    labels = sample_prepared["Human_Label"]
+
+    full["Human_Label"] = np.nan
+    matched = 0
+    if "_Source_Index" in sample.columns:
+        for i, lab in labels.items():
+            if lab not in (0, 1):
+                continue
+            try:
+                idx = int(sample.loc[i, "_Source_Index"])
+            except Exception:
+                continue
+            if 0 <= idx < len(full):
+                full.loc[idx, "Human_Label"] = int(lab)
+                matched += 1
+    else:
+        title_full = _find_col(full, ["title", "제목"])
+        title_sample = _find_col(sample, ["title", "제목"])
+        if not title_full or not title_sample:
+            raise ValueError("라벨 파일을 병합하려면 _Source_Index 또는 Title/제목 열이 필요합니다.")
+        lookup = {}
+        for idx, t in enumerate(full[title_full].fillna("").astype(str)):
+            lookup.setdefault(t.strip().casefold(), idx)
+        for i, lab in labels.items():
+            if lab not in (0, 1):
+                continue
+            key = str(sample.loc[i, title_sample]).strip().casefold()
+            idx = lookup.get(key)
+            if idx is not None:
+                full.loc[idx, "Human_Label"] = int(lab)
+                matched += 1
+
+    valid = full["Human_Label"].isin([0, 1])
+    include_n = int((full.loc[valid, "Human_Label"] == 1).sum())
+    exclude_n = int((full.loc[valid, "Human_Label"] == 0).sum())
+    return full, {"matched": int(matched), "include_n": include_n, "exclude_n": exclude_n, "labeled_n": int(valid.sum())}
+
+
 # ---------------------------------------------------------------------------
 # 의미 기반(임베딩) 신호. TF-IDF 계열(word/char/PICO 유사도)은 결국 전부
 # 표면적 단어 일치에 의존하기 때문에 "서로 다른 근거"라고 보기 어렵다.
@@ -268,7 +412,15 @@ class TextPartExtractor(BaseEstimator, TransformerMixin):
                 title, abstract = text.split(STRUCTURED_SEP, 1)
             else:
                 title, abstract = text, ""
-            out.append(title if self.part == "title" else abstract)
+            value = title if self.part == "title" else abstract
+            # Title-only screening files are valid. If an entire CV fold has no abstracts,
+            # sklearn's TfidfVectorizer would otherwise raise
+            # "empty vocabulary; perhaps the documents only contain stop words".
+            # A constant placeholder keeps the feature branch structurally valid while
+            # contributing no discriminative information.
+            if not str(value).strip():
+                value = "missing_abstract" if self.part == "abstract" else "missing_title"
+            out.append(value)
         return np.asarray(out, dtype=object)
 
 

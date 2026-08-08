@@ -30,7 +30,11 @@ from screening import (
     DEFAULT_RECALL_TARGET,
     zero_shot_screen,
     detect_label_count,
+    build_training_sample,
+    merge_training_labels,
+    TRAINING_SAMPLE_SIZE,
     MIN_LABELS_FOR_SUPERVISED,
+    MIN_INCLUDE_FOR_SUPERVISED,
     REFERENCE_BENCHMARK,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
@@ -52,7 +56,7 @@ if "activity_log" not in st.session_state:
 
 
 PROJECT_SCOPED_STATE_KEYS = [
-    "screening_result", "zero_shot_result", "import_stats", "pdf_extractions", "meta_raw", "meta_result", "meta_r_result",
+    "screening_result", "zero_shot_result", "training_sample", "import_stats", "pdf_extractions", "meta_raw", "meta_result", "meta_r_result",
 ]
 
 
@@ -590,7 +594,7 @@ elif nav == "pico":
 elif nav == "screen":
     hero(
         "AI 문헌 선별",
-        "문헌을 사람이 확인해야 할 순서대로 정리하고, 안전 제외 후보는 회색으로 가장 아래에 배치합니다.",
+        "전체 문헌에서 AI 학습 가치가 높은 200편만 먼저 판정한 뒤, 그 라벨로 나머지 문헌을 한 번에 우선순위화합니다.",
         eyebrow="AI SCREENING",
     )
 
@@ -607,11 +611,10 @@ elif nav == "screen":
         if pico.get(key, "").strip()
     )
 
-    # 일반 사용자는 모델/threshold/모드를 선택하지 않는다.
-    # 라벨 수에 따라 앱이 자동으로 적절한 방식을 사용한다.
     st.info(
-        "① 문헌 파일을 업로드하고 ② PICO와 배제기준을 확인한 뒤 ③ 「AI 문헌 선별 시작」을 누르세요. "
-        "라벨이 충분하면 사용자의 판단을 자동으로 학습하고, 그렇지 않으면 PICO와 배제기준으로 우선순위를 정합니다."
+        "가장 효율적인 고정 흐름입니다: ① 전체 문헌 업로드 → ② AI가 학습용 200편 선정 → "
+        "③ 그 200편만 O/X 판정 → ④ 라벨 파일 업로드 → ⑤ 전체 문헌을 한 번에 AI 선별. "
+        "이후 추가 라벨링은 요구하지 않습니다."
     )
 
     if criteria_text:
@@ -629,9 +632,10 @@ elif nav == "screen":
         st.warning("PICO가 비어 있습니다. 먼저 「PICO 설정」에서 연구 기준을 입력해 주세요.")
 
     file = st.file_uploader(
-        "스크리닝 파일 업로드",
+        "① 전체 문헌 파일 업로드",
         type=["xlsx", "xls", "csv"],
-        help="Title/제목 열을 자동으로 찾습니다. Abstract/초록이 있으면 문장 단위 PICO 분석까지 적용됩니다. Human_Label(O/X 또는 1/0)이 있으면 자동 반영됩니다.",
+        key="screen_full_corpus",
+        help="Title/제목은 필수이며 Abstract/초록을 함께 권장합니다. 기존 라벨이 있어도 새 200편 workflow를 사용할 수 있습니다.",
     )
 
     if file:
@@ -640,62 +644,107 @@ elif nav == "screen":
         if selected_sheet:
             st.caption(f"Excel 시트 자동 선택: {selected_sheet}")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("전체 문헌", f"{len(df):,}편")
-        c2.metric("확인된 라벨", f"{labeled_n:,}편")
-        c3.metric(
-            "AI 방식",
-            "내 판단 반영" if labeled_n >= MIN_LABELS_FOR_SUPERVISED else "PICO 기반",
-            help="사용자가 선택할 필요 없이 라벨 수에 따라 자동으로 결정됩니다.",
-        )
+        a1, a2, a3 = st.columns(3)
+        a1.metric("전체 문헌", f"{len(df):,}편")
+        a2.metric("기존 유효 라벨", f"{labeled_n:,}편")
+        a3.metric("학습용 목표", f"{min(TRAINING_SAMPLE_SIZE, len(df)):,}편")
 
         with st.expander("업로드 파일 미리보기", expanded=False):
             st.dataframe(df.head(20), use_container_width=True)
 
-        run_disabled = not bool(criteria_text)
-        if st.button("AI 문헌 선별 시작", type="primary", use_container_width=True, disabled=run_disabled):
-            try:
-                if labeled_n >= MIN_LABELS_FOR_SUPERVISED:
-                    # 자동배제 안전성을 우선해 지원 preset 중 가장 높은 목표 재현율을 사용한다.
-                    auto_recall_target = DEFAULT_RECALL_TARGET
-                    with st.spinner("Title·Abstract와 문장 단위 PICO를 분석해 문헌 우선순위를 최적화하는 중입니다..."):
-                        result = train_and_predict(
-                            df,
-                            recall_target=auto_recall_target,
-                            criteria_text=criteria_text,
-                        )
-                    st.session_state["screening_result"] = result
-                    st.session_state.pop("zero_shot_result", None)
-                    save_project_state(active, "screening_result", result)
-                    safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-                    log_activity(
-                        "🤖", "AI 문헌 선별 완료",
-                        f"검토 필요 {len(result.predictions)-safe_n0:,}편 / 안전 제외 후보 {safe_n0:,}편 / 라벨 {labeled_n:,}편",
-                    )
-                else:
-                    if not pico_sectioned_text.strip():
-                        raise ValueError("PICO의 P/I/C/O 중 하나 이상을 입력해 주세요.")
-                    with st.spinner("PICO와 배제기준을 기준으로 문헌 순위를 정리하는 중입니다..."):
-                        zs_result = zero_shot_screen(
+        if not criteria_text:
+            st.warning("학습용 200편을 선정하려면 PICO를 먼저 저장해 주세요.")
+        else:
+            if st.button("② AI 학습용 200편 만들기", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("PICO 적합도와 의사결정 경계를 계산해 학습 가치가 높은 200편을 선정하는 중입니다..."):
+                        training_sample = build_training_sample(
                             df,
                             pico_sectioned_text,
                             pico.get("exclusion_criteria", ""),
+                            sample_size=TRAINING_SAMPLE_SIZE,
                         )
-                    st.session_state["zero_shot_result"] = zs_result
-                    st.session_state.pop("screening_result", None)
-                    save_project_state(active, "zero_shot_result", zs_result)
-                    safe_n0 = int(zs_result.metrics.get("safe_exclude_n", 0))
-                    log_activity(
-                        "🤖", "AI 문헌 선별 완료",
-                        f"검토 필요 {len(zs_result.predictions)-safe_n0:,}편 / 안전 제외 후보 {safe_n0:,}편 / 라벨 없음",
-                    )
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+                    st.session_state["training_sample"] = training_sample
+                    save_project_state(active, "training_sample", training_sample)
+                    st.success(f"학습용 문헌 {len(training_sample):,}편을 만들었습니다. Human_Label 열에 O(포함) 또는 X(제외)만 입력하세요.")
+                except Exception as exc:
+                    st.error(str(exc))
 
-    # ------------------------------------------------------------------
-    # 라벨 기반 결과: 실제 성능을 교차검증으로 계산할 수 있음
-    # ------------------------------------------------------------------
+            training_sample = st.session_state.get("training_sample")
+            if isinstance(training_sample, pd.DataFrame) and not training_sample.empty:
+                tcounts = training_sample.get("Training_Stratum", pd.Series(dtype=str)).value_counts()
+                s1, s2, s3 = st.columns(3)
+                s1.metric("High PICO", f"{int(tcounts.get('High PICO relevance', 0)):,}편")
+                s2.metric("경계 문헌", f"{int(tcounts.get('Decision boundary', 0)):,}편")
+                s3.metric("Low PICO", f"{int(tcounts.get('Low PICO relevance', 0)):,}편")
+                st.caption("Include를 충분히 확보하면서도 경계와 명확한 Exclude 패턴을 함께 학습하도록 자동 구성됩니다.")
+                st.download_button(
+                    "학습용 200편 다운로드",
+                    dataframe_to_excel_bytes(training_sample),
+                    "AI_Training_200.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+                labeled_file = st.file_uploader(
+                    "③ O/X 판정을 완료한 AI_Training_200.xlsx 업로드",
+                    type=["xlsx", "xls", "csv"],
+                    key="screen_labeled_training_200",
+                    help="Human_Label 열에 O=Include, X=Exclude를 입력한 파일을 업로드하세요. 빈 행은 학습에서 제외됩니다.",
+                )
+
+                if labeled_file:
+                    try:
+                        label_df, label_sheet = _read_screening_upload(labeled_file)
+                        merged_df, label_stats = merge_training_labels(df, label_df)
+                        l1, l2, l3 = st.columns(3)
+                        l1.metric("학습 라벨", f"{label_stats['labeled_n']:,}편")
+                        l2.metric("Include", f"{label_stats['include_n']:,}편")
+                        l3.metric("Exclude", f"{label_stats['exclude_n']:,}편")
+
+                        enough_classes = (
+                            label_stats["labeled_n"] >= MIN_LABELS_FOR_SUPERVISED
+                            and label_stats["include_n"] > 0
+                            and label_stats["exclude_n"] > 0
+                        )
+                        if label_stats["labeled_n"] < MIN_LABELS_FOR_SUPERVISED:
+                            st.warning(f"유효 라벨이 {label_stats['labeled_n']}편입니다. 최소 {MIN_LABELS_FOR_SUPERVISED}편 이상 판정해야 학습을 시작할 수 있습니다. 가능하면 200편 모두 판정하세요.")
+                        elif label_stats["labeled_n"] < 180:
+                            st.info("일부 문헌이 미판정 상태입니다. 학습은 가능하지만 200편을 모두 판정하는 것이 가장 안정적입니다.")
+                        if label_stats["include_n"] < MIN_INCLUDE_FOR_SUPERVISED:
+                            st.warning(
+                                f"Include가 {label_stats['include_n']}편으로 적습니다. 학습은 가능하지만 높은 Recall을 유지하면 검토 감소 폭이 작을 수 있습니다. "
+                                "추가 라벨링을 강제하지는 않습니다."
+                            )
+
+                        if st.button(
+                            "④ 200편으로 AI 학습 및 전체 문헌 선별",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not enough_classes,
+                        ):
+                            with st.spinner("200편의 사람 판정을 학습하고 전체 문헌의 우선순위를 계산하는 중입니다..."):
+                                result = train_and_predict(
+                                    merged_df,
+                                    recall_target=DEFAULT_RECALL_TARGET,
+                                    criteria_text=criteria_text,
+                                )
+                            result.metrics["training_design"] = "fixed_200_pico_enriched"
+                            result.metrics["training_sample_requested"] = int(TRAINING_SAMPLE_SIZE)
+                            result.metrics["training_sample_labeled"] = int(label_stats["labeled_n"])
+                            st.session_state["screening_result"] = result
+                            st.session_state.pop("zero_shot_result", None)
+                            save_project_state(active, "screening_result", result)
+                            safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                            log_activity(
+                                "🤖", "AI 문헌 선별 완료",
+                                f"200편 고정 학습 → 전체 {len(result.predictions):,}편 / 검토 필요 {len(result.predictions)-safe_n0:,}편 / 안전 제외 후보 {safe_n0:,}편",
+                            )
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
     result = st.session_state.get("screening_result")
     if result:
         total_n = len(result.predictions)
@@ -703,41 +752,28 @@ elif nav == "screen":
         review_n = total_n - safe_n
         reduction_rate = (safe_n / total_n * 100) if total_n else 0.0
 
-        st.markdown('<div class="section-title" style="margin-top:18px;">선별 결과</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title" style="margin-top:18px;">최종 선별 결과</div>', unsafe_allow_html=True)
         r1, r2, r3 = st.columns(3)
         r1.metric("사람이 확인할 문헌", f"{review_n:,}편")
         r2.metric("안전 제외 후보", f"{safe_n:,}편")
         r3.metric("검토 부담 감소", f"{reduction_rate:.1f}%")
-        st.caption("회색 행은 안전 제외 후보이며 표의 가장 아래에 배치됩니다. 경계 문헌은 반드시 사람이 확인하세요.")
+        st.caption("AI는 200편의 사람 판정을 학습한 뒤 전체 문헌을 한 번에 순위화합니다. 이후 추가 라벨링 단계는 없습니다.")
 
-        # 성능은 필요할 때만 펼쳐서 확인한다. 기준 성능은 항상, 현재 프로젝트 성능은 라벨이 있을 때만 표시한다.
         with st.expander("성능 확인", expanded=False):
-            _render_reference_benchmark()
-            st.divider()
-            st.markdown("**현재 프로젝트 성능**")
+            st.markdown("**현재 프로젝트 교차검증 성능**")
             m = result.metrics
             conf = result.confusion
             p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Recall", f"{m.get('recall', 0.0)*100:.1f}%", help="현재 프로젝트 라벨에 대한 교차검증 Recall")
-            p2.metric("False Negative", f"{int(conf.get('fn', 0))}편", help="현재 프로젝트에서 실제 Include인데 낮게 평가된 문헌 수")
+            p1.metric("Recall", f"{m.get('recall', 0.0)*100:.1f}%")
+            p2.metric("False Negative", f"{int(conf.get('fn', 0))}편")
             p3.metric("Precision", f"{m.get('precision', 0.0)*100:.1f}%")
             p4.metric("WSS", f"{m.get('wss', 0.0)*100:.1f}%")
-
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("ROC-AUC", f"{m.get('roc_auc', 0.0):.3f}")
             q2.metric("Average Precision", f"{m.get('average_precision', 0.0):.3f}")
             q3.metric("안전 제외 FN", f"{int(m.get('safe_exclude_cv_false_negatives', 0))}편")
-            q4.metric("검증 라벨", f"{int(m.get('labeled_n', labeled_n if 'labeled_n' in locals() else 0)):,}편")
-
-            if int(m.get("safe_exclude_cv_false_negatives", 0)) == 0:
-                st.success("현재 프로젝트 교차검증에서 안전 제외 후보에 포함된 실제 Include 문헌은 0편이었습니다.")
-            else:
-                st.warning(
-                    f"현재 프로젝트 교차검증에서 안전 제외 후보 중 실제 Include 문헌이 "
-                    f"{int(m.get('safe_exclude_cv_false_negatives', 0))}편 확인되었습니다."
-                )
-            st.caption("현재 프로젝트 성능은 사람이 판정한 라벨을 이용한 교차검증 결과이며, 아직 라벨되지 않은 문헌에 동일한 성능을 보장하지는 않습니다.")
-            st.caption(f"Threshold: {m.get('threshold_strategy', 'Recall-constrained policy')} · Title/Abstract 분리: {'ON' if m.get('title_abstract_separate') else 'OFF'} · Sentence-level PICO: {'ON' if m.get('sentence_pico_used') else 'OFF'} · Prototype similarity: {'ON' if m.get('prototype_similarity_used') else 'OFF'}")
+            q4.metric("학습 라벨", f"{int(m.get('labeled_n', 0)):,}편")
+            st.caption("이 성능은 200편 라벨 내 교차검증 결과입니다. 아직 라벨되지 않은 전체 문헌에서 동일한 성능을 보장하는 독립 검증 결과는 아닙니다.")
 
         counts = result.predictions["AI_Recommendation"].value_counts()
         c1, c2, c3 = st.columns(3)
@@ -765,57 +801,6 @@ elif nav == "screen":
             "AI_Screening_Ranked.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            use_container_width=True,
-        )
-
-    # ------------------------------------------------------------------
-    # 라벨 없는 결과: 실제 성능 수치는 계산하지 않음
-    # ------------------------------------------------------------------
-    zs_result = st.session_state.get("zero_shot_result")
-    if zs_result:
-        m = zs_result.metrics
-        total_zs = int(m.get("n_total", 0))
-        safe_zs = int(m.get("safe_exclude_n", 0))
-        review_zs = total_zs - safe_zs
-        reduction_zs = (safe_zs / total_zs * 100) if total_zs else 0.0
-
-        st.markdown('<div class="section-title" style="margin-top:18px;">선별 결과</div>', unsafe_allow_html=True)
-        z1, z2, z3 = st.columns(3)
-        z1.metric("사람이 확인할 문헌", f"{review_zs:,}편")
-        z2.metric("안전 제외 후보", f"{safe_zs:,}편")
-        z3.metric("잠정 검토 감소", f"{reduction_zs:.1f}%")
-
-        with st.expander("성능 확인", expanded=False):
-            _render_reference_benchmark()
-            st.divider()
-            st.markdown("**현재 프로젝트 성능**")
-            st.info(
-                "현재 프로젝트에는 사람이 판정한 라벨이 충분하지 않아 Recall, Precision, False Negative를 직접 계산할 수 없습니다. "
-                f"유효 라벨이 {MIN_LABELS_FOR_SUPERVISED}편 이상 쌓이면 현재 프로젝트 교차검증 성능이 자동으로 추가됩니다."
-            )
-            st.caption("위의 검증된 기준 성능은 사전 검증 데이터의 결과이며, 현재 프로젝트의 정확도를 뜻하지 않습니다.")
-
-        st.caption("회색 행은 AI가 후순위로 분류한 안전 제외 후보입니다. 라벨 검증 전에는 자동 영구배제 근거로 사용하지 마세요.")
-
-        def _shade_priority_zs(row):
-            status = row.get("AI_Recommendation", "")
-            if status == "안전 제외 후보":
-                return ["background-color: #B8BDC6; color: #111827"] * len(row)
-            if status == "경계 문헌":
-                return ["background-color: #EEF0F3; color: #111827"] * len(row)
-            return ["background-color: #FFFFFF; color: #111827"] * len(row)
-
-        st.markdown('<div class="section-title">AI 순위 결과</div>', unsafe_allow_html=True)
-        st.dataframe(
-            zs_result.predictions.head(1000).style.apply(_shade_priority_zs, axis=1),
-            use_container_width=True,
-            height=540,
-        )
-        st.download_button(
-            "AI 선별 결과 다운로드",
-            dataframe_to_excel_bytes(zs_result.predictions),
-            "AI_Screening_Ranked.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
 
