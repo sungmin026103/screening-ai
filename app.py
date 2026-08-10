@@ -41,6 +41,7 @@ from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed
                     landing_nav, landing_hero, summary_strip)
 from utils import dataframe_to_excel_bytes
 from pdf_analyzer import FIELD_LABELS, analyze_pdf_bytes, extraction_to_dataframe
+from figure_digitizer import render_figure_digitizer
 
 st.set_page_config(page_title="SR Studio · 문헌 스크리닝 워크스페이스", page_icon="◈", layout="wide")
 apply_styles()
@@ -147,6 +148,7 @@ NAV_ITEMS = [
     ("pico", "PICO 설정"),
     ("screen", "AI 스크리닝"),
     ("pdf_analysis", "PDF 분석"),
+    ("figure_digitizer", "Figure 값 추출"),
     ("analytics", "문헌 분석"),
     ("meta", "메타분석 Figure"),
     ("export", "내보내기"),
@@ -903,6 +905,18 @@ elif nav == "pdf_analysis":
             if active:
                 save_project_state(active, "pdf_extractions", [])
             st.rerun()
+
+# ===========================================================================
+# Figure Data Extractor — 2D plot 수치 추출
+# ===========================================================================
+elif nav == "figure_digitizer":
+    hero(
+        "Figure 값 추출",
+        "그래프 이미지를 보정한 뒤 Mean, SD/SE, 95% CI 값을 클릭으로 읽습니다.",
+        eyebrow="FIGURE DATA EXTRACTOR",
+    )
+    render_figure_digitizer()
+
 
 # ===========================================================================
 # 6. 문헌 분석
