@@ -1250,7 +1250,17 @@ def train_and_predict(
         "include_n": n_include,
         "embedding_signal_used": embedding_lookup is not None,
         "wss": work_saved_over_sampling(tn, fn, tp, fp),
+        "threshold": float(threshold),
+        "threshold_strategy": "Recall-constrained WSS optimization",
     }
+
+    # 같은 CV 예측값에서 100% recall을 강제했을 때의 참고 성능도 계산한다.
+    # 모델을 재학습하거나 추가 human labeling을 요구하지 않는다.
+    threshold_100, info_100 = _optimize_threshold_wss(probs, y, 1.0)
+    metrics["threshold_100"] = float(threshold_100)
+    metrics["wss_100"] = float(info_100.get("wss", 0.0))
+    metrics["burden_100"] = float(info_100.get("burden", 1.0))
+    metrics["fn_100"] = int(info_100.get("fn", 0))
 
     # 메인 모델을 전체 라벨 데이터로 최종 학습해 전체 문헌(라벨 없는 것 포함)에
     # 대한 확률을 계산한다.

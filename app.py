@@ -853,7 +853,28 @@ elif nav == "screen":
             q2.metric("Average Precision", f"{m.get('average_precision', 0.0):.3f}")
             q3.metric("안전 제외 FN", f"{int(m.get('safe_exclude_cv_false_negatives', 0))}편")
             q4.metric("학습 라벨", f"{int(m.get('labeled_n', 0)):,}편")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("목표 Recall", f"{m.get('recall_target', 0.95)*100:.0f}%")
+            r2.metric("WSS@95", f"{m.get('wss', 0.0)*100:.1f}%")
+            r3.metric("WSS@100", f"{m.get('wss_100', 0.0)*100:.1f}%")
+            r4.metric("선택 Threshold", f"{m.get('threshold', result.threshold):.3f}")
+            st.caption("Threshold는 200편의 교차검증 예측에서 Recall ≥95%를 만족하는 후보 중 WSS가 최대가 되도록 자동 고정됩니다. 이후 추가 라벨링이나 반복 재학습은 하지 않습니다.")
+            st.caption("WSS@100은 같은 200편 CV 예측에서 FN=0을 강제했을 때의 참고값이며, 추가 human screening을 의미하지 않습니다.")
             st.caption("이 성능은 200편 라벨 내 교차검증 결과입니다. 아직 라벨되지 않은 전체 문헌에서 동일한 성능을 보장하는 독립 검증 결과는 아닙니다.")
+
+            # False-negative 문헌을 바로 확인/다운로드할 수 있게 제공
+            fn_df = result.predictions[result.predictions.get("False_Negative", False) == True].copy()
+            if len(fn_df):
+                st.markdown("**False-negative error analysis 대상**")
+                fn_cols = [c for c in ["Title", "Abstract", "Human_Label_Normalized", "CV_Probability", "CV_Prediction", "AI_Probability", "AI_Recommendation"] if c in fn_df.columns]
+                st.dataframe(fn_df[fn_cols], use_container_width=True, hide_index=True)
+                st.download_button(
+                    "False Negative 문헌 Excel 다운로드",
+                    dataframe_to_excel_bytes(fn_df),
+                    "AI_Screening_False_Negatives.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
 
             st.markdown("**성능 Figure**")
@@ -920,6 +941,7 @@ elif nav == "screen":
                 dataframe_to_excel_bytes(review_df),
                 "AI_Human_Review_Required.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
                 use_container_width=True,
             )
         with d2:
