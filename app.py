@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
+import zipfile
+
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -55,6 +59,80 @@ if "pico" not in st.session_state:
 if "activity_log" not in st.session_state:
     st.session_state.activity_log = []
 
+
+
+def _screening_performance_figure_bytes(result, total_n: int, safe_n: int) -> dict[str, bytes]:
+    """현재 프로젝트의 CV 성능을 4개의 독립 PNG figure로 만든다."""
+    outputs = {}
+    m = result.metrics
+    conf = result.confusion
+
+    def _save(fig, name):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        outputs[name] = buf.getvalue()
+
+    # 1) ROC
+    roc = result.roc_curve or {}
+    fpr, tpr = roc.get("fpr", []), roc.get("tpr", [])
+    if len(fpr) and len(tpr):
+        fig, ax = plt.subplots(figsize=(6.2, 5.2))
+        ax.plot(fpr, tpr, linewidth=2.2, label=f"AI model (AUC = {m.get('roc_auc', 0):.3f})")
+        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1.2, label="Random classifier")
+        ax.set(xlabel="False Positive Rate", ylabel="True Positive Rate (Recall)", title="ROC Curve", xlim=(0,1), ylim=(0,1))
+        ax.legend(frameon=False, loc="lower right")
+        fig.tight_layout(); _save(fig, "01_ROC_Curve.png")
+
+    # 2) Precision-Recall
+    pr = result.pr_curve or {}
+    precision, recall = pr.get("precision", []), pr.get("recall", [])
+    if len(precision) and len(recall):
+        prevalence = m.get("include_n", 0) / m.get("labeled_n", 1) if m.get("labeled_n", 0) else 0
+        fig, ax = plt.subplots(figsize=(6.2, 5.2))
+        ax.plot(recall, precision, linewidth=2.2, label=f"AI model (AP = {m.get('average_precision', 0):.3f})")
+        ax.axhline(prevalence, linestyle="--", linewidth=1.2, label=f"Include prevalence = {prevalence:.3f}")
+        ax.set(xlabel="Recall", ylabel="Precision", title="Precision–Recall Curve", xlim=(0,1), ylim=(0,1))
+        ax.legend(frameon=False, loc="best")
+        fig.tight_layout(); _save(fig, "02_Precision_Recall_Curve.png")
+
+    # 3) Confusion matrix
+    tn, fp, fn, tp = [int(conf.get(k, 0)) for k in ("tn", "fp", "fn", "tp")]
+    cm = np.array([[tn, fp], [fn, tp]])
+    fig, ax = plt.subplots(figsize=(6.2, 5.2))
+    im = ax.imshow(cm)
+    txt = [[f"TN\n{tn}", f"FP\n{fp}"], [f"FN\n{fn}", f"TP\n{tp}"]]
+    cutoff = (cm.max() + cm.min()) / 2 if cm.size else 0
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, txt[i][j], ha="center", va="center", fontsize=14,
+                    color="white" if cm[i,j] > cutoff else "black")
+    ax.set_xticks([0,1], ["Predicted Exclude", "Predicted Include"])
+    ax.set_yticks([0,1], ["Actual Exclude", "Actual Include"])
+    ax.set(title="Confusion Matrix", xlabel="AI prediction", ylabel="Human label")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout(); _save(fig, "03_Confusion_Matrix.png")
+
+    # 4) Screening efficiency
+    review_n = total_n - safe_n
+    safe_pct = 100 * safe_n / total_n if total_n else 0
+    review_pct = 100 * review_n / total_n if total_n else 0
+    fig, ax = plt.subplots(figsize=(6.2, 5.2))
+    bars = ax.bar(["Human review", "AI safe-exclude"], [review_pct, safe_pct])
+    for bar, n, pct in zip(bars, [review_n, safe_n], [review_pct, safe_pct]):
+        ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+2, f"{n:,}\n({pct:.1f}%)", ha="center", va="bottom")
+    ax.set(ylabel="Proportion of total records (%)", title="Screening Efficiency")
+    ax.set_ylim(0, max(100, max(review_pct, safe_pct) + 12))
+    fig.tight_layout(); _save(fig, "04_Screening_Efficiency.png")
+    return outputs
+
+
+def _zip_bytes(files: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 PROJECT_SCOPED_STATE_KEYS = [
     "screening_result", "zero_shot_result", "training_sample", "import_stats", "pdf_extractions", "meta_raw", "meta_result", "meta_r_result",
@@ -777,6 +855,32 @@ elif nav == "screen":
             q4.metric("학습 라벨", f"{int(m.get('labeled_n', 0)):,}편")
             st.caption("이 성능은 200편 라벨 내 교차검증 결과입니다. 아직 라벨되지 않은 전체 문헌에서 동일한 성능을 보장하는 독립 검증 결과는 아닙니다.")
 
+
+            st.markdown("**성능 Figure**")
+            perf_figs = _screening_performance_figure_bytes(result, total_n, safe_n)
+            figure_order = [
+                ("01_ROC_Curve.png", "ROC Curve"),
+                ("02_Precision_Recall_Curve.png", "Precision–Recall Curve"),
+                ("03_Confusion_Matrix.png", "Confusion Matrix"),
+                ("04_Screening_Efficiency.png", "Screening Efficiency"),
+            ]
+            for fname, title in figure_order:
+                if fname in perf_figs:
+                    st.markdown(f"**{title}**")
+                    st.image(perf_figs[fname], use_container_width=False, width=620)
+                    st.download_button(
+                        f"{title} PNG 다운로드",
+                        perf_figs[fname], fname, "image/png",
+                        key=f"download_{fname}", use_container_width=True,
+                    )
+            if perf_figs:
+                st.download_button(
+                    "성능 Figure 4개 ZIP 다운로드",
+                    _zip_bytes(perf_figs),
+                    "AI_Screening_Performance_Figures.zip", "application/zip",
+                    type="primary", use_container_width=True,
+                )
+
         counts = result.predictions["AI_Recommendation"].value_counts()
         c1, c2, c3 = st.columns(3)
         c1.metric("우선 검토", f"{int(counts.get('우선 검토', 0)):,}편")
@@ -805,6 +909,27 @@ elif nav == "screen":
             type="primary",
             use_container_width=True,
         )
+
+        # 실제 screening workflow에 바로 사용할 수 있도록 검토군/안전제외군도 별도 저장
+        review_df = result.predictions[result.predictions["AI_Recommendation"] != "안전 제외 후보"].copy()
+        safe_df = result.predictions[result.predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "사람이 확인할 문헌 다운로드",
+                dataframe_to_excel_bytes(review_df),
+                "AI_Human_Review_Required.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with d2:
+            st.download_button(
+                "AI 안전 제외 후보 다운로드",
+                dataframe_to_excel_bytes(safe_df),
+                "AI_Safe_Exclude_Candidates.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 # ===========================================================================
 # 5. PDF 분석 — 1단계 연구 특성 자동 추출
