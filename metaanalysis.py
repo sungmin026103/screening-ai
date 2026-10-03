@@ -11,6 +11,8 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+
+import rmeta
 from plotly.subplots import make_subplots
 from scipy.stats import chi2, t as t_dist
 
@@ -55,13 +57,8 @@ def compute_effect_sizes(
     sd_t, sd_c = work["sd_t"].to_numpy(), work["sd_c"].to_numpy()
     mean_t, mean_c = work["mean_t"].to_numpy(), work["mean_c"].to_numpy()
 
-    df_pool = n_t + n_c - 2
-    sp = np.sqrt(((n_t - 1) * sd_t ** 2 + (n_c - 1) * sd_c ** 2) / df_pool)
-    d = (mean_t - mean_c) / sp
-    j = 1 - 3 / (4 * df_pool - 1)
-    g = d * j
-    var_d = (n_t + n_c) / (n_t * n_c) + d ** 2 / (2 * (n_t + n_c))
-    var_g = (j ** 2) * var_d
+    # metafor::escalc(measure='SMD')와 동일: 정확한 J(감마함수), vi = 1/n1 + 1/n2 + g²/(2(n1+n2))
+    g, var_g = rmeta.escalc_smd(mean_t, sd_t, n_t, mean_c, sd_c, n_c)
     se_g = np.sqrt(var_g)
 
     work["yi"] = g
@@ -96,53 +93,38 @@ class PooledResult:
     clustered: bool
 
 
+def _pooled_from_rma(r: "rmeta.RmaResult", n_clusters: int | None = None) -> PooledResult:
+    from scipy.stats import chi2 as _chi2
+    tcrit = float(t_dist.ppf(0.975, r.df)) if r.df > 0 else float("nan")
+    pi_se = float(np.sqrt(r.se[0] ** 2 + r.tau2))
+    return PooledResult(
+        beta=float(r.beta[0]), se=float(r.se[0]), ci=(float(r.ci_lb[0]), float(r.ci_ub[0])), df=r.df,
+        p_value=float(r.pval[0]), tau2=r.tau2, q=r.q, q_df=r.k - 1,
+        p_het=float(_chi2.sf(r.q, r.k - 1)) if r.k > 1 else float("nan"), i2=r.i2, k=r.k,
+        n_clusters=n_clusters or r.k,
+        prediction_interval=(float(r.beta[0]) - tcrit * pi_se, float(r.beta[0]) + tcrit * pi_se) if r.k >= 3 else (float("nan"), float("nan")),
+        clustered=False,
+    )
+
+
 def pool_random_effects(effect_df: pd.DataFrame, cluster_col: str = "study") -> PooledResult:
-    yi = effect_df["yi"].to_numpy()
-    vi = effect_df["vi"].to_numpy()
-    k = len(yi)
-
-    wi_fixed = 1 / vi
-    fixed_mean = float(np.sum(wi_fixed * yi) / np.sum(wi_fixed))
-    q = float(np.sum(wi_fixed * (yi - fixed_mean) ** 2))
-    dfree = k - 1
-    c = float(np.sum(wi_fixed) - np.sum(wi_fixed ** 2) / np.sum(wi_fixed)) if np.sum(wi_fixed) > 0 else 0.0
-    tau2 = max(0.0, (q - dfree) / c) if c > 0 else 0.0
-    i2 = max(0.0, (q - dfree) / q) * 100 if q > 0 else 0.0
-    p_het = float(1 - chi2.cdf(q, dfree)) if dfree > 0 else float("nan")
-
-    wi = 1 / (vi + tau2)
-    beta = float(np.sum(wi * yi) / np.sum(wi))
-
+    """R 파이프라인(01_stat_analysis.R)과 같은 모형으로 풀링한다.
+    - 연구당 효과크기 1개: rma(method='REML', test='knha')  — 진단용 study-level 모형과 동일
+    - 연구당 효과크기 여러 개: rma.mv(~1|Study/es_id, REML) + CR2(Satterthwaite) 추론
+    """
+    yi = effect_df["yi"].to_numpy(dtype=float)
+    vi = effect_df["vi"].to_numpy(dtype=float)
     clusters = effect_df[cluster_col].astype(str).to_numpy()
     n_clusters = len(set(clusters))
-    clustered = n_clusters < k  # 같은 study에서 나온 효과크기가 2개 이상이면 클러스터링 존재
-
-    if clustered:
-        # CR1 근사: 클러스터별 가중 잔차 합의 제곱을 더한 sandwich 분산 +
-        # 작은 표본 보정계수 (m/(m-1)).
-        meat = 0.0
-        for cl in set(clusters):
-            mask = clusters == cl
-            meat += (np.sum(wi[mask] * (yi[mask] - beta))) ** 2
-        var_robust = meat / (np.sum(wi) ** 2)
-        adj = n_clusters / (n_clusters - 1) if n_clusters > 1 else 1.0
-        se = float(np.sqrt(var_robust * adj))
-        df_used = max(1, n_clusters - 1)
-    else:
-        se = float(np.sqrt(1 / np.sum(wi)))
-        df_used = max(1, k - 1)
-
-    tcrit = float(t_dist.ppf(0.975, df_used))
-    ci = (beta - tcrit * se, beta + tcrit * se)
-    p_value = float(2 * (1 - t_dist.cdf(abs(beta / se), df_used)))
-
-    pi_se = np.sqrt(se ** 2 + tau2)
-    pi = (beta - tcrit * pi_se, beta + tcrit * pi_se) if k >= 3 else (float("nan"), float("nan"))
-
+    if n_clusters == len(yi):
+        return _pooled_from_rma(rmeta.rma_reml(yi, vi, test="knha"))
+    m = rmeta.fit_three_level(yi, vi, clusters)
+    q = rmeta.rma_reml(yi, vi, test="z").q
+    from scipy.stats import chi2 as _chi2
     return PooledResult(
-        beta=beta, se=se, ci=ci, df=df_used, p_value=p_value,
-        tau2=tau2, q=q, q_df=dfree, p_het=p_het, i2=i2,
-        k=k, n_clusters=n_clusters, prediction_interval=pi, clustered=clustered,
+        beta=m.mu, se=m.cr2_se, ci=(m.cr2_ci_lb, m.cr2_ci_ub), df=m.cr2_df, p_value=m.cr2_p,
+        tau2=m.tau2_L2 + m.tau2_L3, q=q, q_df=m.k - 1, p_het=float(_chi2.sf(q, m.k - 1)), i2=m.i2,
+        k=m.k, n_clusters=m.n_studies, prediction_interval=(m.pi_lb, m.pi_ub), clustered=True,
     )
 
 
@@ -188,31 +170,20 @@ class EggerResult:
     t_value: float
     p_value: float
     df: int
+    slope: float = float("nan")
 
 
 def eggers_test(effect_df: pd.DataFrame) -> EggerResult:
-    se = effect_df["se"].to_numpy()
-    yi = effect_df["yi"].to_numpy()
-    k = len(yi)
-    if k < 4:
+    """metafor::regtest(rma(REML, knha), model='rma', predictor='sei')와 동일.
+    t_value/p_value는 sei 기울기 검정(R egger_*.csv의 z, p), intercept는 se→0 극한 추정치.
+    R 파이프라인처럼 연구당 1개 점(study-level 집계)을 넣어야 한다."""
+    k = len(effect_df)
+    if k < 3:
         return EggerResult(float("nan"), float("nan"), float("nan"), float("nan"), 0)
-    precision = 1 / se
-    snd = yi / se  # standardized normal deviate
-    x = np.column_stack([np.ones(k), precision])
-    beta_hat, *_ = np.linalg.lstsq(x, snd, rcond=None)
-    resid = snd - x @ beta_hat
-    dfree = k - 2
-    sigma2 = float(np.sum(resid ** 2) / dfree) if dfree > 0 else float("nan")
-    cov = sigma2 * np.linalg.inv(x.T @ x)
-    se_intercept = float(np.sqrt(cov[0, 0]))
-    intercept = float(beta_hat[0])
-    tval = intercept / se_intercept if se_intercept > 0 else float("nan")
-    pval = float(2 * (1 - t_dist.cdf(abs(tval), dfree))) if dfree > 0 else float("nan")
-    return EggerResult(intercept=intercept, se=se_intercept, t_value=tval, p_value=pval, df=dfree)
+    r = rmeta.regtest_sei(effect_df)
+    return EggerResult(intercept=r.b0, se=float("nan"), t_value=r.stat, p_value=r.p, df=k - 2, slope=r.b1)
 
 
-# ---------------------------------------------------------------------------
-# 5. Forest plot (Cochrane 스타일 : Study / N·Mean·SD / SMD / 95% CI / Weight)
 # ---------------------------------------------------------------------------
 def _fmt(x, d=2):
     return "" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.{d}f}"
@@ -509,6 +480,9 @@ class ForestSummary:
     pi_lb: float | None = None
     pi_ub: float | None = None
     i2: float | None = None
+    tau2_L2: float | None = None     # 3-level 모형: 연구 내(effect) 분산
+    tau2_L3: float | None = None     # 3-level 모형: 연구 간(study) 분산
+    ci_note: str | None = None       # 예: "CR2 (Satterthwaite df = 10.8)"
 
 
 def prediction_interval(g: float, se: float | None, tau2: float | None, k: int | None):
@@ -540,8 +514,14 @@ def _n_fmt(x):
 
 
 def _num_fmt(x, d=1):
+    """평균·SD 표시. 단위가 작은 값(예: 0.126)이 0.1로 뭉개지지 않도록 3자리 유효숫자를 보장한다."""
     try:
-        return "" if x is None or pd.isna(x) else f"{float(x):.{d}f}"
+        if x is None or pd.isna(x):
+            return ""
+        v = float(x)
+        if v != 0 and abs(v) < 10:
+            return f"{v:.3g}"
+        return f"{v:.{d}f}"
     except Exception:
         return ""
 
@@ -623,8 +603,12 @@ def forest_plot_from_R(
         het_line = f"{het_line}    {pi_txt}" if het_line else pi_txt
     if het_line:
         note_bits.append(het_line)
-    if summary.tau2 is not None and not pd.isna(summary.tau2):
+    if summary.tau2_L2 is not None and summary.tau2_L3 is not None:
+        note_bits.append(f"τ²(L2) = {summary.tau2_L2:.3f}, τ²(L3) = {summary.tau2_L3:.3f}")
+    elif summary.tau2 is not None and not pd.isna(summary.tau2):
         note_bits.append(f"τ² = {summary.tau2:.3f}")
+    if summary.ci_note:
+        note_bits.append(f"95% CI: {summary.ci_note}")
     if summary.p_value is not None and not pd.isna(summary.p_value):
         p_txt = "< .001" if summary.p_value < 0.001 else f"= {summary.p_value:.3f}"
         note_bits.append(f"$p$ {p_txt}")
@@ -829,7 +813,10 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
     ax.axvline(summary.g, color=C_POOL, lw=1.3, zorder=3)
 
     if has_egger_line and len(se) >= 2 and np.ptp(se) > 1e-9:
-        slope, intercept = np.polyfit(se, yi, 1)
+        if egger is not None and np.isfinite(getattr(egger, "slope", float("nan"))):
+            slope, intercept = egger.slope, egger.intercept   # regtest(sei) 적합선
+        else:
+            slope, intercept = np.polyfit(se, yi, 1)
         ax.plot(intercept + slope * se_seq, se_seq, color=C_EGGER, ls="--", lw=1.7,
                 label=f"Egger line ($p$ {p_txt})", zorder=4)
 
@@ -845,7 +832,7 @@ def funnel_plot_from_R(sub: pd.DataFrame, summary: ForestSummary, egger: EggerRe
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.grid(axis="both", color="#E7E9EE", linewidth=0.6, alpha=0.7)
-    fig.text(0.5, 0.035, f"k = {k} effect sizes   |   Egger $p$ {p_txt}",
+    fig.text(0.5, 0.035, f"k = {k} studies (study-level aggregated)   |   Egger $p$ {p_txt}",
              fontsize=9.5, color="#555555", ha="center")
     fig.subplots_adjust(left=0.12, right=0.97, bottom=0.28, top=0.86)
     return fig
@@ -865,16 +852,15 @@ def fig_to_png_bytes(fig, dpi: int = 300) -> bytes:
 # ---------------------------------------------------------------------------
 
 def leave_one_out(effect_df: pd.DataFrame, cluster_col: str = "study") -> pd.DataFrame:
-    """연구를 한 편씩 제외하며 재계산한 pooled g 목록."""
+    """연구(cluster)를 한 편씩 통째로 제외하며 재계산한 pooled g 목록 (metafor leave1out과 동일 단위)."""
     rows = []
-    idx = effect_df.index.to_numpy()
-    for i in idx:
-        sub = effect_df.drop(index=i)
-        if len(sub) < 2:
+    clusters = effect_df[cluster_col].astype(str)
+    for name in pd.unique(clusters):
+        sub = effect_df[clusters != name]
+        if sub[cluster_col].nunique() < 2:
             continue
         p = pool_random_effects(sub, cluster_col=cluster_col)
-        rows.append({"study": str(effect_df.loc[i, "study"]), "g": p.beta,
-                    "ci_lo": p.ci[0], "ci_hi": p.ci[1], "i2": p.i2})
+        rows.append({"study": name, "g": p.beta, "ci_lo": p.ci[0], "ci_hi": p.ci[1], "i2": p.i2})
     return pd.DataFrame(rows)
 
 
@@ -1029,32 +1015,14 @@ def gosh_plot(effect_df: pd.DataFrame, n_iter: int = 1500, min_frac: float = 0.5
 
 
 def trim_and_fill(effect_df: pd.DataFrame, cluster_col: str = "study") -> dict:
-    """Duval & Tweedie 순위기반(L0) 추정치를 이용한 근사 trim-and-fill.
-    R metafor::trimfill()의 반복 알고리즘과 완전히 동일하지는 않은 근사치이다."""
+    """metafor::trimfill(rma(REML, knha), estimator='L0')와 동일(반복 추정, side 자동).
+    R과 마찬가지로 원 추정치는 knha, 채운 뒤 재적합은 z 검정 CI다."""
     work = effect_df[[cluster_col, "yi", "vi"]].copy().rename(columns={cluster_col: "study"})
-    work = work.sort_values("yi").reset_index(drop=True)
-    n = len(work)
-    if n < 3:
+    if len(work) < 3:
         raise ValueError("Trim-and-fill에는 최소 3개 이상의 연구가 필요합니다.")
-    pooled0 = pool_random_effects(work, cluster_col="study")
-    centered = (work["yi"] - pooled0.beta).to_numpy()
-    ranks = pd.Series(np.abs(centered)).rank().to_numpy()
-    signs = np.sign(centered)
-    Sr = float(np.sum(ranks[signs > 0]))
-    L0 = (4 * Sr - n * (n + 1)) / (2 * n - 1)
-    n0 = max(0, min(n - 1, int(round(L0))))
-
-    if n0 == 0:
-        return {"n_missing": 0, "original": pooled0, "adjusted": pooled0, "augmented": work}
-
-    order = np.argsort(-np.abs(centered))
-    trimmed_idx = order[:n0]
-    mirrored = work.iloc[trimmed_idx].copy()
-    mirrored["yi"] = 2 * pooled0.beta - mirrored["yi"].to_numpy()
-    mirrored["study"] = mirrored["study"].astype(str) + " (filled)"
-    augmented = pd.concat([work, mirrored], ignore_index=True)
-    pooled1 = pool_random_effects(augmented, cluster_col="study")
-    return {"n_missing": n0, "original": pooled0, "adjusted": pooled1, "augmented": augmented}
+    tf = rmeta.trimfill_l0(work)
+    return {"n_missing": tf["k0"], "side": tf["side"], "original": _pooled_from_rma(tf["original"]),
+            "adjusted": _pooled_from_rma(tf["adjusted"]), "augmented": tf["points"]}
 
 
 def trim_fill_plot(tf_result: dict, title: str = "Trim-and-fill sensitivity") -> "plt.Figure":
@@ -1072,7 +1040,7 @@ def trim_fill_plot(tf_result: dict, title: str = "Trim-and-fill sensitivity") ->
     ax.set_yticklabels([title])
     ax.set_ylim(0.4, 1.6)
     ax.set_xlabel("Effect size (g)")
-    ax.set_title(f"Trim-and-fill adjusted effect (est. {tf_result['n_missing']} missing studies, approx.)",
+    ax.set_title(f"Trim-and-fill adjusted effect (k0 = {tf_result['n_missing']}, side = {tf_result.get('side', '?')})",
                 fontsize=12, loc="left", fontweight="bold")
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=9, frameon=True)
     ax.spines["top"].set_visible(False)

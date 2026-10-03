@@ -11,7 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -30,6 +30,7 @@ from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.svm import LinearSVC
 from scipy.stats import beta as _beta_dist
+from scipy.stats import t as _t_dist
 
 # 문장 임베딩(의미 기반) 신호는 선택적 의존성이다. requirements.txt에
 # sentence-transformers가 없거나 배포 환경에서 모델 다운로드가 막혀 있어도
@@ -70,6 +71,9 @@ REFERENCE_BENCHMARK = {
 MIN_LABELS_FOR_SUPERVISED = 100
 TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
+# 층화 추출: PICO 점수 순위 경계(상위 10%, 상위 40%)와 층별 표본 배분(합 1.0)
+STRATUM_BOUNDS = (None, 0.40)  # High는 상위 n_high편 전수, Mid는 그 아래~상위 40%
+STRATUM_ALLOCATION = (0.50, 0.35, 0.15)
 
 # 엑셀 다운로드 시 구간 순서와 배경색. False Negative는 실제 라벨이 Include인데
 # 컷오프 밖으로 밀려난, 눈에 띄어야 하는 문헌이라 원래 버킷에서 따로 떼어내
@@ -194,10 +198,11 @@ def build_training_sample(
     criteria_text: str,
     exclusion_text: str = "",
     sample_size: int = TRAINING_SAMPLE_SIZE,
+    random_state: int = 42,
 ) -> pd.DataFrame:
     """전체 코퍼스에서 학습 가치가 높은 문헌을 빠르게 한 번에 뽑는다.
 
-    200편을 높은 PICO 적합도 50%, 경계 35%, 낮은 적합도 15%로 구성한다.
+    PICO 점수 상위 100편은 전수, 그 아래~상위 40%에서 70편, 하위 60%에서 30편을 무작위 추출한다.
     이 단계는 의도적으로 가벼운 TF-IDF만 사용해 8천~수만 편에서도 빠르게 끝나며,
     실제 최종 지도학습 모델은 이후 200편 라벨을 이용해 별도로 학습한다.
     """
@@ -240,45 +245,54 @@ def build_training_sample(
         excl_score = np.zeros(len(docs), dtype=float)
     scores = np.asarray(pico_score - 0.75 * excl_score, dtype=float)
 
+    # 층화 표본: 상위층은 전수(take-all), 나머지 층은 무작위.
+    # - High: PICO 점수 상위 n_high편을 그대로 선택(추출확률 1, weight 1). Include를
+    #   최대한 확보해 모델 학습력을 유지한다(예전 방식과 동일한 편수).
+    # - Mid/Low: 나머지를 점수 순위로 두 층으로 나눠 각 층에서 무작위 추출하고
+    #   Sampling_Weight = 층 크기 / 추출 편수를 붙인다. 이 가중치로 임계값을 정하면
+    #   저관련 영역에 숨은 Include까지 반영한 코퍼스 기준 Recall을 추정할 수 있다.
+    # 라벨 수(200)는 그대로다.
     n = min(int(sample_size), len(base))
-    n_high = int(round(n * 0.50))
-    n_boundary = int(round(n * 0.35))
-    n_low = n - n_high - n_boundary
-    ranked = np.argsort(scores)
+    rng = np.random.default_rng(random_state)
+    order = np.argsort(-scores, kind="stable")
+    alloc = [int(round(n * a)) for a in STRATUM_ALLOCATION]
+    alloc[-1] = n - sum(alloc[:-1])
 
-    # 데이터 자체의 점수 분포에서 중앙 경계를 잡고 그 주변을 uncertainty 표본으로 사용.
-    boundary = float(_otsu_threshold(scores))
-    boundary_order = np.argsort(np.abs(scores - boundary))
-
-    selected: list[tuple[int, str]] = []
-    used_idx: set[int] = set()
+    selected: list[tuple[int, str, float]] = []
     used_titles: set[str] = set()
 
-    def add(indices, label, limit):
-        count = 0
-        for raw_idx in indices:
-            idx = int(raw_idx)
-            title_key = titles.iloc[idx].strip().casefold()
-            if idx in used_idx or not title_key or title_key in used_titles:
+    def _take(pool, want):
+        picked = []
+        for idx in pool:
+            idx = int(idx)
+            key = titles.iloc[idx].strip().casefold()
+            if not key or key in used_titles:
                 continue
-            used_idx.add(idx)
-            used_titles.add(title_key)
-            selected.append((idx, label))
-            count += 1
-            if count >= limit:
+            used_titles.add(key)
+            picked.append(idx)
+            if len(picked) >= want:
                 break
+        return picked
 
-    add(ranked[::-1], "High PICO relevance", n_high)
-    add(boundary_order, "Decision boundary", n_boundary)
-    add(ranked, "Low PICO relevance", n_low)
-    if len(selected) < n:
-        # 중복 제목 때문에 부족한 경우 전체 점수 순위에서 남은 문헌으로 보충.
-        add(ranked[::-1], "Supplemental", n - len(selected))
+    high = _take(order, alloc[0])
+    selected.extend((i, "High PICO relevance", 1.0) for i in high)
+    k_high = (int(np.where(order == high[-1])[0][0]) + 1) if high else 0
+    cut_mid = max(k_high + 1, int(np.ceil(len(order) * STRATUM_BOUNDS[1])))
+    carry = 0
+    for label, members, want in [
+        ("Mid PICO relevance", order[k_high:cut_mid], alloc[1]),
+        ("Low PICO relevance", order[cut_mid:], alloc[2]),
+    ]:
+        picked = _take(rng.permutation(members), want + carry)
+        carry = want + carry - len(picked)
+        weight = len(members) / len(picked) if picked else 0.0
+        selected.extend((i, label, weight) for i in picked)
 
     rows = []
-    for idx, stratum in selected[:n]:
+    for idx, stratum, weight in selected[:n]:
         row = base.iloc[idx].copy()
         row["Training_Stratum"] = stratum
+        row["Sampling_Weight"] = round(float(weight), 6)
         rows.append(row)
     out = pd.DataFrame(rows).reset_index(drop=True)
     out.insert(0, "Training_No", np.arange(1, len(out) + 1))
@@ -296,6 +310,8 @@ def merge_training_labels(full_df: pd.DataFrame, labeled_sample_df: pd.DataFrame
     labels = sample_prepared["Human_Label"]
 
     full["Human_Label"] = np.nan
+    full["Sampling_Weight"] = np.nan
+    has_w = "Sampling_Weight" in sample.columns
     matched = 0
     if "_Source_Index" in sample.columns:
         for i, lab in labels.items():
@@ -307,6 +323,8 @@ def merge_training_labels(full_df: pd.DataFrame, labeled_sample_df: pd.DataFrame
                 continue
             if 0 <= idx < len(full):
                 full.loc[idx, "Human_Label"] = int(lab)
+                if has_w:
+                    full.loc[idx, "Sampling_Weight"] = pd.to_numeric(sample.loc[i, "Sampling_Weight"], errors="coerce")
                 matched += 1
     else:
         title_full = _find_col(full, ["title", "제목"])
@@ -323,6 +341,8 @@ def merge_training_labels(full_df: pd.DataFrame, labeled_sample_df: pd.DataFrame
             idx = lookup.get(key)
             if idx is not None:
                 full.loc[idx, "Human_Label"] = int(lab)
+                if has_w:
+                    full.loc[idx, "Sampling_Weight"] = pd.to_numeric(sample.loc[i, "Sampling_Weight"], errors="coerce")
                 matched += 1
 
     valid = full["Human_Label"].isin([0, 1])
@@ -843,10 +863,11 @@ def _build_pipeline(
     criteria_text: str = "",
     embedding_lookup: dict | None = None,
     sentence_pico_lookup: dict | None = None,
+    calib_cv: int = 3,
 ) -> Pipeline:
     features = _build_feature_union(criteria_text, embedding_lookup, sentence_pico_lookup)
     base = LinearSVC(class_weight="balanced")
-    model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
+    model = CalibratedClassifierCV(base, method="sigmoid", cv=calib_cv)
     return Pipeline([("features", features), ("model", model)])
 
 # ---------------------------------------------------------------------------
@@ -907,9 +928,7 @@ def _compute_safety_signals(
     signals: dict[str, dict] = {}
 
     def _run(name: str, pipeline: Pipeline):
-        cv_probs = cross_val_predict(pipeline, texts, y, cv=cv, method="predict_proba")[:, 1]
-        pipeline.fit(texts, y)
-        all_probs = pipeline.predict_proba(all_texts)[:, 1]
+        cv_probs, all_probs = _crossfit(pipeline, texts, y, cv, all_texts)
         signals[name] = {"cv": cv_probs, "all": all_probs}
 
     _run("word_tfidf", _build_word_only_pipeline())
@@ -949,17 +968,14 @@ RECALL_TARGET_PRESETS = [0.99, 0.95, 0.90]
 DEFAULT_RECALL_TARGET = 0.95
 
 # ---------------------------------------------------------------------------
-# 안전 제외 정족수(quorum). 예전에는 모든 신호(최대 6개)가 전부 동의해야만 안전
-# 제외로 인정했다(엄격한 AND). 신호 수가 늘어날수록 교집합이 기하급수적으로
-# 줄어들어, 신호를 추가할수록 오히려 실제 절감 효과가 작아지는 역설이 생긴다.
-# 대신 "서로 다른 근거를 가진 신호들 중 80% 이상이 각자의 허용 FN 기준을
-# 지키며 Exclude로 동의"하면 인정하도록 고정한다. 사용자가 매번 고를 수 있는
-# 옵션이 아니라 코드에 고정된 값이다 (항상 같은 기준으로 동작해야 신뢰할 수
-# 있고, 쓰는 사람 입장에서도 헷갈릴 옵션이 없어야 한다).
-# 100%(만장일치)보다 완화됐지만 여전히 압도적 다수의 동의를 요구하므로 안전성은
-# 크게 훼손하지 않으면서, 안전 제외 후보 수(=검토 절감량)를 늘린다.
+# 세 구간은 신호들을 스태킹한 단일 확률 하나로 나눈다.
+#  - 우선 검토: 확률 ≥ 목표 Recall(기본 95%)에서 WSS 최대인 임계값
+#  - 안전 제외: 확률 < 라벨 Include 점수의 99% 단측 예측구간 하한(외삽 여유 포함)
+#  - 경계 문헌: 그 사이
+# 이전 버전의 신호별 투표(정족수) 방식은 확률이 더 높은 문헌이 더 낮은 구간에 놓이는
+# 역전이 생겼고, 정족수를 데이터로 고르면 같은 라벨로 선택·검증하는 과적합이 확인되어 폐기했다.
 # ---------------------------------------------------------------------------
-SAFETY_QUORUM_RATIO = 2/3
+SAFE_RECALL_TARGET = 0.99
 
 
 def allowed_fn_from_recall_target(n_include: int, recall_target: float) -> int:
@@ -1011,87 +1027,117 @@ def work_saved_over_sampling(tn: int, fn: int, tp: int, fp: int) -> float:
     return float((tn + fn) / n - (1.0 - recall))
 
 
-def _optimize_threshold_wss(cv_probs: np.ndarray, y: np.ndarray, recall_target: float = 0.95) -> tuple[float, dict]:
-    """교차검증 Recall 제약을 만족하는 threshold 중 WSS가 가장 높은 값을 자동 선택한다."""
+def _weights_or_ones(weights, n: int) -> np.ndarray:
+    if weights is None:
+        return np.ones(n, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    return np.where(np.isfinite(w) & (w > 0), w, 1.0)
+
+
+def _optimize_threshold_wss(cv_probs: np.ndarray, y: np.ndarray, recall_target: float = 0.95, weights=None) -> tuple[float, dict]:
+    """교차검증 Recall 제약을 만족하는 threshold 중 WSS가 가장 높은 값을 자동 선택한다.
+    weights(Sampling_Weight)가 있으면 Recall·WSS를 층화 표본 가중치로 계산해 코퍼스 기준 추정치로 쓴다."""
     probs = np.asarray(cv_probs, dtype=float)
     y = np.asarray(y, dtype=int)
+    w = _weights_or_ones(weights, len(y))
     candidates = np.unique(np.r_[0.0, probs, 1.0])
     best = None
     for thr in candidates:
-        pred = (probs >= thr).astype(int)
-        tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+        pred = probs >= thr
+        tp = w[(y == 1) & pred].sum(); fn = w[(y == 1) & ~pred].sum()
+        fp = w[(y == 0) & pred].sum(); tn = w[(y == 0) & ~pred].sum()
         rec = tp / (tp + fn) if (tp + fn) else 0.0
         if rec + 1e-12 < float(recall_target):
             continue
         wss = work_saved_over_sampling(tn, fn, tp, fp)
-        burden = (tp + fp) / len(y) if len(y) else 1.0
+        burden = (tp + fp) / w.sum() if w.sum() else 1.0
         score = (wss, -burden, thr)
         if best is None or score > best[0]:
-            best = (score, float(thr), {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp), "recall": float(rec), "wss": float(wss), "burden": float(burden)})
+            best = (score, float(thr), {"tn": float(tn), "fp": float(fp), "fn": float(fn), "tp": float(tp), "recall": float(rec), "wss": float(wss), "burden": float(burden)})
     if best is None:
         return 0.0, {"recall": 1.0, "wss": 0.0, "burden": 1.0}
     return best[1], best[2]
 
 
-def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int) -> float:
-    inc_probs = np.sort(np.asarray(cv_probs, dtype=float)[np.asarray(y) == 1])
-    if len(inc_probs) == 0:
+def _fn_budget_cutoff(cv_probs: np.ndarray, y: np.ndarray, allowed_fn: int, weights=None) -> float:
+    """라벨 Include 중 확률이 낮은 쪽부터 허용 FN만큼만 컷오프 아래로 두는 가장 관대한 컷오프.
+    weights가 있으면 '허용 FN 편수'를 Include 가중합의 같은 비율(allowed_fn / n_include)로 환산한다."""
+    probs = np.asarray(cv_probs, dtype=float)
+    y = np.asarray(y)
+    inc_mask = y == 1
+    if not inc_mask.any():
         return 0.5
+    order = np.argsort(probs[inc_mask], kind="stable")
+    inc_probs = probs[inc_mask][order]
+    inc_w = _weights_or_ones(None if weights is None else np.asarray(weights)[inc_mask], inc_mask.sum())[order]
     allowed_fn = max(0, int(allowed_fn))
     if allowed_fn >= len(inc_probs):
-        return 0.0  # 전부 놓쳐도 된다면 사실상 컷오프 없음 (거의 모든 문헌이 후보가 될 수 있음)
-    return float(inc_probs[allowed_fn])
+        return 0.0
+    allowed_mass = allowed_fn / len(inc_probs) * inc_w.sum()
+    k = int(np.searchsorted(np.cumsum(inc_w), allowed_mass + 1e-9, side="right"))
+    return float(inc_probs[min(k, len(inc_probs) - 1)])
 
 
-def _recompute_unanimous_exclude(pred_df: pd.DataFrame, allowed_fn: int):
-    """저장된 각 신호의 (라벨 데이터 교차검증 확률, 전체 데이터 확률) 컬럼으로부터
-    신호별 '허용 FN' 컷오프를 다시 계산하고, 신호들 중 SAFETY_QUORUM_RATIO(80%) 이상이
-    각자의 컷오프보다 낮을 때 안전 제외 후보로 인정한다 (만장일치가 아닌 고정 정족수).
-    모델을 재학습하지 않고 저장된 확률만 사용하므로 허용 FN 값을 바꿔도 즉시 재계산된다.
-    함수/컬럼 이름은 하위 호환을 위해 유지한다.
-    """
-    signal_names = [c[len("Prob_"):] for c in pred_df.columns if c.startswith("Prob_")]
-    mask = pred_df["Human_Label_Normalized"].isin([0, 1])
-    if signal_names:
-        first_cv_col = f"CV_Prob_{signal_names[0]}"
-        mask = mask & pred_df[first_cv_col].notna()
-    y = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
+def _safe_exclude_cutoff(cv_probs: np.ndarray, y: np.ndarray, level: float = 0.99) -> float:
+    """안전 제외 컷오프. 라벨 Include의 CV 점수(logit)에 정규분포를 가정하고, 새 Include 한 편이
+    이 값보다 낮을 확률이 (1-level)이 되는 단측 예측구간 하한을 쓴다.
+        cut = sigmoid(mean - t_{level, n-1} · sd · sqrt(1 + 1/n))
+    라벨 Include 중 최저값보다 더 아래로 외삽하므로, 라벨 Include가 적거나 점수가 흩어져
+    있을수록 기준선이 자동으로 내려가 안전 제외가 줄어든다(라벨 Include 3편 미만이면 0편).
+    '가장 낮은 라벨 Include' 기준은 SYNERGY 벤치마크에서 실제 Recall이 27–89%까지
+    떨어져 폐기했다."""
+    probs = np.asarray(cv_probs, dtype=float)
+    inc = probs[np.asarray(y) == 1]
+    if len(inc) < 3:
+        return 0.0
+    z = _logit(inc)
+    n = len(z)
+    lower = z.mean() - _t_dist.ppf(level, n - 1) * z.std(ddof=1) * np.sqrt(1 + 1 / n)
+    return float(min(1 / (1 + np.exp(-lower)), inc.min()))
 
-    n = len(pred_df)
-    n_signals = len(signal_names)
-    # 정족수: 신호 수의 80% 이상이 동의해야 안전 제외 인정 (SAFETY_QUORUM_RATIO, 고정값).
-    # ceil을 써서 예를 들어 신호가 6개면 5개 이상, 5개면 4개 이상 동의를 요구한다
-    # (80%의 소수점 결과를 내림하면 요구 조건이 실질적으로 더 느슨해져 버리므로 올림 사용).
-    quorum_needed = int(np.ceil(SAFETY_QUORUM_RATIO * n_signals)) if n_signals else 0
 
-    agree_all = np.zeros(n, dtype=int)
-    agree_cv_labeled = np.zeros(int(mask.sum()), dtype=int)
-    safety_terms = []
-    for name in signal_names:
-        cv_probs = pd.to_numeric(pred_df.loc[mask, f"CV_Prob_{name}"], errors="coerce").to_numpy()
-        cutoff = _fn_budget_cutoff(cv_probs, y, allowed_fn) if len(cv_probs) else 0.5
-        all_probs = pd.to_numeric(pred_df[f"Prob_{name}"], errors="coerce").to_numpy()
-        agree_all += (all_probs < cutoff).astype(int)
-        agree_cv_labeled += (cv_probs < cutoff).astype(int)
-        safety_terms.append(1.0 - all_probs)
+def _crossfit(pipeline, texts: np.ndarray, y: np.ndarray, cv: StratifiedKFold, all_texts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """fold 모델로 (라벨 문헌 OOF 확률, 전체 문헌에 대한 fold 모델 평균 확률)을 함께 계산한다.
+    임계값을 정한 확률 분포(fold 모델)와 비라벨 문헌에 적용하는 확률 분포를 일치시키기 위함이다
+    (전체 재학습 모델은 확률 분포가 fold 모델과 달라 CV 임계값의 의미가 흔들린다)."""
+    oof = np.zeros(len(y), dtype=float)
+    all_sum = np.zeros(len(all_texts), dtype=float)
+    k = 0
+    for tr, va in cv.split(texts, y):
+        model = clone(pipeline)
+        model.fit(texts[tr], y[tr])
+        oof[va] = model.predict_proba(texts[va])[:, 1]
+        all_sum += model.predict_proba(all_texts)[:, 1]
+        k += 1
+    return oof, all_sum / max(k, 1)
 
-    quorum_all = agree_all >= quorum_needed
-    quorum_cv_labeled = agree_cv_labeled >= quorum_needed
 
-    safety_score = np.mean(safety_terms, axis=0) if safety_terms else np.zeros(n)
-    safe_exclude_cv_n = int(quorum_cv_labeled.sum())
-    safe_exclude_cv_fn = int(((y == 1) & quorum_cv_labeled).sum())
-    return quorum_all, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn
+def _logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=float), 1e-4, 1 - 1e-4)
+    return np.log(p / (1 - p))
+
+
+def _stack_signals(signals: dict, y: np.ndarray, cv: StratifiedKFold, labeled_pos: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
+    """신호별 OOF 확률을 입력으로 하는 메타 로지스틱 회귀(stacking)로 단일 확률을 만든다.
+    투표 대신 하나의 연속 점수로 세 구간을 나누므로, 확률이 높은 문헌이 더 낮은 구간에
+    배치되는 역전이 생기지 않는다."""
+    names = sorted(signals)
+    x_cv = np.column_stack([_logit(signals[n]["cv"]) for n in names])
+    x_all = np.column_stack([_logit(signals[n]["all"]) for n in names])
+    meta = LogisticRegression(C=1.0, class_weight="balanced", max_iter=2000)
+    oof = cross_val_predict(meta, x_cv, y, cv=cv, method="predict_proba")[:, 1]
+    meta.fit(x_cv, y)
+    all_p = meta.predict_proba(x_all)[:, 1]
+    all_p[labeled_pos] = oof
+    return oof, all_p, {n: float(c) for n, c in zip(names, meta.coef_[0])}
 
 
 def _priority_labels(probabilities: np.ndarray, threshold: float, unanimous_exclude: np.ndarray) -> np.ndarray:
-    """확률과 다중 모델 합의를 실제 검토 목적에 맞는 3단계로 구분한다.
+    """스태킹 확률을 3단계로 구분한다.
 
-    - 우선 검토: Include 확률이 임계값 이상 (흰색)
-    - 안전 제외 후보: 임계값 미만이면서, Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM(메인 모델),
-      PICO 유사도(있는 경우) 등 서로 다른 근거를 가진 신호들 중 80% 이상(고정 정족수)이
-      "허용 FN 이하" 조건을 각자 만족하며 Exclude 방향으로 동의 (진한 회색)
-    - 경계 문헌: 임계값 미만이지만 모델들의 의견이 갈리는 경우, 사람이 반드시 확인 (중간 회색)
+    - 우선 검토: 확률이 임계값 이상 (흰색)
+    - 안전 제외 후보: 확률이 안전 컷오프 미만 (진한 회색)
+    - 경계 문헌: 그 사이, 사람이 반드시 확인 (중간 회색)
     """
     probabilities = np.asarray(probabilities, dtype=float)
     unanimous_exclude = np.asarray(unanimous_exclude, dtype=bool)
@@ -1122,19 +1168,21 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
     mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
     y_labeled = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
     cv_probs_main = pd.to_numeric(pred_df.loc[mask, "CV_Probability"], errors="coerce").to_numpy()
-    threshold = _fn_budget_cutoff(cv_probs_main, y_labeled, allowed_fn)
+    w_labeled = (pd.to_numeric(pred_df.loc[mask, "Sampling_Weight"], errors="coerce").to_numpy()
+                 if "Sampling_Weight" in pred_df.columns else None)
+    threshold = _fn_budget_cutoff(cv_probs_main, y_labeled, allowed_fn, w_labeled)
     updated.threshold = threshold
 
     probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
-    unanimous_exclude, safety_score, safe_exclude_cv_n, safe_exclude_cv_fn = _recompute_unanimous_exclude(
-        pred_df, allowed_fn
-    )
-    pred_df["Safety_Score"] = safety_score
-    pred_df["Unanimous_Exclude"] = unanimous_exclude
-    pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, unanimous_exclude)
+    safe_cut = min(_safe_exclude_cutoff(cv_probs_main, y_labeled, SAFE_RECALL_TARGET), threshold)
+    safe_all = probs < safe_cut
+    safe_cv = cv_probs_main < safe_cut
+    pred_df["Unanimous_Exclude"] = safe_all
+    pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, safe_all)
     updated.metrics["allowed_fn"] = int(allowed_fn)
-    updated.metrics["safe_exclude_cv_n"] = safe_exclude_cv_n
-    updated.metrics["safe_exclude_cv_false_negatives"] = safe_exclude_cv_fn
+    updated.metrics["safe_cutoff"] = float(safe_cut)
+    updated.metrics["safe_exclude_cv_n"] = int(safe_cv.sum())
+    updated.metrics["safe_exclude_cv_false_negatives"] = int(((y_labeled == 1) & safe_cv).sum())
 
     cv_pred = (cv_probs_main >= threshold).astype(int)
     pred_df.loc[:, "CV_Prediction"] = np.nan
@@ -1151,11 +1199,8 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
         "f1": float(2 * pre * rec / (pre + rec)) if pre + rec > 0 else 0.0,
         "measured_fn": int(fn),
         "wss": work_saved_over_sampling(tn, fn, tp, fp),
-        "threshold_strategy": "Recall-constrained WSS optimization",
-        "cv_screening_burden": float(threshold_info.get("burden", 1.0)),
-        "title_abstract_separate": True,
-        "sentence_pico_used": sentence_pico_lookup is not None,
-        "prototype_similarity_used": True,
+        "threshold": float(threshold),
+        "threshold_strategy": "FN-budget cutoff (manual)",
     })
 
     updated.predictions = _sort_by_priority(pred_df)
@@ -1201,6 +1246,11 @@ def train_and_predict(
 
     min_class = int(labeled["Human_Label"].value_counts().min())
     folds = max(2, min(5, min_class))
+    # 외부 fold의 학습 부분에 남는 소수 클래스 수에 맞춰 내부 보정(calibration) fold를 줄인다.
+    # (Include가 적을 때 "less than 3 examples" 오류로 학습이 중단되던 문제)
+    calib_cv = min(3, min_class - int(np.ceil(min_class / folds)))
+    if calib_cv < 2:
+        raise ValueError(f"Include 라벨이 {min_class}편뿐이라 교차검증을 할 수 없습니다. Include가 최소 4편 이상 필요합니다.")
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
 
     # 의미 임베딩은 전체 문헌 텍스트에 대해 한 번만 계산한다 (고정 가중치 인코더라
@@ -1215,21 +1265,27 @@ def train_and_predict(
         embedding_lookup = {str(k): v for k, v in zip(all_texts, vecs)}
     sentence_pico_lookup = build_sentence_pico_lookup(all_texts, data["Abstract"].to_numpy(), criteria_text)
 
-    # 메인 랭킹 모델(전체 파이프라인: TF-IDF + PICO 유사도 + [임베딩] + 선형 SVM)을 fold마다
-    # 처음부터 다시 학습한다. train만으로 학습하기 때문에 검증 성능이 부풀려지지 않는다.
-    probs = cross_val_predict(
-        _build_pipeline(criteria_text, embedding_lookup, sentence_pico_lookup), texts, y, cv=cv, method="predict_proba"
-    )[:, 1]
+    raw = df.reset_index(drop=True)
+    weights = (pd.to_numeric(raw.loc[labeled.index, "Sampling_Weight"], errors="coerce").to_numpy()
+               if "Sampling_Weight" in raw.columns else None)
+    labeled_pos = labeled.index.to_numpy()
 
-    # Precision-Recall 곡선은 참고용 차트로만 계산해서 보여준다 (임계값 결정에는 쓰지 않음).
+    # 모든 신호를 cross-fit으로 계산한다: 라벨 문헌은 OOF 확률, 비라벨 문헌은 fold 모델 평균.
+    main_pipeline = _build_pipeline(criteria_text, embedding_lookup, sentence_pico_lookup, calib_cv)
+    svm_cv, svm_all = _crossfit(main_pipeline, texts, y, cv, all_texts)
+    svm_all[labeled_pos] = svm_cv
+    signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text, embedding_lookup, sentence_pico_lookup)
+    signals["linear_svm"] = {"cv": svm_cv, "all": svm_all}
+    for sig in signals.values():
+        sig["all"][labeled_pos] = sig["cv"]
+
+    probs, all_probs, stack_coef = _stack_signals(signals, y, cv, labeled_pos)
+
     precision, recall, pr_thresholds = precision_recall_curve(y, probs)
     fpr, tpr, _ = roc_curve(y, probs)
 
-    # 임계값은 '허용 FN 개수'로 직접 정한다: 라벨 Include 중 확률이 가장 낮은
-    # allowed_fn개까지만 임계값 아래로 떨어지도록 하는 가장 관대한(=검토량이 가장 적은)
-    # 임계값을 선택한다. allowed_fn은 위에서 recall_target으로부터 자동 계산되었으므로,
-    # "몇 편 놓쳐도 되는가"를 매번 감으로 정하는 게 아니라 고정된 재현율 정책에서 유도된다.
-    threshold, threshold_info = _optimize_threshold_wss(probs, y, recall_target)
+    # 우선 검토 임계값: (가중) Recall ≥ 목표를 만족하면서 WSS가 최대인 값.
+    threshold, threshold_info = _optimize_threshold_wss(probs, y, recall_target, weights)
     pred = (probs >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
 
@@ -1250,30 +1306,20 @@ def train_and_predict(
         "include_n": n_include,
         "embedding_signal_used": embedding_lookup is not None,
         "wss": work_saved_over_sampling(tn, fn, tp, fp),
+        "recall_weighted": float(threshold_info.get("recall", 1.0)),
+        "wss_weighted": float(threshold_info.get("wss", 0.0)),
+        "sampling_weighted": weights is not None,
         "threshold": float(threshold),
-        "threshold_strategy": "Recall-constrained WSS optimization",
+        "threshold_strategy": "Recall-constrained WSS optimization (sampling-weighted)" if weights is not None else "Recall-constrained WSS optimization",
+        "tier_method": "stacking",
+        "stack_coefficients": stack_coef,
     }
 
-    # 같은 CV 예측값에서 100% recall을 강제했을 때의 참고 성능도 계산한다.
-    # 모델을 재학습하거나 추가 human labeling을 요구하지 않는다.
-    threshold_100, info_100 = _optimize_threshold_wss(probs, y, 1.0)
+    threshold_100, info_100 = _optimize_threshold_wss(probs, y, 1.0, weights)
     metrics["threshold_100"] = float(threshold_100)
     metrics["wss_100"] = float(info_100.get("wss", 0.0))
     metrics["burden_100"] = float(info_100.get("burden", 1.0))
     metrics["fn_100"] = int(info_100.get("fn", 0))
-
-    # 메인 모델을 전체 라벨 데이터로 최종 학습해 전체 문헌(라벨 없는 것 포함)에
-    # 대한 확률을 계산한다.
-    final_pipeline = _build_pipeline(criteria_text, embedding_lookup, sentence_pico_lookup)
-    final_pipeline.fit(texts, y)
-    all_probs = final_pipeline.predict_proba(all_texts)[:, 1]
-
-    # --- 안전 제외 후보: 서로 다른 근거를 가진 신호들이 "각자 같은 허용 FN
-    # 기준으로도 안전한" 컷오프 아래일 때만 인정한다. 최대한 많이 거르는 것이
-    # 아니라, 거의 틀리지 않는 것만 거른다. (word/char TF-IDF, 로지스틱 회귀,
-    # PICO 유사도, 의미 임베딩, 선형 SVM 최대 6개 신호)
-    aux_signals = _compute_safety_signals(texts, y, cv, all_texts, criteria_text, embedding_lookup, sentence_pico_lookup)
-    aux_signals["linear_svm"] = {"cv": probs, "all": all_probs}  # 메인 모델도 하나의 투표로 포함
 
     result_df = df.copy().reset_index(drop=True)
     result_df["AI_Probability"] = all_probs
@@ -1286,24 +1332,23 @@ def train_and_predict(
     result_df["False_Negative"] = False
     result_df.loc[labeled.index, "False_Negative"] = (y == 1) & (pred == 0)
 
-    for name, sig in aux_signals.items():
+    for name, sig in signals.items():
         result_df[f"Prob_{name}"] = sig["all"]
         result_df[f"CV_Prob_{name}"] = np.nan
         result_df.loc[labeled.index, f"CV_Prob_{name}"] = sig["cv"]
 
-    unanimous_exclude_all, safety_score_all, safe_exclude_cv_n, safe_exclude_cv_fn = _recompute_unanimous_exclude(
-        result_df, allowed_fn
-    )
-    # 라벨 데이터에서 "안전 제외 후보로 분류되었지만 실제로는 Include였던" 건수를
-    # 교차검증 기준으로 집계한다. 5개 신호 모두 같은 허용 FN 기준으로 컷오프를 잡고
-    # 교집합(모두 동의)만 인정하므로, 이 값은 수학적으로 allowed_fn을 넘을 수 없다.
-    metrics["safe_exclude_cv_n"] = safe_exclude_cv_n
-    metrics["safe_exclude_cv_false_negatives"] = safe_exclude_cv_fn
-    metrics["safety_signal_count"] = len(aux_signals)
-
-    result_df["Safety_Score"] = safety_score_all
-    result_df["Unanimous_Exclude"] = unanimous_exclude_all
-    result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, unanimous_exclude_all)
+    # 안전 제외: 라벨 Include 점수 분포의 99% 단측 예측구간 하한 아래(_safe_exclude_cutoff).
+    safe_cut = min(_safe_exclude_cutoff(probs, y, SAFE_RECALL_TARGET), threshold)
+    safe_all = all_probs < safe_cut
+    safe_cv = probs < safe_cut
+    metrics["safe_cutoff"] = float(safe_cut)
+    metrics["safe_recall_target"] = float(SAFE_RECALL_TARGET)
+    metrics["safe_exclude_cv_n"] = int(safe_cv.sum())
+    metrics["safe_exclude_cv_false_negatives"] = int(((y == 1) & safe_cv).sum())
+    result_df["Safety_Score"] = 1.0 - all_probs
+    metrics["safety_signal_count"] = len(signals)
+    result_df["Unanimous_Exclude"] = safe_all
+    result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, safe_all)
     result_df["AI_Exclusion_Signal"] = [_obvious_exclusion_reason(t, a) for t, a in zip(data["Title"], data["Abstract"])]
 
     result_df = _sort_by_priority(result_df)
@@ -1370,7 +1415,7 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
 
     for col_idx, col_name in enumerate(export_df.columns, start=1):
         sample = export_df[col_name].astype(str).head(200).tolist()
-        max_len = max([len(str(col_name))] + [len(v) for v in sample]) if sample else len(str(col_name))
+        max_len = max([len(str(col_name))] + [len(str(v)) for v in sample]) if sample else len(str(col_name))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(60, max(10, max_len + 2))
 
     ws.freeze_panes = "A2"
@@ -1381,9 +1426,9 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
     legend_ws["B1"].font = Font(bold=True)
     legend_rows = [
         ("우선 검토", "Include 확률이 임계값 이상인 문헌. 사람이 우선적으로 확인해야 합니다."),
-        ("경계 문헌", "임계값 미만이지만 Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도, (가능한 경우) 의미 임베딩 모델들의 의견이 갈리는 문헌. 반드시 사람이 확인해야 합니다."),
+        ("경계 문헌", "스태킹 확률이 우선 검토 임계값과 안전 제외 컷오프 사이인 문헌. 반드시 사람이 확인해야 합니다."),
         ("False Negative", "실제 라벨은 Include였지만 교차검증에서 임계값 아래로 예측된 문헌. 모델 개선 및 재확인이 필요합니다."),
-        ("안전 제외 후보", "서로 다른 근거를 가진 신호 모델들 중 80% 이상이, 목표 재현율로부터 자동 계산된 허용 FN 기준을 각자 지키면서 Exclude 방향으로 동의한 문헌. 사람이 읽지 않아도 되는 문헌입니다."),
+        ("안전 제외 후보", "Word/Char TF-IDF, 로지스틱 회귀, 선형 SVM, PICO 유사도, (가능한 경우) 의미 임베딩 신호를 스태킹한 확률이, 라벨 Include 점수 분포로부터 새 Include가 이보다 낮을 확률이 1%가 되도록 정한 컷오프 미만인 문헌. 사람이 읽지 않아도 되는 문헌으로 제안되지만, 200편 교차검증에 근거한 추정입니다."),
     ]
     for i, (name, desc) in enumerate(legend_rows, start=2):
         legend_ws.append([name, desc])

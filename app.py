@@ -236,6 +236,66 @@ if "nav" not in st.session_state:
 
 # 프로젝트를 열기 전에는 간결한 랜딩 화면과 최근 프로젝트만 표시
 
+import rmeta as _rmeta
+import zipfile as _zipfile
+
+
+def _forest_summary(fit_or_row, ci_mode: str, i2: float | None = None) -> ForestSummary:
+    """3-level 결과(Python 적합 또는 R pooled_*.csv 한 행) → ForestSummary.
+    ci_mode가 CR2이면 clubSandwich CR2/Satterthwaite CI·p, 아니면 rma.mv(test='t') CI·p."""
+    g = lambda name: float(getattr(fit_or_row, name))
+    use_cr2 = ci_mode.startswith("CR2") and np.isfinite(g("cr2_ci_lb"))
+    if use_cr2:
+        lo, hi, p, note = g("cr2_ci_lb"), g("cr2_ci_ub"), g("cr2_p"), f"CR2 (Satterthwaite df = {g('cr2_df'):.1f})"
+    else:
+        lo, hi = g("ci_lb"), g("ci_ub")
+        p = g("pval")
+        note = f"model-based t (df = {int(g('k')) - 1})"
+    return ForestSummary(
+        g=g("mu"), ci_lb=lo, ci_ub=hi, tau2=g("tau2_L2") + g("tau2_L3"), k=int(g("k")), p_value=p,
+        pi_lb=g("pi_lb"), pi_ub=g("pi_ub"), i2=i2, tau2_L2=g("tau2_L2"), tau2_L3=g("tau2_L3"), ci_note=note,
+    )
+
+
+def _r_style_from_effects(eff: pd.DataFrame, ci_mode: str):
+    """01_stat_analysis.R와 같은 순서로 계산한다.
+    effect 단위 3-level REML(+CR2) → forest 요약 / study 단위 CS 집계(rho=0.6) → REML+knha 진단."""
+    fit = _rmeta.fit_three_level(eff["yi"], eff["vi"], eff["study"])
+    summary = _forest_summary(fit, ci_mode, i2=fit.i2)
+    study_df = _rmeta.aggregate_cs(eff[["study", "yi", "vi"]])
+    return summary, fit.weights, study_df
+
+
+def _read_r_outputs_zip(uploaded) -> dict[str, dict[str, pd.DataFrame]]:
+    """r_outputs 폴더(또는 프로젝트 전체)를 압축한 zip에서 outcome별 CSV를 읽는다."""
+    want = ("effects", "pooled", "vardecomp", "study_level", "egger", "trimfill")
+    out: dict[str, dict[str, pd.DataFrame]] = {}
+    with _zipfile.ZipFile(uploaded) as zf:
+        for name in zf.namelist():
+            base = Path(name).name
+            if not base.endswith(".csv"):
+                continue
+            stem = base[:-4]
+            for kind in want:
+                if stem.startswith(kind + "_"):
+                    outcome = stem[len(kind) + 1:]
+                    if kind == "study_level" and outcome.startswith("hksj_"):
+                        continue
+                    with zf.open(name) as fh:
+                        out.setdefault(outcome, {})[kind] = pd.read_csv(fh)
+                    break
+    return {o: d for o, d in out.items() if {"effects", "pooled"}.issubset(d)}
+
+
+@st.cache_data(show_spinner=False)
+def _analyze_workbook(file_bytes: bytes, ci_mode: str):
+    import extraction as _ex
+    import auto_figures as _af
+    outs, qc = _ex.read_extraction_workbook(io.BytesIO(file_bytes))
+    results = [_af.analyze_outcome(d, o, ci_mode) for o, d in outs.items() if d["Study"].nunique() >= 2]
+    return results, qc
+
+
 def _render_reference_benchmark() -> None:
     """라벨 유무와 관계없이 항상 확인할 수 있는 사전 검증 성능을 표시한다."""
     b = REFERENCE_BENCHMARK
@@ -737,7 +797,7 @@ elif nav == "screen":
         else:
             if st.button("② AI 학습용 200편 만들기", type="primary", use_container_width=True):
                 try:
-                    with st.spinner("PICO 적합도와 의사결정 경계를 계산해 학습 가치가 높은 200편을 선정하는 중입니다..."):
+                    with st.spinner("PICO 적합도 층별로 학습용 200편을 무작위 선정하는 중입니다..."):
                         training_sample = build_training_sample(
                             df,
                             pico_sectioned_text,
@@ -755,9 +815,9 @@ elif nav == "screen":
                 tcounts = training_sample.get("Training_Stratum", pd.Series(dtype=str)).value_counts()
                 s1, s2, s3 = st.columns(3)
                 s1.metric("High PICO", f"{int(tcounts.get('High PICO relevance', 0)):,}편")
-                s2.metric("경계 문헌", f"{int(tcounts.get('Decision boundary', 0)):,}편")
+                s2.metric("Mid PICO", f"{int(tcounts.get('Mid PICO relevance', 0)):,}편")
                 s3.metric("Low PICO", f"{int(tcounts.get('Low PICO relevance', 0)):,}편")
-                st.caption("Include를 충분히 확보하면서도 경계와 명확한 Exclude 패턴을 함께 학습하도록 자동 구성됩니다.")
+                st.caption("PICO 점수 상위 100편은 전수, 나머지는 중간·하위 층에서 무작위로 뽑습니다. Sampling_Weight 열은 Recall 추정에 쓰이니 지우지 마세요.")
                 st.download_button(
                     "학습용 200편 다운로드",
                     dataframe_to_excel_bytes(training_sample),
@@ -1103,11 +1163,92 @@ elif nav == "meta":
         "논문 최종 통계는 R 결과를 기준으로 하고, 이 탭은 Figure 확인과 시각적 다듬기에 사용하세요.",
         eyebrow="메타분석",
     )
-    meta_file = st.file_uploader("데이터 업로드 (Excel/CSV)", type=["xlsx", "xls", "csv"], key="meta_upload_unified")
+    meta_file = st.file_uploader("데이터 추출 엑셀 (outcome별 시트) / R r_outputs zip / CSV", type=["zip", "xlsx", "xls", "csv"], key="meta_upload_unified")
+    ci_mode = st.radio(
+        "Pooled 95% CI", ["CR2 (Satterthwaite)", "모델 기반 (rma.mv, t)"], horizontal=True, key="meta_ci_mode",
+        help="R 파이프라인의 주 추론은 CR2입니다. 02a_make_forest_only.py는 모델 기반 CI를 그리므로, 본문 수치와 같은 쪽을 고르세요.",
+    )
+
+    result_ready = False
+    if meta_file and Path(meta_file.name).suffix.lower() == ".zip":
+        # ---- R 결과 그대로: effects_/pooled_/vardecomp_/study_level_/egger_ CSV ----
+        r_sets = _read_r_outputs_zip(meta_file)
+        if not r_sets:
+            st.error("zip 안에서 effects_<outcome>.csv와 pooled_<outcome>.csv 쌍을 찾지 못했습니다.")
+            st.stop()
+        outcome = st.selectbox("Outcome", sorted(r_sets), key="meta_r_outcome")
+        rs = r_sets[outcome]
+        e = rs["effects"]
+        eff = pd.DataFrame({"study": e["Study"].astype(str), "yi": e["g"].astype(float), "vi": e["vi"].astype(float)})
+        prow = rs["pooled"].iloc[0]
+        i2_r = (100 * (1 - float(rs["vardecomp"].iloc[0]["prop_sampling"]))) if "vardecomp" in rs else None
+        summary = _forest_summary(prow, ci_mode, i2=i2_r)
+        fit_w = _rmeta.fit_three_level(eff["yi"], eff["vi"], eff["study"]).weights
+        sub = eff.copy()
+        sub["ci_lo"], sub["ci_hi"] = e["ci_lb"].astype(float), e["ci_ub"].astype(float)
+        sub["weight_pct"] = fit_w
+        for src, dst in [("Mean_treat", "mean_treat"), ("SD_treat", "sd_treat"), ("N_treat", "n_treat"),
+                         ("Mean_control", "mean_control"), ("SD_control", "sd_control"), ("N_control", "n_control")]:
+            if src in e.columns:
+                sub[dst] = e[src]
+        if "study_level" in rs:
+            study_df = rs["study_level"].rename(columns={"Study": "study"})[["study", "yi", "vi"]].copy()
+        else:
+            study_df = _rmeta.aggregate_cs(eff)
+        study_df["se"] = np.sqrt(study_df["vi"])
+        egger = eggers_test(study_df)
+        pooled = pool_random_effects(study_df, cluster_col="study")
+        title = outcome
+        st.caption(f"R 결과 사용: pooled_{outcome}.csv의 μ·CI·PI·τ²를 그대로 그립니다. 진단 그림은 R과 같은 study-level 점(study_level_{outcome}.csv)과 같은 모형(REML + knha)으로 계산합니다.")
+        meta_df = None
+        result_ready = True
+
+    workbook_mode = False
+    if meta_file and Path(meta_file.name).suffix.lower() in {".xlsx", ".xls"}:
+        import auto_figures as _af
+        with st.spinner("데이터 추출 시트를 읽고 outcome별로 분석하는 중입니다..."):
+            wb_results, wb_qc = _analyze_workbook(meta_file.getvalue(), ci_mode)
+        if wb_results:
+            workbook_mode = True
+            st.success(f"outcome 시트 {len(wb_results)}개를 인식했습니다: " + ", ".join(r["outcome"] for r in wb_results))
+            st.caption("효과크기 Hedges' g · 3-level random-effects (REML, Study/effect) · CR2 cluster-robust · 95% PI. "
+                       "출판편향·민감도 진단은 연구 단위 집계(CS, ρ = 0.6) + REML/knha. R 파이프라인(01_stat_analysis.R)과 수치 일치 검증.")
+            with st.expander("데이터 QC (제외·중복 처리 내역)", expanded=False):
+                st.dataframe(wb_qc, use_container_width=True, hide_index=True)
+            summ = pd.DataFrame([_af.summary_row(r) for r in wb_results])
+            st.dataframe(summ.round(3), use_container_width=True, hide_index=True)
+
+            wb_dpi = st.select_slider("Figure 해상도 (DPI)", options=[150, 300, 600], value=300, key="wb_dpi")
+            if st.button("전체 figure 만들기 (zip)", type="primary", use_container_width=True, key="wb_make"):
+                bar = st.progress(0.0, text="figure 생성 중...")
+                zbytes, adv_tbl = _af.build_figure_zip(wb_results, wb_qc, dpi=wb_dpi,
+                                                       progress=lambda f, o: bar.progress(f, text=f"{o} 완료"))
+                st.session_state["wb_zip"] = zbytes
+                st.session_state["wb_adv"] = adv_tbl
+                bar.empty()
+                log_activity("📈", "메타분석 figure 일괄 생성", f"{len(wb_results)}개 outcome")
+                save_project_state(active, "meta_done", True)
+            if st.session_state.get("wb_adv") is not None:
+                st.caption("고급 분석: p < .05는 09_Advanced_significant_p05, 나머지는 10_Advanced_not_significant 폴더에 모두 저장됩니다. "
+                           "메타회귀·dose-response는 CR2 기준으로 분류합니다. SKIPPED는 데이터가 부족해 실행하지 않은 분석입니다.")
+                st.dataframe(st.session_state["wb_adv"].round(4), use_container_width=True, hide_index=True)
+            if st.session_state.get("wb_zip"):
+                st.download_button("figure + 결과표 zip 다운로드", st.session_state["wb_zip"], "meta_analysis_figures.zip",
+                                   "application/zip", use_container_width=True, key="wb_dl")
+
+            st.markdown('<div class="section-title" style="margin-top:22px;">미리보기</div>', unsafe_allow_html=True)
+            pick = st.selectbox("Outcome", [r["outcome"] for r in wb_results], key="wb_pick")
+            res = next(r for r in wb_results if r["outcome"] == pick)
+            figs = _af.make_figures(res, which=("forest", "funnel"))
+            for f in figs.values():
+                st.pyplot(f, use_container_width=True)
+            if st.checkbox("민감도 진단 그림도 보기 (Trim-and-fill · LOO · Influence · Baujat · GOSH)", key="wb_diag"):
+                for f in _af.make_figures(res, which=("trimfill", "leave1out", "influence", "baujat", "gosh")).values():
+                    st.pyplot(f, use_container_width=True)
 
     if not meta_file:
-        empty_state("📈", "R 결과 파일을 업로드하세요", "R에서 산출한 연구별 효과크기(yi/vi 또는 95% CI) 결과를 권장합니다. Python은 Figure 확인과 시각적 정리에 사용합니다.")
-    else:
+        empty_state("📈", "데이터 추출 엑셀을 올리세요", "outcome별 시트에 Study, Mean_treat, SD_treat, N_treat, Mean_control, SD_control, N_control 열이 있으면 시트를 자동 인식해 모든 figure를 만듭니다. R 결과(r_outputs zip)도 받습니다.")
+    elif Path(meta_file.name).suffix.lower() != ".zip" and not workbook_mode:
         meta_df = pd.read_excel(meta_file) if Path(meta_file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(meta_file)
         cols = list(meta_df.columns)
         guess = guess_columns(cols)
@@ -1127,18 +1268,16 @@ elif nav == "meta":
             try:
                 eff = compute_effect_sizes(meta_df, guess["study"], guess["mean_treat"], guess["sd_treat"], guess["n_treat"],
                                            guess["mean_control"], guess["sd_control"], guess["n_control"], None)
-                pooled = pool_random_effects(eff, cluster_col="study")
-                egger = eggers_test(eff)
+                summary, fit_w, study_df = _r_style_from_effects(eff, ci_mode)
+                pooled = pool_random_effects(study_df, cluster_col="study")
+                egger = eggers_test(study_df)
                 title = guess["mean_treat"].split("_")[0] if guess.get("mean_treat") else "Effects of intervention"
                 sub = eff.rename(columns={
                     "mean_t": "mean_treat", "sd_t": "sd_treat",
                     "mean_c": "mean_control", "sd_c": "sd_control",
                     "ci_low": "ci_lo", "ci_high": "ci_hi",
                 })
-                summary = ForestSummary(g=pooled.beta, ci_lb=pooled.ci[0], ci_ub=pooled.ci[1],
-                                        tau2=pooled.tau2, i2=pooled.i2, k=pooled.k, p_value=pooled.p_value)
-                if pooled.k >= 3 and not pd.isna(pooled.prediction_interval[0]):
-                    summary.pi_lb, summary.pi_ub = pooled.prediction_interval
+                sub["weight_pct"] = fit_w
                 result_ready = True
             except Exception as exc:
                 st.error(f"자동 계산 중 문제가 발생했습니다: {exc}")
@@ -1159,16 +1298,14 @@ elif nav == "meta":
                 if eff.empty:
                     raise ValueError("유효한 효과크기/분산 값이 없습니다.")
                 eff["se"] = np.sqrt(eff["vi"])
-                pooled = pool_random_effects(eff, cluster_col="study")
-                egger = eggers_test(eff)
+                summary, fit_w, study_df = _r_style_from_effects(eff, ci_mode)
+                pooled = pool_random_effects(study_df, cluster_col="study")
+                egger = eggers_test(study_df)
                 title = "Effects of intervention"
                 sub = eff.copy()
                 sub["ci_lo"] = sub["yi"] - 1.96 * np.sqrt(sub["vi"])
                 sub["ci_hi"] = sub["yi"] + 1.96 * np.sqrt(sub["vi"])
-                summary = ForestSummary(g=pooled.beta, ci_lb=pooled.ci[0], ci_ub=pooled.ci[1],
-                                        tau2=pooled.tau2, i2=pooled.i2, k=pooled.k, p_value=pooled.p_value)
-                if pooled.k >= 3 and not pd.isna(pooled.prediction_interval[0]):
-                    summary.pi_lb, summary.pi_ub = pooled.prediction_interval
+                sub["weight_pct"] = fit_w
                 result_ready = True
             except Exception as exc:
                 st.error(f"자동 계산 중 문제가 발생했습니다: {exc}")
@@ -1206,83 +1343,84 @@ elif nav == "meta":
                 if eff.empty:
                     raise ValueError("유효한 효과크기/분산 값이 없습니다. 열 선택을 확인하세요.")
                 eff["se"] = np.sqrt(eff["vi"])
-                pooled = pool_random_effects(eff, cluster_col="study")
-                egger = eggers_test(eff)
+                summary, fit_w, study_df = _r_style_from_effects(eff, ci_mode)
+                pooled = pool_random_effects(study_df, cluster_col="study")
+                egger = eggers_test(study_df)
                 title = "Effects of intervention"
                 sub = eff.copy()
                 sub["ci_lo"] = sub["yi"] - 1.96 * np.sqrt(sub["vi"])
                 sub["ci_hi"] = sub["yi"] + 1.96 * np.sqrt(sub["vi"])
-                summary = ForestSummary(g=pooled.beta, ci_lb=pooled.ci[0], ci_ub=pooled.ci[1],
-                                        tau2=pooled.tau2, i2=pooled.i2, k=pooled.k, p_value=pooled.p_value)
-                if pooled.k >= 3 and not pd.isna(pooled.prediction_interval[0]):
-                    summary.pi_lb, summary.pi_ub = pooled.prediction_interval
+                sub["weight_pct"] = fit_w
                 result_ready = True
             except Exception as exc:
                 st.error(str(exc))
 
-        if result_ready:
-            fig_f = forest_plot_from_R(sub, summary, title=title)
-            st.pyplot(fig_f, use_container_width=True)
-            dpi_pick = st.select_slider("다운로드 해상도 (DPI)", options=[150, 300, 600, 1200], value=300, key="unified_forest_dpi")
+    if result_ready:
+        fig_f = forest_plot_from_R(sub, summary, title=title)
+        st.pyplot(fig_f, use_container_width=True)
+        dpi_pick = st.select_slider("다운로드 해상도 (DPI)", options=[150, 300, 600, 1200], value=300, key="unified_forest_dpi")
+        st.download_button(
+            f"Forest plot PNG 다운로드 ({dpi_pick}dpi)", fig_to_png_bytes(fig_f, dpi=dpi_pick),
+            f"forest_{title.replace(' ', '_')}.png", "image/png", type="primary", use_container_width=True, key="unified_forest_dl",
+        )
+        # R 02_make_figures.py와 같이: study-level 집계 점, 중심 = study-level REML+knha 추정치
+        funnel_center = ForestSummary(g=pooled.beta, ci_lb=pooled.ci[0], ci_ub=pooled.ci[1])
+        fig_fn = funnel_plot_from_R(study_df, funnel_center, egger, title=title)
+        st.pyplot(fig_fn, use_container_width=True)
+        st.download_button(
+            "Funnel plot PNG 다운로드", fig_to_png_bytes(fig_fn, dpi=300),
+            f"funnel_{title.replace(' ', '_')}.png", "image/png", use_container_width=True, key="unified_funnel_dl",
+        )
+        if not pd.isna(egger.p_value):
+            egger_p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
+            st.caption(f"k={summary.k} effects / {len(study_df)} studies · Hedges' g={summary.g:.3f} [{summary.ci_lb:.3f}, {summary.ci_ub:.3f}] ({summary.ci_note}) · "
+                       f"Egger(regtest, sei, study-level) p={egger_p_txt}" + (" — 연구 10편 미만: 탐색적 해석" if len(study_df) < 10 else ""))
+        st.session_state["meta_raw"] = {"done": True}
+        save_project_state(active, "meta_raw", st.session_state["meta_raw"])
+        save_project_state(active, "meta_done", True)
+        log_activity("📈", "메타분석 그림 생성", f"{title} — g={summary.g:.2f}")
+
+        st.markdown('<div class="section-title" style="margin-top:22px;">고급 진단 그림</div>', unsafe_allow_html=True)
+        st.caption("Leave-one-out · Baujat · GOSH · Trim-and-fill · Influence — R 파이프라인과 같이 연구 단위 집계 점(CS, ρ = 0.6)에 "
+                   "REML + knha 모형으로 계산합니다(leave1out·trimfill·regtest는 R 출력과 소수점 이하까지 일치 확인). GOSH만 무작위 부분집합 근사입니다.")
+        adv_dpi = st.select_slider("진단 그림 다운로드 해상도 (DPI)", options=[150, 300, 600, 1200], value=300, key="adv_dpi")
+
+        def _adv_show(fig, name, key):
+            st.pyplot(fig, use_container_width=True)
             st.download_button(
-                f"Forest plot PNG 다운로드 ({dpi_pick}dpi)", fig_to_png_bytes(fig_f, dpi=dpi_pick),
-                f"forest_{title.replace(' ', '_')}.png", "image/png", type="primary", use_container_width=True, key="unified_forest_dl",
+                f"{name} PNG 다운로드", fig_to_png_bytes(fig, dpi=adv_dpi),
+                f"{name.lower().replace(' ', '_').replace('-', '')}_{title.replace(' ', '_')}.png",
+                "image/png", use_container_width=True, key=f"{key}_dl",
             )
-            fig_fn = funnel_plot_from_R(sub, summary, egger, title=title)
-            st.pyplot(fig_fn, use_container_width=True)
-            st.download_button(
-                "Funnel plot PNG 다운로드", fig_to_png_bytes(fig_fn, dpi=300),
-                f"funnel_{title.replace(' ', '_')}.png", "image/png", use_container_width=True, key="unified_funnel_dl",
-            )
-            if not pd.isna(egger.p_value):
-                egger_p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
-                st.caption(f"k={pooled.k} · Hedges' g={pooled.beta:.3f} [{pooled.ci[0]:.3f}, {pooled.ci[1]:.3f}] · I²={pooled.i2:.1f}% · Egger's test p={egger_p_txt}")
-            st.session_state["meta_raw"] = {"done": True}
-            save_project_state(active, "meta_raw", st.session_state["meta_raw"])
-            save_project_state(active, "meta_done", True)
-            log_activity("📈", "메타분석 그림 생성", f"{title} — g={pooled.beta:.2f}")
 
-            st.markdown('<div class="section-title" style="margin-top:22px;">고급 진단 그림</div>', unsafe_allow_html=True)
-            st.caption("Leave-one-out · Baujat · GOSH · Trim-and-fill · Influence — 업로드한 파일로 자동 계산됩니다. "
-                       "leave-one-out 재적합 기반 근사치이며, R metafor의 정확한 3-level CRVE 알고리즘과 100% 동일하지는 않습니다.")
-            adv_dpi = st.select_slider("진단 그림 다운로드 해상도 (DPI)", options=[150, 300, 600, 1200], value=300, key="adv_dpi")
-
-            def _adv_show(fig, name, key):
-                st.pyplot(fig, use_container_width=True)
-                st.download_button(
-                    f"{name} PNG 다운로드", fig_to_png_bytes(fig, dpi=adv_dpi),
-                    f"{name.lower().replace(' ', '_').replace('-', '')}_{title.replace(' ', '_')}.png",
-                    "image/png", use_container_width=True, key=f"{key}_dl",
-                )
-
-            if pooled.k >= 3:
-                try:
-                    _adv_show(leave_one_out_plot(eff, pooled, title=f"Leave-one-out — {title}"), "Leave-one-out", "loo")
-                except Exception as exc:
-                    st.caption(f"Leave-one-out 그림을 생성하지 못했습니다: {exc}")
+        if pooled.k >= 3:
             try:
-                _adv_show(baujat_plot(eff, pooled, title=f"Baujat plot — {title}"), "Baujat", "baujat")
+                _adv_show(leave_one_out_plot(study_df, pooled, title=f"Leave-one-out — {title}"), "Leave-one-out", "loo")
             except Exception as exc:
-                st.caption(f"Baujat plot을 생성하지 못했습니다: {exc}")
-            if pooled.k >= 4:
-                try:
-                    _adv_show(gosh_plot(eff, n_iter=1200, title=f"GOSH plot — {title}"), "GOSH", "gosh")
-                except Exception as exc:
-                    st.caption(f"GOSH plot을 생성하지 못했습니다: {exc}")
-            else:
-                st.caption("GOSH plot에는 최소 4개 이상의 연구가 필요합니다.")
-            if pooled.k >= 3:
-                try:
-                    tf_result = trim_and_fill(eff)
-                    _adv_show(trim_fill_plot(tf_result, title=title), "Trim-and-fill", "trimfill")
-                except Exception as exc:
-                    st.caption(f"Trim-and-fill 그림을 생성하지 못했습니다: {exc}")
-                try:
-                    _adv_show(influence_plot(eff, pooled, title=title), "Influence", "influence")
-                except Exception as exc:
-                    st.caption(f"Influence 그림을 생성하지 못했습니다: {exc}")
-            else:
-                st.caption("Trim-and-fill / Influence 그림에는 최소 3개 이상의 연구가 필요합니다.")
+                st.caption(f"Leave-one-out 그림을 생성하지 못했습니다: {exc}")
+        try:
+            _adv_show(baujat_plot(study_df, pooled, title=f"Baujat plot — {title}"), "Baujat", "baujat")
+        except Exception as exc:
+            st.caption(f"Baujat plot을 생성하지 못했습니다: {exc}")
+        if pooled.k >= 4:
+            try:
+                _adv_show(gosh_plot(study_df, n_iter=1200, title=f"GOSH plot — {title}"), "GOSH", "gosh")
+            except Exception as exc:
+                st.caption(f"GOSH plot을 생성하지 못했습니다: {exc}")
+        else:
+            st.caption("GOSH plot에는 최소 4개 이상의 연구가 필요합니다.")
+        if pooled.k >= 3:
+            try:
+                tf_result = trim_and_fill(study_df)
+                _adv_show(trim_fill_plot(tf_result, title=title), "Trim-and-fill", "trimfill")
+            except Exception as exc:
+                st.caption(f"Trim-and-fill 그림을 생성하지 못했습니다: {exc}")
+            try:
+                _adv_show(influence_plot(study_df, pooled, title=title), "Influence", "influence")
+            except Exception as exc:
+                st.caption(f"Influence 그림을 생성하지 못했습니다: {exc}")
+        else:
+            st.caption("Trim-and-fill / Influence 그림에는 최소 3개 이상의 연구가 필요합니다.")
 
 
 
