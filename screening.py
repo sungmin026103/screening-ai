@@ -59,7 +59,7 @@ TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
 VALIDATION_RECALL_TARGET = 0.95
 VALIDATION_CONFIDENCE = 0.95
-ALGORITHM_VERSION = "V31.0"
+ALGORITHM_VERSION = "V32.0"
 # 층화 추출: PICO 점수 순위 경계(상위 10%, 상위 40%)와 층별 표본 배분(합 1.0)
 STRATUM_BOUNDS = (None, 0.40)  # High는 상위 n_high편 전수, Mid는 그 아래~상위 40%
 STRATUM_ALLOCATION = (0.50, 0.35, 0.15)
@@ -2048,6 +2048,14 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
 
 
 
+def _pct(x) -> str:
+    """비율을 '93.8%' 문자열로 쓴다. 1.0이 엑셀에서 TRUE로 보이는 혼동을 막는다."""
+    try:
+        return f"{float(x) * 100:.1f}%"
+    except Exception:
+        return str(x)
+
+
 def validation_methods_text(result: ScreeningResult) -> str:
     """현재 validation 결과를 Methods에 옮길 수 있는 보수적 문구를 만든다."""
     m = result.metrics
@@ -2069,7 +2077,19 @@ def validation_methods_text(result: ScreeningResult) -> str:
         f"human-validation sample, with {safe_fn} potentially eligible records assigned to the auto-exclusion region. "
         f"The operational quality-gate status was {status}. "
         "These internal validation results were used as a quality-control safeguard and were not interpreted as a "
-        "guarantee that no eligible records remained among unlabelled records."
+        "guarantee that no eligible records remained among unlabelled records. "
+        + (
+            f"Because the number of eligible records in the validation sample was finite ({inc}), recall is reported "
+            f"with its one-sided 95% lower confidence bound ({float(m.get('policy_safe_recall_lower_ci', 0.0)) * 100:.1f}%) "
+            "rather than as a point estimate of 100%. "
+        )
+        + (
+            f"Applying Clopper-Pearson one-sided 95% upper bounds within risk strata of the automatically excluded set, "
+            f"at most {float(m.get('audit_max_missed_current', 0.0)):.0f} eligible records could have been missed. "
+            if m.get("audit_max_missed_current") else ""
+        )
+        + "Reference lists and forward citations of all included studies were additionally screened to detect records "
+          "potentially missed at the title/abstract stage."
     )
 
 
@@ -2095,18 +2115,18 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ("Human Include n", int(m.get("include_n", 0))),
         ("Human Exclude n", int(m.get("labeled_n", 0)) - int(m.get("include_n", 0))),
         ("Target Recall", float(m.get("recall_target", DEFAULT_RECALL_TARGET))),
-        ("OOF Recall (unweighted)", float(m.get("recall", 0.0))),
-        ("OOF Recall (sampling-weighted, globally tuned)", float(m.get("recall_weighted", 0.0))),
-        ("Fold-held-out priority Recall (sampling-weighted)", float(m.get("policy_priority_recall_weighted", 0.0))),
-        ("Fold-held-out priority Recall (unweighted)", float(m.get("policy_priority_recall_unweighted", 0.0))),
-        ("OOF Recall one-sided 95% lower bound", float(m.get("recall_lower_ci", 0.0))),
-        ("OOF min-fold Recall", float(m.get("min_fold_recall", 0.0))),
-        ("Safe-exclude Recall (globally tuned, unweighted)", float(m.get("safe_recall", 0.0))),
-        ("Safe-exclude Recall (globally tuned, sampling-weighted)", float(m.get("safe_recall_weighted", 0.0))),
-        ("Safe-exclude Recall one-sided 95% lower bound (globally tuned)", float(m.get("safe_recall_lower_ci", 0.0))),
-        ("Fold-held-out safe Recall one-sided 95% lower bound", float(m.get("policy_safe_recall_lower_ci", 0.0))),
-        ("Fold-held-out safe Recall (sampling-weighted)", float(m.get("policy_safe_recall_weighted", 0.0))),
-        ("Fold-held-out safe Recall (unweighted)", float(m.get("policy_safe_recall_unweighted", 0.0))),
+        ("OOF Recall (unweighted)", _pct(m.get("recall", 0.0))),
+        ("OOF Recall (sampling-weighted, globally tuned)", _pct(m.get("recall_weighted", 0.0))),
+        ("Fold-held-out priority Recall (sampling-weighted)", _pct(m.get("policy_priority_recall_weighted", 0.0))),
+        ("Fold-held-out priority Recall (unweighted)", _pct(m.get("policy_priority_recall_unweighted", 0.0))),
+        ("OOF Recall one-sided 95% lower bound", _pct(m.get("recall_lower_ci", 0.0))),
+        ("OOF min-fold Recall", _pct(m.get("min_fold_recall", 0.0))),
+        ("Safe-exclude Recall (globally tuned, unweighted)", _pct(m.get("safe_recall", 0.0))),
+        ("Safe-exclude Recall (globally tuned, sampling-weighted)", _pct(m.get("safe_recall_weighted", 0.0))),
+        ("Safe-exclude Recall one-sided 95% lower bound (globally tuned)", _pct(m.get("safe_recall_lower_ci", 0.0))),
+        ("Fold-held-out safe Recall one-sided 95% lower bound", _pct(m.get("policy_safe_recall_lower_ci", 0.0))),
+        ("Fold-held-out safe Recall (sampling-weighted)", _pct(m.get("policy_safe_recall_weighted", 0.0))),
+        ("Fold-held-out safe Recall (unweighted)", _pct(m.get("policy_safe_recall_unweighted", 0.0))),
         ("Fold-held-out safe FN", int(m.get("policy_safe_fn", 0))),
         ("Fold-held-out safe-excluded n", int(m.get("policy_safe_excluded_n", 0))),
         ("Fold-held-out final WSS (sampling-weighted)", float(m.get("policy_safe_wss_weighted", 0.0))),
@@ -2153,6 +2173,46 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         for c in ews[1]: c.fill = header_fill; c.font = header_font
         ews.freeze_panes = "A2"
 
+    # --- PRISMA 흐름과 감사 설계: 동료심사에서 반드시 요구되는 두 가지 -------------
+    pred = result.predictions
+    counts = pred["AI_Recommendation"].value_counts()
+    auto_on = bool(result.metrics.get("auto_exclusion_enabled", False))
+    auto_n = int(counts.get("안전 제외 후보", 0)) if auto_on else 0
+    flow = [
+        ["Stage", "n"],
+        ["Records screened by AI-assisted workflow", int(len(pred))],
+        ["Human-validation sample labelled by reviewers", int(result.metrics.get("labeled_n", 0))],
+        ["  of which judged potentially eligible", int(result.metrics.get("include_n", 0))],
+        ["Records assigned to automatic exclusion", auto_n],
+        ["Records retained for human title/abstract screening", int(len(pred)) - auto_n],
+        ["  priority tier", int(counts.get("우선 검토", 0))],
+        ["  borderline tier", int(counts.get("경계 문헌", 0))],
+        ["  no-abstract tier (title-only, manual)", int(counts.get(MANUAL_REVIEW_TIER, 0))],
+    ]
+    fws = wb.create_sheet("PRISMA_Flow")
+    for row in flow: fws.append(row)
+    for c in fws[1]: c.fill = header_fill; c.font = header_font
+    fws.column_dimensions["A"].width = 56; fws.column_dimensions["B"].width = 14
+
+    try:
+        strata = audit_risk_strata(pred)
+        opts = audit_size_options(strata)
+        aws = wb.create_sheet("Audit_Design")
+        aws.append(["자동 제외 집합의 위험층별 누락 상한 (Clopper-Pearson 95% 단측)"])
+        aws["A1"].font = Font(bold=True)
+        aws.append([])
+        for row in dataframe_to_rows(strata, index=False, header=True): aws.append(row)
+        start = aws.max_row - len(strata)
+        for c in aws[start]: c.fill = header_fill; c.font = header_font
+        aws.append([])
+        aws.append(["목표 상한별 추가 감사 분량"]); aws.cell(row=aws.max_row, column=1).font = Font(bold=True)
+        for row in dataframe_to_rows(opts, index=False, header=True): aws.append(row)
+        for j, wdt in enumerate([46, 14, 12, 14, 18, 18], start=1):
+            aws.column_dimensions[get_column_letter(j)].width = wdt
+        result.metrics["audit_max_missed_current"] = float(strata["최대_누락_추정"].sum())
+    except Exception:
+        pass
+
     mws = wb.create_sheet("Methods_Text")
     mws["A1"] = "Suggested Methods wording"
     mws["A1"].font = Font(bold=True)
@@ -2168,6 +2228,10 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ["REVIEW", "위 조건 중 하나라도 충족하지 못한 경우. 모델 순위는 참고할 수 있으나 자동 제외는 잠금 상태로 취급해야 함."],
         ["Confidence bound", "표본의 유한한 Include 수 때문에 생기는 불확실성을 보여주는 보조 지표. PASS를 통계적 무누락 보장으로 해석하지 않음."],
         ["Scope", "현재 결과는 해당 review의 200편 내부 human-validation 및 OOF 예측에 대한 품질관리 결과이며, 미라벨 전체 코퍼스에 대한 절대적 보장이 아님."],
+        ["보고 원칙", "Recall은 점추정 100%가 아니라 단측 95% 하한과 함께 보고한다. Include 수가 적을수록 하한은 낮아지며, 이것이 실제 불확실성이다."],
+        ["Audit_Design", "자동 제외 집합을 '제외 사유 × 노출어 포함 여부'로 나눈 뒤 셀별 누락 상한을 계산한 표. 노출어가 있는데 제외된 셀이 가장 위험하다(주제는 맞는데 결과어 규칙이 못 잡은 경우). 목표 상한을 정하고 그만큼 추가로 읽는 것이 동료심사 대응의 핵심이다."],
+        ["논리적 근거 vs 통계적 근거", "노출어가 아예 없어 제외된 문헌은 PECO상 노출이 필수이므로 제목·초록 단계에서 적격 판정 자체가 불가능하다(논리적 근거). 반면 노출어는 있으나 결과어가 없어 제외된 문헌은 결과어 사전의 누락 가능성이 있으므로 표본 감사로 뒷받침해야 한다(통계적 근거)."],
+        ["Known-item recovery", "이미 적격임을 아는 문헌(연구계획서 인용문헌, 선행 리뷰 포함문헌 등)이 자동 제외되지 않았는지 확인하는 검사. 통계적 상한보다 심사자 설득력이 크다."],
     ]
     for row in notes: nws.append(row)
     for c in nws[1]: c.fill = header_fill; c.font = header_font
@@ -2395,3 +2459,242 @@ def merge_validation_extension(
         "max_weight": float(merged["Sampling_Weight"].max()),
     }
     return merged, stats
+
+
+# ---------------------------------------------------------------------------
+# 위험층화 감사 (risk-stratified audit of the auto-excluded set)
+# ---------------------------------------------------------------------------
+# 동료심사에서 가장 먼저 지적되는 지점은 "AI가 제외한 수천 편을 아무도 읽지 않았다"이다.
+# 내부 validation(라벨 200편)에서 safe-exclude FN=0이라는 사실만으로는 부족하다.
+# 라벨 수가 작으면 '놓쳤을 수 있는 최대 편수'의 상한이 전체 적격 문헌 수보다 커질 수 있고,
+# 그러면 "누락이 없다"는 주장은 통계적으로 공허하다.
+#
+# 그래서 자동 제외 집합을 위험 셀(제외 사유 × 노출어 포함 여부)로 나누고,
+#   (1) 셀별로 현재 상한(Clopper-Pearson 95% 단측 상한 × 셀 크기)을 계산하고
+#   (2) 목표 상한을 만족하려면 셀별로 몇 편을 더 읽어야 하는지 역산하고
+#   (3) 그만큼 무작위로 뽑아 사람이 읽은 뒤 상한을 다시 계산한다.
+# 보고에는 recall 100%가 아니라 이 상한을 쓴다.
+# ---------------------------------------------------------------------------
+
+AUDIT_CONFIDENCE = 0.95
+AUDIT_EXPOSURE_PATTERN = GATE_RULES_DEFAULT[0][1] if GATE_RULES_DEFAULT else r"$^"
+
+
+def _cp_upper(n: int, k: int = 0, confidence: float = AUDIT_CONFIDENCE) -> float:
+    """Clopper-Pearson 단측 상한. k=0이면 1-(1-c)^(1/n)과 같다."""
+    if n <= 0:
+        return 1.0
+    if k >= n:
+        return 1.0
+    return float(_beta_dist.ppf(confidence, k + 1, n - k))
+
+
+def audit_risk_strata(
+    predictions: pd.DataFrame,
+    exposure_pattern: str = AUDIT_EXPOSURE_PATTERN,
+    audit_labels: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """자동 제외 집합을 위험 셀로 나누고 셀별 누락 상한을 계산한다.
+
+    셀 = 제외 사유(Gate_Fail_Reason, 없으면 '확률 기준 제외') × 노출어 포함 여부.
+    노출어가 있는데 제외된 문헌이 가장 위험하다 — 주제는 맞는데 규칙이 결과어를 못 찾은 경우다.
+    """
+    pool = predictions[predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+    if pool.empty:
+        raise ValueError("자동 제외 후보가 없어 감사 설계를 만들 수 없습니다.")
+
+    text = (pool.get("Title", pool.get("제목", pd.Series([""] * len(pool)))).fillna("").astype(str) + " "
+            + pool.get("Abstract", pool.get("초록", pd.Series([""] * len(pool)))).fillna("").astype(str)).str.lower()
+    has_exp = text.str.contains(exposure_pattern, regex=True, na=False)
+    reason = pool.get("Gate_Fail_Reason", pd.Series([""] * len(pool))).fillna("")
+    reason = reason.where(reason.astype(str).str.len() > 0, "확률 기준 제외")
+    pool["_audit_cell"] = [f"{r} | 노출어 {'있음' if e else '없음'}" for r, e in zip(reason, has_exp)]
+
+    w = pd.to_numeric(pool.get("Sampling_Weight", pd.Series([1.0] * len(pool))), errors="coerce").fillna(1.0)
+    lab = pd.to_numeric(pool.get("Human_Label_Normalized", pd.Series([np.nan] * len(pool))), errors="coerce")
+
+    extra_n: dict[str, int] = {}
+    extra_k: dict[str, int] = {}
+    if audit_labels is not None and len(audit_labels):
+        a = audit_labels.copy()
+        acol = next((c for c in a.columns if str(c).strip().lower() in
+                     {"audit_label", "human_label", "판정", "라벨"}), None)
+        if acol is None:
+            raise ValueError("감사 파일에서 판정 열(Audit_Label)을 찾지 못했습니다.")
+        av = a[acol].map(_normalize_label_value)
+        cell_col = next((c for c in a.columns if str(c) in {"감사_셀", "_audit_cell", "Audit_Cell"}), None)
+        if cell_col is None:
+            raise ValueError("감사 파일에서 감사_셀 열을 찾지 못했습니다.")
+        for cell, grp in a.assign(_v=av).groupby(a[cell_col].astype(str)):
+            judged = grp["_v"].isin([0, 1])
+            extra_n[str(cell)] = int(judged.sum())
+            extra_k[str(cell)] = int((grp["_v"] == 1).sum())
+
+    rows = []
+    for cell, grp in pool.groupby("_audit_cell"):
+        idx = grp.index
+        N = float(w.loc[idx].sum())
+        n_lab = int(lab.loc[idx].isin([0, 1]).sum()) + extra_n.get(str(cell), 0)
+        k = int((lab.loc[idx] == 1).sum()) + extra_k.get(str(cell), 0)
+        ub = _cp_upper(n_lab, k)
+        rows.append({
+            "감사_셀": cell,
+            "N_corpus": int(round(N)),
+            "읽은_편수": n_lab,
+            "발견_Include": k,
+            "누락률_95%상한": ub,
+            "최대_누락_추정": ub * N,
+        })
+    out = pd.DataFrame(rows).sort_values("최대_누락_추정", ascending=False).reset_index(drop=True)
+    return out
+
+
+def recommend_audit_sizes(strata: pd.DataFrame, target_max_missed: float = 10.0) -> pd.DataFrame:
+    """전체 누락 상한을 target_max_missed 이하로 만들기 위해 셀별로 몇 편을 더 읽어야 하는지.
+
+    셀별 목표는 코퍼스 크기에 비례 배분한다(큰 셀일수록 더 읽어야 함).
+    """
+    out = strata.copy()
+    total_N = float(out["N_corpus"].sum()) or 1.0
+    needs = []
+    for _, r in out.iterrows():
+        N = float(r["N_corpus"])
+        cell_target = max(target_max_missed * N / total_N, 1.0)
+        n_needed = int(r["읽은_편수"])
+        k = int(r["발견_Include"])
+        # 추가로 읽을 때 Include가 더 나오지 않는다는 가정 하의 최소 n
+        while n_needed < int(N) and _cp_upper(n_needed, k) * N > cell_target:
+            n_needed += max(1, int(n_needed * 0.1) or 1)
+        needs.append(max(0, min(int(N), n_needed) - int(r["읽은_편수"])))
+    out["추가_필요_편수"] = needs
+    out["목표_달성시_최대누락"] = [
+        _cp_upper(int(r["읽은_편수"]) + n, int(r["발견_Include"])) * float(r["N_corpus"])
+        for n, (_, r) in zip(needs, out.iterrows())
+    ]
+    return out
+
+
+def build_risk_audit_sample(
+    predictions: pd.DataFrame,
+    sizes: pd.DataFrame,
+    exposure_pattern: str = AUDIT_EXPOSURE_PATTERN,
+    seed: int = 20260101,
+) -> pd.DataFrame:
+    """셀별 '추가_필요_편수'만큼 자동 제외 집합에서 무작위로 뽑는다."""
+    pool = predictions[predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+    text = (pool.get("Title", pool.get("제목", pd.Series([""] * len(pool)))).fillna("").astype(str) + " "
+            + pool.get("Abstract", pool.get("초록", pd.Series([""] * len(pool)))).fillna("").astype(str)).str.lower()
+    has_exp = text.str.contains(exposure_pattern, regex=True, na=False)
+    reason = pool.get("Gate_Fail_Reason", pd.Series([""] * len(pool))).fillna("")
+    reason = reason.where(reason.astype(str).str.len() > 0, "확률 기준 제외")
+    pool["감사_셀"] = [f"{r} | 노출어 {'있음' if e else '없음'}" for r, e in zip(reason, has_exp)]
+    already = pd.to_numeric(pool.get("Human_Label_Normalized", pd.Series([np.nan] * len(pool))),
+                            errors="coerce").isin([0, 1])
+
+    rng = np.random.default_rng(seed)
+    picks = []
+    for _, r in sizes.iterrows():
+        take = int(r.get("추가_필요_편수", 0))
+        if take <= 0:
+            continue
+        grp = pool[(pool["감사_셀"] == r["감사_셀"]) & (~already)]
+        if grp.empty:
+            continue
+        take = int(min(take, len(grp)))
+        picks.append(grp.iloc[np.sort(rng.choice(len(grp), size=take, replace=False))])
+    if not picks:
+        raise ValueError("추가로 읽어야 할 문헌이 없습니다(이미 목표 상한을 만족).")
+
+    out = pd.concat(picks).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    out.insert(0, "Audit_No", np.arange(1, len(out) + 1))
+    out.insert(1, "Audit_Label", "")
+    front = [c for c in ["Audit_No", "Audit_Label", "감사_셀", "제목", "Title", "초록", "Abstract",
+                         "Gate_Fail_Reason", "AI_Probability_%"] if c in out.columns]
+    return out[front + [c for c in out.columns if c not in front]]
+
+
+def summarize_audit(strata_after: pd.DataFrame, total_include_est: float | None = None) -> dict:
+    """감사 후 전체 누락 상한과 해석 문구를 만든다."""
+    max_missed = float(strata_after["최대_누락_추정"].sum())
+    read = int(strata_after["읽은_편수"].sum())
+    found = int(strata_after["발견_Include"].sum())
+    out = {
+        "audited_n": read,
+        "found_include": found,
+        "max_missed_upper": max_missed,
+        "pool_n": int(strata_after["N_corpus"].sum()),
+        "confidence": AUDIT_CONFIDENCE,
+    }
+    if total_include_est:
+        out["total_include_est"] = float(total_include_est)
+        out["max_missed_share"] = max_missed / float(total_include_est)
+    return out
+
+
+def audit_size_options(strata: pd.DataFrame, targets=(100.0, 50.0, 25.0, 10.0)) -> pd.DataFrame:
+    """목표 상한별로 '몇 편을 더 읽어야 하는지'를 표로 만든다.
+
+    목표를 하나로 강제하지 않는 이유: 셀이 크면 상한을 낮추는 비용이 급격히 커진다.
+    연구자가 비용과 보고 가능한 상한을 보고 직접 고르는 편이 정직하다.
+    """
+    rows = []
+    for t in targets:
+        rec = recommend_audit_sizes(strata, target_max_missed=float(t))
+        rows.append({
+            "목표_최대누락": float(t),
+            "추가_읽을_편수": int(rec["추가_필요_편수"].sum()),
+            "달성시_최대누락": float(rec["목표_달성시_최대누락"].sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def known_item_recovery(
+    predictions: pd.DataFrame,
+    known_titles: list[str],
+    threshold: float = 0.72,
+) -> tuple[pd.DataFrame, dict]:
+    """알려진 적격 문헌(seed study)이 자동 제외되지 않았는지 확인한다.
+
+    동료심사에서 통계적 상한보다 설득력이 큰 증거다. 연구계획서 인용문헌, 선행 리뷰의
+    포함문헌, 다른 경로로 이미 찾은 적격 문헌의 제목을 넣으면, 각각이 어느 티어에
+    배치되었는지와 코퍼스에서 찾았는지를 돌려준다.
+    자동 제외(안전 제외 후보)로 간 문헌이 한 편이라도 있으면 그 자체가 반증이다.
+    """
+    titles = predictions.get("Title", predictions.get("제목", pd.Series([""] * len(predictions))))
+    titles = titles.fillna("").astype(str)
+    norm = titles.str.lower().str.replace(r"[^a-z0-9가-힣 ]", " ", regex=True).str.split().str.join(" ")
+
+    rows = []
+    for q in known_titles:
+        qn = re.sub(r"[^a-z0-9가-힣 ]", " ", str(q).lower())
+        qn = " ".join(qn.split())
+        if not qn:
+            continue
+        qset = set(qn.split())
+        best_i, best_s = -1, 0.0
+        for i, t in enumerate(norm):
+            tset = set(t.split())
+            if not tset:
+                continue
+            s = len(qset & tset) / max(len(qset), 1)
+            if s > best_s:
+                best_i, best_s = i, s
+        if best_i >= 0 and best_s >= threshold:
+            rows.append({"입력_제목": q, "매칭_제목": titles.iloc[best_i], "유사도": round(best_s, 3),
+                         "배치": predictions["AI_Recommendation"].iloc[best_i],
+                         "AI_확률_%": predictions.get("AI_Probability_%", pd.Series([np.nan] * len(predictions))).iloc[best_i]})
+        else:
+            rows.append({"입력_제목": q, "매칭_제목": "(코퍼스에서 찾지 못함)", "유사도": round(best_s, 3),
+                         "배치": "미검색", "AI_확률_%": np.nan})
+
+    out = pd.DataFrame(rows)
+    found = out[out["배치"] != "미검색"]
+    auto_excluded = out[out["배치"] == "안전 제외 후보"]
+    stats = {
+        "n_known": int(len(out)),
+        "n_found_in_corpus": int(len(found)),
+        "n_auto_excluded": int(len(auto_excluded)),
+        "recovery_rate": float(len(found[found["배치"] != "안전 제외 후보"]) / len(out)) if len(out) else 0.0,
+        "passed": bool(len(out) > 0 and len(auto_excluded) == 0),
+    }
+    return out, stats

@@ -44,6 +44,12 @@ from screening import (
     plan_validation_extension,
     build_validation_extension,
     merge_validation_extension,
+    audit_risk_strata,
+    audit_size_options,
+    recommend_audit_sizes,
+    build_risk_audit_sample,
+    summarize_audit,
+    known_item_recovery,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -1020,6 +1026,106 @@ elif nav == "screen":
                         )
                     except Exception as exc:
                         st.error(str(exc))
+
+        # ------------------------------------------------------------------
+        # 동료심사 대응: 자동 제외 집합의 위험층화 감사 + known-item 복구 검사
+        # ------------------------------------------------------------------
+        if auto_enabled and safe_candidate_n > 0:
+            st.markdown('<div class="section-title" style="margin-top:18px;">자동 제외 검증 (동료심사 대응)</div>', unsafe_allow_html=True)
+            try:
+                strata = audit_risk_strata(result.predictions)
+                opts = audit_size_options(strata)
+                cur = float(strata["최대_누락_추정"].sum())
+                inc_est = float(pd.to_numeric(
+                    result.predictions.get("Sampling_Weight", pd.Series([1.0] * len(result.predictions))),
+                    errors="coerce").fillna(1.0)[
+                    pd.to_numeric(result.predictions.get("Human_Label_Normalized",
+                                                         pd.Series([np.nan] * len(result.predictions))),
+                                  errors="coerce") == 1].sum())
+                a1, a2 = st.columns(2)
+                a1.metric("현재 누락 상한 (95%)", f"{cur:.0f}편")
+                a2.metric("추정 전체 적격 문헌", f"{inc_est:.0f}편")
+                st.caption(
+                    "Recall 100%는 '라벨한 표본 안에서' 참일 뿐입니다. 심사자가 묻는 것은 읽지 않은 자동 제외 문헌이며, "
+                    "그 답은 위 상한입니다. 상한이 추정 전체 적격 문헌 수에 비해 크면 아직 근거가 부족합니다."
+                )
+                st.dataframe(strata, use_container_width=True, hide_index=True)
+                st.caption(
+                    "노출어가 **없어서** 제외된 셀은 논리적 근거가 있습니다 — PECO상 노출이 필수이므로 제목·초록에 "
+                    "노출어가 없으면 적격 판정 자체가 불가능합니다. 근거가 필요한 쪽은 **노출어는 있는데 결과어가 없어 "
+                    "제외된 셀**이고, 여기가 감사 대상입니다."
+                )
+                st.markdown("**목표 상한별 추가 감사 분량**")
+                st.dataframe(opts, use_container_width=True, hide_index=True)
+
+                tgt = st.selectbox("목표 누락 상한(편)", [100, 50, 25, 10], index=2, key="audit_target")
+                if st.button("① 감사 표본 뽑기", use_container_width=True, key="btn_audit_build"):
+                    try:
+                        sizes = recommend_audit_sizes(strata, target_max_missed=float(tgt))
+                        sample = build_risk_audit_sample(result.predictions, sizes)
+                        st.session_state["audit_sample_df"] = sample
+                        save_project_state(active, "audit_sample_df", sample)
+                        st.success(f"{len(sample)}편을 뽑았습니다. Audit_Label 열에 O 또는 X를 입력하세요.")
+                    except Exception as exc:
+                        st.error(str(exc))
+
+                a_sample = st.session_state.get("audit_sample_df")
+                if isinstance(a_sample, pd.DataFrame) and not a_sample.empty:
+                    st.download_button(
+                        f"② 감사용 {len(a_sample)}편 다운로드",
+                        dataframe_to_excel_bytes(a_sample),
+                        "AI_AutoExclude_Audit.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary", use_container_width=True,
+                    )
+                    st.caption("적격 **가능성이 있으면 O**, 확실히 제외면 X. 애매하면 O로 두세요 — 누락을 찾는 것이 목적입니다.")
+                    a_file = st.file_uploader("③ 판정 완료한 AI_AutoExclude_Audit.xlsx 업로드",
+                                              type=["xlsx", "xls", "csv"], key="audit_upload")
+                    if a_file:
+                        try:
+                            a_df, _sh = _read_screening_upload(a_file)
+                            after = audit_risk_strata(result.predictions, audit_labels=a_df)
+                            summ = summarize_audit(after, total_include_est=inc_est)
+                            st.dataframe(after, use_container_width=True, hide_index=True)
+                            if summ["found_include"] == 0:
+                                st.success(
+                                    f"감사 {summ['audited_n']:,}편에서 적격 후보가 나오지 않았습니다. "
+                                    f"자동 제외 {summ['pool_n']:,}편에서 놓친 적격 문헌은 95% 신뢰수준에서 "
+                                    f"최대 {summ['max_missed_upper']:.0f}편입니다. 이 수치를 Methods와 Limitations에 그대로 쓰세요."
+                                )
+                            else:
+                                st.error(
+                                    f"감사에서 적격 후보가 {summ['found_include']}편 나왔습니다. 자동 제외를 그대로 쓰면 안 됩니다. "
+                                    "해당 문헌의 Gate_Fail_Reason을 확인해 결과어/노출어 사전을 보강한 뒤 다시 선별하세요."
+                                )
+                        except Exception as exc:
+                            st.error(str(exc))
+            except Exception as exc:
+                st.caption(f"감사 설계를 만들 수 없습니다: {exc}")
+
+            with st.expander("Known-item 복구 검사 (이미 적격임을 아는 문헌이 제외되지 않았는지)", expanded=False):
+                st.caption(
+                    "연구계획서 인용문헌, 선행 리뷰의 포함문헌, 다른 경로로 이미 찾은 적격 문헌의 제목을 "
+                    "한 줄에 하나씩 넣으세요. 통계적 상한보다 심사자 설득력이 큰 증거입니다."
+                )
+                known_text = st.text_area("알려진 적격 문헌 제목", height=140, key="known_items")
+                if st.button("복구 검사 실행", use_container_width=True, key="btn_known"):
+                    titles = [t.strip() for t in str(known_text).splitlines() if t.strip()]
+                    if not titles:
+                        st.warning("제목을 한 줄에 하나씩 입력해 주세요.")
+                    else:
+                        tbl, ks = known_item_recovery(result.predictions, titles)
+                        st.dataframe(tbl, use_container_width=True, hide_index=True)
+                        if ks["passed"]:
+                            st.success(
+                                f"{ks['n_known']}편 중 {ks['n_found_in_corpus']}편을 코퍼스에서 찾았고, "
+                                "자동 제외된 문헌은 없습니다."
+                            )
+                        else:
+                            st.error(
+                                f"알려진 적격 문헌 {ks['n_auto_excluded']}편이 자동 제외되었습니다. "
+                                "자동 제외를 적용하면 안 됩니다."
+                            )
 
         st.download_button(
             "Human validation 품질관리 보고서 다운로드",

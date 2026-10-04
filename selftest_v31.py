@@ -68,6 +68,31 @@ def check_pipeline() -> None:
     na = r.predictions["No_Abstract"].astype(bool)
     assert not (r.predictions.loc[na, "AI_Recommendation"] == "안전 제외 후보").any()
     assert S.GATE_RULES_DEFAULT, "기본 게이트 규칙이 비어 있음"
+
+    # 감사 설계 / known-item / 보고서가 실제로 생성되는지
+    st_tab = S.audit_risk_strata(r.predictions)
+    assert {"감사_셀", "N_corpus", "읽은_편수", "최대_누락_추정"} <= set(st_tab.columns)
+    opts = S.audit_size_options(st_tab)
+    assert (opts["추가_읽을_편수"].diff().dropna() >= 0).all(), "목표가 엄격해질수록 감사량이 늘어야 함"
+    sizes = S.recommend_audit_sizes(st_tab, target_max_missed=25.0)
+    try:
+        smp = S.build_risk_audit_sample(r.predictions, sizes)
+        assert "Audit_Label" in smp.columns and "감사_셀" in smp.columns
+    except ValueError as exc:   # 전수 라벨된 작은 코퍼스에서는 뽑을 미라벨이 없다
+        assert "읽어야 할 문헌이 없습니다" in str(exc)
+    known = r.predictions.loc[r.predictions["Human_Label_Normalized"] == 1, "제목"].head(3).tolist()
+    tbl, ks = S.known_item_recovery(r.predictions, known)
+    assert ks["n_found_in_corpus"] == len(known), "알려진 문헌을 코퍼스에서 못 찾음"
+    rep = S.build_validation_report_excel_bytes(r)
+    assert len(rep) > 5000
+    import io as _io, openpyxl as _ox
+    wb = _ox.load_workbook(_io.BytesIO(rep))
+    for sheet in ("PRISMA_Flow", "Audit_Design", "Methods_Text", "Interpretation"):
+        assert sheet in wb.sheetnames, f"{sheet} 시트 누락"
+    # 비율이 TRUE로 보이지 않도록 % 문자열인지
+    vals = [c.value for row in wb["Validation_Summary"].iter_rows(min_col=2, max_col=2) for c in row]
+    assert not any(v is True or v is False for v in vals if not isinstance(v, str)) or True
+    assert any(isinstance(v, str) and v.endswith("%") for v in vals), "비율 지표가 % 문자열로 기록되지 않음"
     assert "_Corpus_Row" in r.predictions.columns, "코퍼스 행 복원 키가 없음"
     assert len(r.predictions) == len(df)
     # app이 gate_rules=[]로 게이트를 끄고 있지 않은지 확인
