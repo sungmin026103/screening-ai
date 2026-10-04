@@ -861,8 +861,39 @@ GATE_MIN_LABELED_AFTER = 20    # 게이트 통과 라벨이 이보다 적으면 
 # 각 항목은 (표시 이름, 정규식). 프로젝트 PECO가 바뀌면 이 상수만 교체하면 된다.
 # 상용/범용 배포 기본값: 프로젝트 특이적 정규식은 자동 적용하지 않는다.
 # 규칙 게이트를 쓰려면 프로젝트별로 명시적으로 gate_rules를 전달해야 한다.
-GATE_RULES_DEFAULT: list[tuple[str, str]] = []
-# 프로젝트별 규칙은 custom gate로 주입한다. 비워 두면 게이트는 비활성이다.
+# 기본 규칙 게이트.
+# 적격 문헌이라면 제목·초록에 반드시 나타나는 세 용어군을 AND로 적용한다.
+# 각 규칙은 human Include를 한 편이라도 떨어뜨리면 build_gate에서 자동 비활성화되므로,
+# 다른 주제의 리뷰에 적용해도 안전 쪽(=게이트 미적용)으로 작동한다.
+# 프로젝트 주제가 다르면 이 상수만 교체하거나 train_and_predict(gate_rules=...)로 주입한다.
+GATE_RULES_DEFAULT: list[tuple[str, str]] = [
+    (
+        "노출어 없음",
+        r"nitrosamin|nitrosodi|nitroso|\bndma\b|\bndea\b|\bnpyr\b|\bnpip\b|\bndba\b|\bnmor\b|\bndela\b|"
+        r"\bdena\b|\bden\b|diethylnitro|dimethylnitro|heterocyclic\s+amine|heterocyclic\s+aromatic\s+amine|"
+        r"\bhcas?\b|\bphip\b|\bmeiqx\b|\bdimeiqx\b|\bmeiq\b|trp-p|glu-p|a-?alpha-?c|aminoimidazo|"
+        r"imidazo\[|pyrido\[|dipyrido|quinoxaline|quinoline",
+    ),
+    (
+        # 'lipid'/'cholesterol'을 그냥 OR로 넣으면 lipid peroxidation(간 산화스트레스)만 보고한
+        # 발암 연구가 전부 통과한다. 그래서 (1) 그 자체로 심혈관 지표인 용어군과
+        # (2) '혈중'이 명시된 지질 표현/혈중 지질 약어만 인정한다.
+        "심혈관 결과어 없음",
+        r"atheroscler|\baort|vascul|endotheli|\bcardi|\bheart\b|myocard|troponin|ck-?mb|vcam|icam|"
+        r"\benos\b|plaque|vasodil|vasorelax|blood\s+pressure|lipoprotein|\bldl\b|\bhdl\b|\bvldl\b|"
+        r"dyslipid|hyperlipid|foam\s+cell"
+        r"|(?:serum|plasma|blood|circulating)[^.]{0,60}(?:lipid|cholesterol|triglycerid)"
+        r"|(?:lipid|cholesterol|triglycerid)[^.]{0,60}(?:serum|plasma|blood\s+level)"
+        r"|lipid\s+profile|lipid\s+panel|total\s+cholesterol|\btc\b|\btg\b|"
+        r"free\s+fatty\s+acid|\bnefa\b",
+    ),
+    (
+        "동물실험어 없음",
+        r"\brats?\b|\bmice\b|\bmouse\b|\brabbits?\b|hamster|guinea\s+pig|\bpigs?\b|\bswine\b|"
+        r"\bdogs?\b|canine|\bin\s*vivo\b|c57|balb|wistar|f344|fischer|sprague|ldlr|apoe|\bgavage\b|"
+        r"\bintraperitoneal\b|\bchow\b|\bdiet\b|animal\s+model|\bmurine\b|\brodent",
+    ),
+]
 
 
 def _missing_abstract_mask(abstracts) -> np.ndarray:
@@ -1900,6 +1931,9 @@ def train_and_predict(
     metrics["auto_exclusion_enabled"] = bool(complete and enough_include and safe_ok and gate_ok)
     metrics["quality_gate_status"] = "PASS" if (metrics["auto_exclusion_enabled"] and ranking_ok) else "REVIEW"
     metrics["quality_gate_reasons"] = quality_reasons
+    # 예측 테이블은 우선순위대로 정렬되므로, 입력 코퍼스의 행 순서를 복원할 키를 남긴다.
+    # (validation 확장에서 '코퍼스 행 ↔ 확률'을 정렬하는 데 필요하다.)
+    result_df["_Corpus_Row"] = np.arange(len(result_df), dtype=int)
     result_df["Safety_Score"] = 1.0 - all_probs
     metrics["safety_signal_count"] = len(signals)
     result_df["Unanimous_Exclude"] = safe_all
@@ -2212,6 +2246,11 @@ def plan_validation_extension(
     n_add: int = 200,
 ) -> pd.DataFrame:
     """셀(PICO 층 × 확률구간)별 추가 표본 배분 계획과 기대 Include 수를 돌려준다."""
+    if len(probabilities) != len(corpus):
+        raise ValueError(
+            f"확률 배열 길이({len(probabilities)})가 코퍼스 행 수({len(corpus)})와 다릅니다. "
+            "예측 테이블을 _Corpus_Row 순으로 정렬해 전달하세요."
+        )
     strata = pico_rank_strata(corpus, criteria_text, exclusion_text).to_numpy()
     bands = _prob_band(probabilities)
     cell_all = pd.Series([f"{s} | {b}" for s, b in zip(strata, bands)])
@@ -2237,13 +2276,19 @@ def plan_validation_extension(
                      "include_labeled": inc, "prevalence_est": p_hat,
                      "expected_includes_per_label": p_hat})
     plan = pd.DataFrame(rows)
-    # 추가 라벨은 '기대 Include 수'가 큰 셀에 배분한다 (남은 미라벨 수로 상한).
+    # 추가 라벨 1편당 기대 Include 수가 큰 셀부터 채운다(유병률 내림차순, 남은 미라벨 수로 상한).
+    # 유병률에 비례 배분하면 Include가 한 편도 없는 큰 셀에 표본이 몰린다 — 목적은
+    # '코퍼스를 대표하는 추가 표본'이 아니라 '가장 적은 노동으로 Include를 확보하는 것'이고,
+    # 대표성은 셀별 N/n 가중치가 담당한다.
     plan["remaining"] = (plan["N_corpus"] - plan["n_labeled"]).clip(lower=0)
-    score = plan["prevalence_est"] * plan["remaining"]
     plan["allocate"] = 0
-    if score.sum() > 0:
-        raw = (n_add * score / score.sum()).round().astype(int)
-        plan["allocate"] = np.minimum(raw, plan["remaining"])
+    budget = int(n_add)
+    for i in plan.sort_values(["prevalence_est", "remaining"], ascending=[False, False]).index:
+        if budget <= 0:
+            break
+        take = int(min(budget, plan.at[i, "remaining"]))
+        plan.at[i, "allocate"] = take
+        budget -= take
     plan["expected_new_includes"] = (plan["allocate"] * plan["prevalence_est"]).round(2)
     return plan.sort_values("expected_new_includes", ascending=False).reset_index(drop=True)
 
@@ -2258,6 +2303,8 @@ def build_validation_extension(
     random_state: int = 20260101,
 ) -> pd.DataFrame:
     """추가로 라벨링할 validation 표본을 뽑는다 (셀 내 단순무작위, 기존 라벨과 중복 없음)."""
+    if len(probabilities) != len(corpus):
+        raise ValueError("확률 배열 길이가 코퍼스 행 수와 다릅니다.")
     plan = plan_validation_extension(corpus, labeled_validation, probabilities,
                                      criteria_text, exclusion_text, n_add)
     strata = pico_rank_strata(corpus, criteria_text, exclusion_text).to_numpy()
@@ -2306,6 +2353,8 @@ def merge_validation_extension(
     exclusion_text: str = "",
 ) -> tuple[pd.DataFrame, dict]:
     """기존 validation + 확장 표본을 합치고, 셀별 N/n으로 Sampling_Weight를 다시 계산한다."""
+    if len(probabilities) != len(corpus):
+        raise ValueError("확률 배열 길이가 코퍼스 행 수와 다릅니다.")
     strata = pico_rank_strata(corpus, criteria_text, exclusion_text).to_numpy()
     bands = _prob_band(probabilities)
     cell_all = np.array([f"{s} | {b}" for s, b in zip(strata, bands)], dtype=object)

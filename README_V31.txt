@@ -60,3 +60,47 @@ AI 확률은 독립된 training 표본으로 적합된 모델의 출력이며 va
 앱 UI: 자동 제외가 잠긴 상태에서 '최종 선별 결과' 아래에
   ① 배분 계획 보기 → ② 추가 표본 뽑기 → ③ 다운로드 → ④ 판정 후 업로드 → 가중치 재계산
 순서로 진행한다. 계획 화면에 '추가 N편을 읽으면 Include가 약 몇 편 늘어나는지' 추정치를 보여준다.
+
+[V31 핫픽스 — 배포 사고 2건]
+1. NameError: app.py가 screening.py의 MANUAL_REVIEW_TIER 등 새 이름을 import하지 않아
+   결과 화면에서 죽었다. import 블록을 수정하고, selftest_v31.py에
+   'app.py가 쓰는 screening 이름이 전부 import되었는지' 검사를 추가했다.
+2. 규칙 게이트가 꺼진 채 동작: app.py가 train_and_predict(gate_rules=[])로 빈 규칙을
+   강제 전달하고 있었고 GATE_RULES_DEFAULT도 비어 있었다. 그래서 안전 제외가 10편에 그쳤다.
+   gate_rules=None(기본값 사용)으로 바꾸고 GATE_RULES_DEFAULT에 검증된 3개 규칙을 복원했다.
+   각 규칙은 human Include를 한 편이라도 떨어뜨리면 자동 비활성화되므로 안전 쪽으로 작동한다.
+
+[V31 2차 핫픽스 — 검증 절차를 바꿔서 잡은 버그]
+이전 배포는 "함수를 직접 호출하는 테스트"만 돌려서 앱 경로의 버그를 못 잡았다.
+이번에는 streamlit.testing AppTest로 실제 화면을 렌더하고 버튼까지 눌러 확인했다.
+그 과정에서 추가로 발견해 고친 것:
+
+1. df 미정의 NameError (잠재)
+   결과 화면은 파일 재업로드 없이도 그려지는데, validation 확장 블록이 업로더 안에서만
+   정의되는 df를 참조했다. 코퍼스를 st.session_state["screen_corpus_df"]에 보관하고,
+   없으면 안내 문구를 띄우며 확장 기능을 비활성화하도록 바꿨다.
+
+2. 확률-코퍼스 정렬 오류 (조용한 오작동, 더 위험)
+   예측 테이블은 우선순위대로 정렬되고 _Source_Index도 없어서, 확장 기능에 넘어가는
+   AI 확률이 코퍼스 행과 어긋난 채로 계산될 수 있었다. train_and_predict가 _Corpus_Row를
+   남기도록 하고, 확장 함수들에 길이 불일치 검증을 넣었다.
+
+3. 위젯 key와 session_state key 충돌
+   key="ext_plan" 버튼과 st.session_state["ext_plan"] 대입이 충돌해 ① 버튼을 눌러도
+   ② 단계가 나타나지 않았다. state key를 ext_plan_df / ext_sample_df로 분리했다.
+
+4. 추가 표본 배분 전략 수정
+   유병률 비례 배분은 Include가 한 편도 없는 큰 셀에 표본을 몰아넣었다. 라벨 1편당
+   기대 Include가 큰 셀부터 채우는 탐욕적 배분으로 바꿨다. 대표성은 셀별 N/n 가중치가 담당한다.
+
+[검증 내역]
+  pyflakes           전 모듈 미정의 이름 0건
+  selftest_v30.py    PASS
+  selftest_v31.py    PASS (app import 일치 / 위젯 key 충돌 / 초록결측 티어 / _Corpus_Row / 기본 게이트)
+  E2E (2,000편 합성) 표본선정 → 라벨 → 학습 → 재타이어링(0.99/0.95/0.90) → 엑셀 4종 →
+                     확장 계획 → 추가 표본 추출 → 병합 → 재학습까지 통과,
+                     가중치 합이 코퍼스 크기를 정확히 복원(2,000.000)
+  AppTest UI         ①결과만 보유 ②확장 가능 ③자동제외 잠금 3가지 상태에서 예외 0건,
+                     ① 배분 계획 → ② 표본 뽑기 → ③ 다운로드 버튼까지 클릭 동작 확인
+  실제 validation    게이트 3규칙 전부 활성·Include 탈락 0편, safe Recall(가중) 100%·FN 0,
+                     안전 제외 추정 6,356편 / 사람이 읽을 양 1,274편

@@ -39,6 +39,11 @@ from screening import (
     TRAINING_SAMPLE_SIZE,
     MIN_LABELS_FOR_SUPERVISED,
     MIN_INCLUDE_FOR_SUPERVISED,
+    MANUAL_REVIEW_TIER,
+    GATE_RULES_DEFAULT,
+    plan_validation_extension,
+    build_validation_extension,
+    merge_validation_extension,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -760,6 +765,8 @@ elif nav == "screen":
 
     if file:
         df, selected_sheet = _read_screening_upload(file)
+        # 결과 화면(아래 if result 블록)은 업로드 없이도 그려지므로 코퍼스를 세션에 보관한다.
+        st.session_state["screen_corpus_df"] = df
         labeled_n = detect_label_count(df)
         if selected_sheet:
             st.caption(f"Excel 시트 자동 선택: {selected_sheet}")
@@ -860,7 +867,7 @@ elif nav == "screen":
                                     merged_df,
                                     recall_target=DEFAULT_RECALL_TARGET,
                                     criteria_text=criteria_text,
-                                    gate_rules=[],
+                                    gate_rules=None,  # None이면 GATE_RULES_DEFAULT를 사용한다.
                                     validation_expected_n=len(training_sample),
                                 )
                             result.metrics["training_design"] = "fixed_200_pico_enriched_stratified_validation"
@@ -935,19 +942,33 @@ elif nav == "screen":
             )
             ext_n = st.selectbox("추가로 라벨링할 편수", [100, 200, 300, 400], index=1, key="ext_n")
             labeled_val = st.session_state.get("screen_labeled_validation")
-            probs_corpus = result.predictions.sort_values("_Source_Index")["AI_Probability"].to_numpy() \
-                if "_Source_Index" in result.predictions.columns else result.predictions["AI_Probability"].to_numpy()
+            corpus_df = st.session_state.get("screen_corpus_df")
+            preds = result.predictions
+            ext_ready = (
+                corpus_df is not None
+                and labeled_val is not None
+                and "_Corpus_Row" in preds.columns
+                and len(preds) == len(corpus_df)
+            )
+            probs_corpus = (
+                preds.sort_values("_Corpus_Row")["AI_Probability"].to_numpy() if ext_ready else None
+            )
+            if not ext_ready:
+                st.info(
+                    "추가 표본을 뽑으려면 위에서 전체 문헌 파일과 라벨 파일을 다시 업로드해 주세요. "
+                    "세션이 새로 시작되면 코퍼스가 메모리에 없습니다."
+                )
 
-            if st.button("① 추가 표본 배분 계획 보기", use_container_width=True, key="ext_plan"):
+            if ext_ready and st.button("① 추가 표본 배분 계획 보기", use_container_width=True, key="btn_ext_plan"):
                 try:
                     plan = plan_validation_extension(
-                        df, labeled_val, probs_corpus, pico_sectioned_text,
+                        corpus_df, labeled_val, probs_corpus, pico_sectioned_text,
                         pico.get("exclusion_criteria", ""), n_add=int(ext_n))
-                    st.session_state["ext_plan"] = plan
+                    st.session_state["ext_plan_df"] = plan
                 except Exception as exc:
                     st.error(str(exc))
 
-            plan = st.session_state.get("ext_plan")
+            plan = st.session_state.get("ext_plan_df") if ext_ready else None
             if isinstance(plan, pd.DataFrame) and not plan.empty:
                 show = plan[plan["allocate"] > 0][
                     ["Cell", "N_corpus", "n_labeled", "include_labeled", "prevalence_est", "allocate", "expected_new_includes"]]
@@ -958,18 +979,18 @@ elif nav == "screen":
                     f"(현재 {include_n_now}편 → 약 {include_n_now + exp_inc:.0f}편). "
                     "자동 제외를 열려면 Include 10편 이상이 필요합니다."
                 )
-                if st.button("② 추가 표본 뽑기", use_container_width=True, key="ext_build"):
+                if st.button("② 추가 표본 뽑기", use_container_width=True, key="btn_ext_build"):
                     try:
                         ext = build_validation_extension(
-                            df, labeled_val, probs_corpus, pico_sectioned_text,
+                            corpus_df, labeled_val, probs_corpus, pico_sectioned_text,
                             pico.get("exclusion_criteria", ""), n_add=int(ext_n))
-                        st.session_state["ext_sample"] = ext
-                        save_project_state(active, "ext_sample", ext)
+                        st.session_state["ext_sample_df"] = ext
+                        save_project_state(active, "ext_sample_df", ext)
                         st.success(f"{len(ext)}편을 뽑았습니다. Human_Label 열에 O 또는 X를 입력하세요.")
                     except Exception as exc:
                         st.error(str(exc))
 
-            ext_sample = st.session_state.get("ext_sample")
+            ext_sample = st.session_state.get("ext_sample_df") if ext_ready else None
             if isinstance(ext_sample, pd.DataFrame) and not ext_sample.empty:
                 st.download_button(
                     f"③ 추가 validation {len(ext_sample)}편 다운로드",
@@ -985,7 +1006,7 @@ elif nav == "screen":
                     try:
                         ext_df, _sheet = _read_screening_upload(ext_file)
                         merged_val, mstats = merge_validation_extension(
-                            df, labeled_val, ext_df, probs_corpus,
+                            corpus_df, labeled_val, ext_df, probs_corpus,
                             pico_sectioned_text, pico.get("exclusion_criteria", ""))
                         st.session_state["screen_labeled_validation"] = merged_val
                         save_project_state(active, "screen_labeled_validation", merged_val)
@@ -1012,11 +1033,14 @@ elif nav == "screen":
         if gm.get("gate_active"):
             gs = gm.get("gate_stats", {})
             st.info(
-                "이 프로젝트에는 사용자가 명시적으로 제공한 규칙 게이트가 적용되었습니다. "
+                "규칙 게이트가 적용되었습니다(human Include를 떨어뜨리는 규칙은 자동 비활성화됩니다). "
                 f"게이트 제외 {int(gs.get('corpus_removed_n', 0)):,}편 · human Include 탈락 {int(gs.get('labeled_include_removed_n', 0))}편"
             )
         else:
-            st.caption("V30 범용 모드에서는 프로젝트 특이적 hidden regex gate를 기본 적용하지 않습니다.")
+            st.caption(
+                "규칙 게이트가 적용되지 않았습니다. 기본 규칙이 human Include를 한 편이라도 떨어뜨렸거나, "
+                "게이트 통과 라벨이 부족한 경우입니다. 위 품질관리 보고서에서 사유를 확인하세요."
+            )
 
         with st.expander("검증 성능 자세히 보기", expanded=False):
             m = result.metrics
