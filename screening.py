@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import re
+import hashlib
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from copy import deepcopy
 
@@ -45,32 +47,15 @@ except Exception:  # pragma: no cover
 # 화면에 표시되는 3단계 우선순위 (정렬 순서 그대로 사용)
 PRIORITY_ORDER = ["우선 검토", "경계 문헌", "안전 제외 후보"]
 
-# ---------------------------------------------------------------------------
-# 검증된 기준 성능(Reference benchmark)
-# ---------------------------------------------------------------------------
-# 이 값은 현재 프로젝트의 실시간 성능이 아니라, 이전에 사람 라벨이 있는 독립적인
-# 검증 데이터에서 얻은 기준 성능이다. 라벨이 없는 새 프로젝트에서도 사용자가
-# "이 AI가 어느 정도 검증되었는지" 확인할 수 있도록 UI에 항상 표시한다.
-# 새 버전의 모델을 다시 검증하면 이 상수만 업데이트하면 된다.
-REFERENCE_BENCHMARK = {
-    "name": "SpaceFood labeled benchmark",
-    "version_note": "Legacy reference benchmark (pre-V16); V16 requires revalidation",
-    "n": 2499,
-    "recall": 0.9893,
-    "precision": 0.1800,
-    "false_negative": 2,
-    "roc_auc": 0.9446,
-    "average_precision": 0.6856,
-    "screening_burden": 0.411,
-    "work_saved": 0.589,
-}
-
 # 지도학습(재현율 통계적 보장) 모드로 전환되는 최소 라벨 수. 이 미만이면 앱은
 # 자동으로 zero-shot 모드로 동작한다 — 사람이 매번 "어느 모드로 할지" 고르는 게
 # 아니라, 라벨 존재 여부라는 데이터 상태로 결정되는 고정 기준이다.
 MIN_LABELS_FOR_SUPERVISED = 100
 TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
+VALIDATION_RECALL_TARGET = 0.95
+VALIDATION_CONFIDENCE = 0.95
+ALGORITHM_VERSION = "V30.0"
 # 층화 추출: PICO 점수 순위 경계(상위 10%, 상위 40%)와 층별 표본 배분(합 1.0)
 STRATUM_BOUNDS = (None, 0.40)  # High는 상위 n_high편 전수, Mid는 그 아래~상위 40%
 STRATUM_ALLOCATION = (0.50, 0.35, 0.15)
@@ -193,6 +178,17 @@ def detect_label_count(df: pd.DataFrame) -> int:
         return 0
 
 
+def _stable_record_id(source_index: int, title: str) -> str:
+    """Human-validation 파일에서 행을 안전하게 다시 연결하기 위한 안정적 ID."""
+    payload = f"{int(source_index)}|{str(title).strip().casefold()}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(payload).hexdigest()[:20]
+
+
+def _validation_set_id(record_ids: list[str]) -> str:
+    payload = "|".join(sorted(map(str, record_ids))).encode("utf-8")
+    return "VAL-" + hashlib.sha256(payload).hexdigest()[:16].upper()
+
+
 def build_training_sample(
     df: pd.DataFrame,
     criteria_text: str,
@@ -200,14 +196,14 @@ def build_training_sample(
     sample_size: int = TRAINING_SAMPLE_SIZE,
     random_state: int = 42,
 ) -> pd.DataFrame:
-    """전체 코퍼스에서 학습 가치가 높은 문헌을 빠르게 한 번에 뽑는다.
+    """전체 코퍼스에서 1회성 human-validation 표본을 만든다.
 
-    PICO 점수 상위 100편은 전수, 그 아래~상위 40%에서 70편, 하위 60%에서 30편을 무작위 추출한다.
-    이 단계는 의도적으로 가벼운 TF-IDF만 사용해 8천~수만 편에서도 빠르게 끝나며,
-    실제 최종 지도학습 모델은 이후 200편 라벨을 이용해 별도로 학습한다.
+    기본 200편 = High 100편(상위 PICO 적합도 전수) + Mid 70편 + Low 30편(층화 무작위).
+    High는 certainty stratum이라 weight=1이며, Mid/Low는 역추출확률 가중치(IPW)를 저장한다.
+    이 200편은 모델 학습과 out-of-fold 내부 검증에 동시에 사용되며 추가 라벨링은 필수가 아니다.
     """
     if not criteria_text or not criteria_text.strip():
-        raise ValueError("학습용 문헌을 선정하려면 PICO 기준이 필요합니다.")
+        raise ValueError("검증용 문헌을 선정하려면 PICO/PECO 기준이 필요합니다.")
     if len(df) == 0:
         raise ValueError("문헌 데이터가 비어 있습니다.")
 
@@ -219,6 +215,8 @@ def build_training_sample(
     titles = base[title_col].fillna("").astype(str)
     abstracts = base[abstract_col].fillna("").astype(str) if abstract_col else pd.Series([""] * len(base))
     docs = (titles + " " + abstracts).str.strip().tolist()
+    if not any(x.strip() for x in docs):
+        raise ValueError("Title/Abstract 텍스트가 비어 있어 표본을 선정할 수 없습니다.")
     base["_Source_Index"] = np.arange(len(base), dtype=int)
 
     sections = _parse_pico_sections(criteria_text)
@@ -228,15 +226,13 @@ def build_training_sample(
     exclusion_items = _split_bullet_items(exclusion_text)
     all_queries = queries + exclusion_items
 
-    # 샘플 선정은 속도가 핵심이므로 pretrained embedding 다운로드 없이 TF-IDF만 사용.
-    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=60000, sublinear_tf=True, stop_words="english")
+    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=60000,
+                          sublinear_tf=True, stop_words="english")
     mat = vec.fit_transform(docs + all_queries)
     doc_mat = mat[:len(docs)]
     query_mat = mat[len(docs):]
     pico_q = query_mat[:len(queries)]
     pico_sim = cosine_similarity(doc_mat, pico_q)
-    # 샘플 enrichment에서는 min만 쓰면 짧은 제목/초록에서 0이 과도하게 많아져
-    # 구분력이 사라질 수 있어 mean+min을 결합한다.
     pico_score = 0.65 * pico_sim.mean(axis=1) + 0.35 * pico_sim.min(axis=1)
     if exclusion_items:
         excl_q = query_mat[len(queries):]
@@ -245,86 +241,184 @@ def build_training_sample(
         excl_score = np.zeros(len(docs), dtype=float)
     scores = np.asarray(pico_score - 0.75 * excl_score, dtype=float)
 
-    # 층화 표본: 상위층은 전수(take-all), 나머지 층은 무작위.
-    # - High: PICO 점수 상위 n_high편을 그대로 선택(추출확률 1, weight 1). Include를
-    #   최대한 확보해 모델 학습력을 유지한다(예전 방식과 동일한 편수).
-    # - Mid/Low: 나머지를 점수 순위로 두 층으로 나눠 각 층에서 무작위 추출하고
-    #   Sampling_Weight = 층 크기 / 추출 편수를 붙인다. 이 가중치로 임계값을 정하면
-    #   저관련 영역에 숨은 Include까지 반영한 코퍼스 기준 Recall을 추정할 수 있다.
-    # 라벨 수(200)는 그대로다.
-    n = min(int(sample_size), len(base))
-    rng = np.random.default_rng(random_state)
+    n_total = len(base)
+    n = min(int(sample_size), n_total)
     order = np.argsort(-scores, kind="stable")
-    alloc = [int(round(n * a)) for a in STRATUM_ALLOCATION]
-    alloc[-1] = n - sum(alloc[:-1])
+    rng = np.random.default_rng(random_state)
 
-    selected: list[tuple[int, str, float]] = []
-    used_titles: set[str] = set()
+    # 코퍼스가 200편 이하라면 표본추출이 아니라 전수 validation이다.
+    if n == n_total:
+        selected = [(int(i), "Census", 1.0, 1.0, n_total, n_total) for i in order]
+    else:
+        alloc = [int(round(n * a)) for a in STRATUM_ALLOCATION]
+        alloc[-1] = n - sum(alloc[:-1])
+        high_n = min(alloc[0], n_total)
+        cut_mid = max(high_n, min(n_total, int(np.ceil(n_total * STRATUM_BOUNDS[1]))))
+        high_pool = order[:high_n]
+        mid_pool = order[high_n:cut_mid]
+        low_pool = order[cut_mid:]
 
-    def _take(pool, want):
-        picked = []
-        for idx in pool:
-            idx = int(idx)
-            key = titles.iloc[idx].strip().casefold()
-            if not key or key in used_titles:
-                continue
-            used_titles.add(key)
-            picked.append(idx)
-            if len(picked) >= want:
-                break
-        return picked
+        # 보통 N>>200이면 정확히 100/70/30. 작은 층이 부족한 예외에서는 남는 표본을 다른 층으로 이동.
+        mid_take = min(alloc[1], len(mid_pool))
+        low_take = min(alloc[2], len(low_pool))
+        deficit = n - (len(high_pool) + mid_take + low_take)
+        if deficit > 0:
+            add_mid = min(deficit, len(mid_pool) - mid_take)
+            mid_take += add_mid; deficit -= add_mid
+        if deficit > 0:
+            add_low = min(deficit, len(low_pool) - low_take)
+            low_take += add_low; deficit -= add_low
+        if deficit > 0:
+            # 이 경우는 사실상 n_total<=n에 가까운 경계 상황. 남은 행을 순위대로 채운다.
+            remaining = [i for i in order if i not in set(high_pool.tolist())]
+            chosen = set()
+            mid_pick = list(rng.choice(mid_pool, size=mid_take, replace=False)) if mid_take else []
+            low_pick = list(rng.choice(low_pool, size=low_take, replace=False)) if low_take else []
+            chosen.update(map(int, mid_pick + low_pick))
+            extra = [int(i) for i in remaining if int(i) not in chosen][:deficit]
+        else:
+            mid_pick = list(rng.choice(mid_pool, size=mid_take, replace=False)) if mid_take else []
+            low_pick = list(rng.choice(low_pool, size=low_take, replace=False)) if low_take else []
+            extra = []
 
-    high = _take(order, alloc[0])
-    selected.extend((i, "High PICO relevance", 1.0) for i in high)
-    k_high = (int(np.where(order == high[-1])[0][0]) + 1) if high else 0
-    cut_mid = max(k_high + 1, int(np.ceil(len(order) * STRATUM_BOUNDS[1])))
-    carry = 0
-    for label, members, want in [
-        ("Mid PICO relevance", order[k_high:cut_mid], alloc[1]),
-        ("Low PICO relevance", order[cut_mid:], alloc[2]),
-    ]:
-        picked = _take(rng.permutation(members), want + carry)
-        carry = want + carry - len(picked)
-        weight = len(members) / len(picked) if picked else 0.0
-        selected.extend((i, label, weight) for i in picked)
+        selected = []
+        # High는 정의상 top high_n 전수이므로 inclusion probability=1.
+        for i in high_pool:
+            selected.append((int(i), "High PICO relevance", 1.0, 1.0, len(high_pool), len(high_pool)))
+        if mid_take:
+            w = len(mid_pool) / mid_take
+            pi = mid_take / len(mid_pool)
+            selected.extend((int(i), "Mid PICO relevance", w, pi, len(mid_pool), mid_take) for i in mid_pick)
+        if low_take:
+            w = len(low_pool) / low_take
+            pi = low_take / len(low_pool)
+            selected.extend((int(i), "Low PICO relevance", w, pi, len(low_pool), low_take) for i in low_pick)
+        # extra는 매우 드문 경계 fallback이며 보수적으로 weight=1 처리하고 별도 표기한다.
+        selected.extend((int(i), "Fallback", 1.0, 1.0, len(extra), len(extra)) for i in extra)
 
     rows = []
-    for idx, stratum, weight in selected[:n]:
+    for idx, stratum, weight, pi, stratum_n, sampled_n in selected[:n]:
         row = base.iloc[idx].copy()
         row["Training_Stratum"] = stratum
-        row["Sampling_Weight"] = round(float(weight), 6)
+        row["Sampling_Weight"] = round(float(weight), 8)
+        row["Sampling_Probability"] = round(float(pi), 8)
+        row["Sampling_Stratum_N"] = int(stratum_n)
+        row["Sampling_Stratum_n"] = int(sampled_n)
+        row["Validation_Record_ID"] = _stable_record_id(idx, titles.iloc[idx])
         rows.append(row)
+
     out = pd.DataFrame(rows).reset_index(drop=True)
     out.insert(0, "Training_No", np.arange(1, len(out) + 1))
+    set_id = _validation_set_id(out["Validation_Record_ID"].astype(str).tolist())
+    out.insert(1, "Validation_Set_ID", set_id)
     out["Human_Label"] = ""
     return out
 
 
-def merge_training_labels(full_df: pd.DataFrame, labeled_sample_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """200편 라벨 파일을 원본 전체 문헌에 병합한다. _Source_Index를 우선 사용하고,
-    없으면 정규화한 제목으로 매칭한다. Human_Label은 O/X 또는 1/0을 허용한다.
+def validate_human_validation_file(expected_sample_df: pd.DataFrame, uploaded_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """다운로드한 validation 표본과 업로드된 O/X 파일의 무결성과 완전성을 검사한다.
+
+    Sampling_Weight/stratum 등 설계 메타데이터는 업로드 파일을 신뢰하지 않고 앱이 보관한
+    expected_sample_df에서 다시 가져온다. 사용자는 Human_Label만 수정할 수 있다.
+    """
+    expected = expected_sample_df.copy().reset_index(drop=True)
+    uploaded = uploaded_df.copy().reset_index(drop=True)
+    if expected.empty:
+        raise ValueError("앱에 저장된 validation 표본이 없습니다. 200편 표본을 다시 생성해 주세요.")
+    if "Human_Label" not in uploaded.columns:
+        # prepare_screening_data가 인식하는 별칭을 허용하되 최종적으로 Human_Label로 복사한다.
+        label_col = _find_col(uploaded, ["human_label", "label", "decision", "판정", "라벨"])
+        if label_col is None:
+            raise ValueError("Human_Label 열을 찾지 못했습니다. 다운로드한 파일의 열 이름을 유지해 주세요.")
+        uploaded["Human_Label"] = uploaded[label_col]
+
+    key = "Validation_Record_ID" if "Validation_Record_ID" in expected.columns and "Validation_Record_ID" in uploaded.columns else "_Source_Index"
+    if key not in expected.columns or key not in uploaded.columns:
+        raise ValueError("Validation_Record_ID 또는 _Source_Index가 없어 원본 200편과 안전하게 대조할 수 없습니다.")
+    if uploaded[key].duplicated().any():
+        raise ValueError(f"업로드 파일의 {key}에 중복 행이 있습니다. 원본 validation 파일을 사용해 주세요.")
+
+    exp_keys = expected[key].astype(str)
+    up_keys = uploaded[key].astype(str)
+    missing = sorted(set(exp_keys) - set(up_keys))
+    extra = sorted(set(up_keys) - set(exp_keys))
+    if missing or extra:
+        raise ValueError(
+            f"업로드 파일이 생성된 validation 표본과 일치하지 않습니다. 누락 {len(missing)}편, 추가 {len(extra)}편입니다. "
+            "처음 다운로드한 파일에서 Human_Label 열만 수정해 주세요."
+        )
+
+    label_map = dict(zip(up_keys, uploaded["Human_Label"]))
+    canonical = expected.copy()
+    canonical["Human_Label"] = canonical[key].astype(str).map(label_map)
+    normalized = canonical["Human_Label"].map(_normalize_label_value)
+    invalid_mask = ~normalized.isin([0, 1])
+    if invalid_mask.any():
+        bad_n = int(invalid_mask.sum())
+        bad_rows = canonical.loc[invalid_mask, "Training_No"].head(10).astype(str).tolist() if "Training_No" in canonical.columns else []
+        detail = f" (예: {', '.join(bad_rows)})" if bad_rows else ""
+        raise ValueError(f"200편 모두 O 또는 X로 판정해야 합니다. 미판정/잘못된 값 {bad_n}편{detail}")
+
+    canonical["Human_Label"] = normalized.astype(int)
+    include_n = int((canonical["Human_Label"] == 1).sum())
+    exclude_n = int((canonical["Human_Label"] == 0).sum())
+    return canonical, {
+        "labeled_n": int(len(canonical)),
+        "expected_n": int(len(expected)),
+        "include_n": include_n,
+        "exclude_n": exclude_n,
+        "complete": True,
+        "validation_set_id": str(expected.get("Validation_Set_ID", pd.Series([""])).iloc[0]) if len(expected) else "",
+    }
+
+
+def merge_training_labels(
+    full_df: pd.DataFrame,
+    labeled_sample_df: pd.DataFrame,
+    expected_sample_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Human-validation O/X를 전체 코퍼스에 병합한다.
+
+    V30에서는 expected_sample_df가 주어지면 200/200 완전 라벨링과 표본 ID 무결성을 강제하고,
+    Sampling_Weight는 앱이 원래 생성한 표본에서만 가져온다. 하위 호환을 위해 None도 허용한다.
     """
     full = full_df.copy().reset_index(drop=True)
-    sample = labeled_sample_df.copy().reset_index(drop=True)
-    sample_prepared, _ = prepare_screening_data(sample)
-    labels = sample_prepared["Human_Label"]
+    if expected_sample_df is not None:
+        sample, stats = validate_human_validation_file(expected_sample_df, labeled_sample_df)
+    else:
+        sample = labeled_sample_df.copy().reset_index(drop=True)
+        sample_prepared, _ = prepare_screening_data(sample)
+        sample["Human_Label"] = sample_prepared["Human_Label"]
+        valid_tmp = sample["Human_Label"].isin([0, 1])
+        stats = {
+            "labeled_n": int(valid_tmp.sum()),
+            "expected_n": int(len(sample)),
+            "include_n": int((sample.loc[valid_tmp, "Human_Label"] == 1).sum()),
+            "exclude_n": int((sample.loc[valid_tmp, "Human_Label"] == 0).sum()),
+            "complete": bool(valid_tmp.all()),
+            "validation_set_id": "",
+        }
 
     full["Human_Label"] = np.nan
     full["Sampling_Weight"] = np.nan
-    has_w = "Sampling_Weight" in sample.columns
+    full["Training_Stratum"] = pd.Series([""] * len(full), dtype="object")
+    full["Validation_Record_ID"] = pd.Series([""] * len(full), dtype="object")
     matched = 0
+
     if "_Source_Index" in sample.columns:
-        for i, lab in labels.items():
+        for _, row in sample.iterrows():
+            lab = _normalize_label_value(row.get("Human_Label"))
             if lab not in (0, 1):
                 continue
             try:
-                idx = int(sample.loc[i, "_Source_Index"])
+                idx = int(row["_Source_Index"])
             except Exception:
                 continue
             if 0 <= idx < len(full):
                 full.loc[idx, "Human_Label"] = int(lab)
-                if has_w:
-                    full.loc[idx, "Sampling_Weight"] = pd.to_numeric(sample.loc[i, "Sampling_Weight"], errors="coerce")
+                full.loc[idx, "Sampling_Weight"] = pd.to_numeric(row.get("Sampling_Weight", 1.0), errors="coerce")
+                full.loc[idx, "Training_Stratum"] = row.get("Training_Stratum", "")
+                full.loc[idx, "Validation_Record_ID"] = row.get("Validation_Record_ID", "")
                 matched += 1
     else:
         title_full = _find_col(full, ["title", "제목"])
@@ -334,21 +428,30 @@ def merge_training_labels(full_df: pd.DataFrame, labeled_sample_df: pd.DataFrame
         lookup = {}
         for idx, t in enumerate(full[title_full].fillna("").astype(str)):
             lookup.setdefault(t.strip().casefold(), idx)
-        for i, lab in labels.items():
+        for _, row in sample.iterrows():
+            lab = _normalize_label_value(row.get("Human_Label"))
             if lab not in (0, 1):
                 continue
-            key = str(sample.loc[i, title_sample]).strip().casefold()
-            idx = lookup.get(key)
+            key_title = str(row[title_sample]).strip().casefold()
+            idx = lookup.get(key_title)
             if idx is not None:
                 full.loc[idx, "Human_Label"] = int(lab)
-                if has_w:
-                    full.loc[idx, "Sampling_Weight"] = pd.to_numeric(sample.loc[i, "Sampling_Weight"], errors="coerce")
+                full.loc[idx, "Sampling_Weight"] = pd.to_numeric(row.get("Sampling_Weight", 1.0), errors="coerce")
+                full.loc[idx, "Training_Stratum"] = row.get("Training_Stratum", "")
+                full.loc[idx, "Validation_Record_ID"] = row.get("Validation_Record_ID", "")
                 matched += 1
 
     valid = full["Human_Label"].isin([0, 1])
-    include_n = int((full.loc[valid, "Human_Label"] == 1).sum())
-    exclude_n = int((full.loc[valid, "Human_Label"] == 0).sum())
-    return full, {"matched": int(matched), "include_n": include_n, "exclude_n": exclude_n, "labeled_n": int(valid.sum())}
+    stats = dict(stats)
+    stats.update({
+        "matched": int(matched),
+        "include_n": int((full.loc[valid, "Human_Label"] == 1).sum()),
+        "exclude_n": int((full.loc[valid, "Human_Label"] == 0).sum()),
+        "labeled_n": int(valid.sum()),
+    })
+    if expected_sample_df is not None and matched != len(expected_sample_df):
+        raise ValueError(f"전체 코퍼스와 validation 표본 매칭에 실패했습니다: {matched}/{len(expected_sample_df)}편")
+    return full, stats
 
 
 # ---------------------------------------------------------------------------
@@ -641,10 +744,14 @@ def _cosine_sim_matrix(doc_texts: list[str], query_texts: list[str]) -> np.ndarr
     if not query_texts:
         return np.zeros((len(doc_texts), 0))
     if embeddings_available():
-        model = _get_embed_model()
-        doc_vecs = model.encode(list(doc_texts), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
-        query_vecs = model.encode(list(query_texts), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
-        return doc_vecs @ query_vecs.T
+        try:
+            model = _get_embed_model()
+            doc_vecs = model.encode(list(doc_texts), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+            query_vecs = model.encode(list(query_texts), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+            return doc_vecs @ query_vecs.T
+        except Exception:
+            # 배포 서버가 오프라인이거나 모델 캐시가 없어도 전체 앱은 TF-IDF로 계속 동작한다.
+            pass
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
     vectorizer.fit(list(doc_texts) + list(query_texts))
     doc_vecs = vectorizer.transform(doc_texts)
@@ -723,6 +830,251 @@ def _obvious_exclusion_reason(title: str, abstract: str) -> str:
     ]
     reasons = [label for pattern, label in checks if re.search(pattern, t, flags=re.I)]
     return "; ".join(reasons)
+
+
+
+# ---------------------------------------------------------------------------
+# PECO 규칙 게이트 (ML 앞단의 결정론적 사전 제외)
+# ---------------------------------------------------------------------------
+# 배경: 층화 표본(High/Mid/Low PICO)에서 Low/Mid 층 Include 1~2편이 큰 표본가중치를
+# 갖기 때문에, 목표 재현율을 가중 기준으로 맞추면 임계값과 안전제외 컷오프가 동시에
+# 붕괴해 '안전 제외 후보'가 거의 나오지 않는다. 이때 검토량을 줄이는 가장 확실한
+# 수단은 모델을 더 돌리는 것이 아니라, 적격 문헌이라면 제목·초록에 반드시 등장할 수밖에
+# 없는 용어군(노출어/결과어/연구설계어)을 AND 조건으로 걸어 corpus를 먼저 줄이는 것이다.
+#
+# 안전장치:
+#   1) 각 규칙은 라벨 Include를 한 편이라도 떨어뜨리면 자동으로 비활성화된다
+#      (사람 라벨 위에서 FN=0인 규칙만 살아남는다).
+#   2) 살아남은 규칙이 없거나, 게이트 통과 Include가 너무 적으면 게이트 전체가 꺼진다.
+#   3) 게이트에서 떨어진 문헌은 삭제되지 않고 '안전 제외 후보'로 분류되며,
+#      Gate_Fail_Reason 열에 어떤 규칙에 걸렸는지 남는다 (감사·무작위 검증 가능).
+# ---------------------------------------------------------------------------
+
+GATE_MIN_INCLUDE_AFTER = 4     # 게이트 통과 라벨 Include가 이보다 적으면 게이트 사용 안 함
+GATE_MIN_LABELED_AFTER = 20    # 게이트 통과 라벨이 이보다 적으면 게이트 사용 안 함
+
+# 각 항목은 (표시 이름, 정규식). 프로젝트 PECO가 바뀌면 이 상수만 교체하면 된다.
+# 상용/범용 배포 기본값: 프로젝트 특이적 정규식은 자동 적용하지 않는다.
+# 규칙 게이트를 쓰려면 프로젝트별로 명시적으로 gate_rules를 전달해야 한다.
+GATE_RULES_DEFAULT: list[tuple[str, str]] = []
+
+# V29에 포함됐던 특정 니트로사민-심혈관-동물실험용 규칙은 하위 참고용으로만 보존한다.
+# 절대로 기본 적용되지 않는다.
+LEGACY_NITROSAMINE_CVD_GATE_RULES: list[tuple[str, str]] = [
+    (
+        "노출어 없음",
+        r"nitrosamin|nitrosodi|nitroso|\bndma\b|\bndea\b|\bnpyr\b|\bnpip\b|\bndba\b|\bnmor\b|\bndela\b|"
+        r"\bdena\b|\bden\b|diethylnitro|dimethylnitro|heterocyclic\s+amine|heterocyclic\s+aromatic\s+amine|"
+        r"\bhcas?\b|\bphip\b|\bmeiqx\b|\bdimeiqx\b|\bmeiq\b|trp-p|glu-p|a-?alpha-?c|aminoimidazo|"
+        r"imidazo\[|pyrido\[|dipyrido|quinoxaline|quinoline",
+    ),
+    (
+        # 'lipid'/'cholesterol'을 그냥 OR로 넣으면 lipid peroxidation(간 산화스트레스)만 보고한
+        # 발암 연구가 전부 통과한다. 그래서 (1) 그 자체로 심혈관 지표인 용어군과
+        # (2) '혈중'이 명시된 지질 표현/혈중 지질 약어만 인정한다.
+        "심혈관 결과어 없음",
+        r"atheroscler|\baort|vascul|endotheli|\bcardi|\bheart\b|myocard|troponin|ck-?mb|vcam|icam|"
+        r"\benos\b|plaque|vasodil|vasorelax|blood\s+pressure|lipoprotein|\bldl\b|\bhdl\b|\bvldl\b|"
+        r"dyslipid|hyperlipid|foam\s+cell"
+        r"|(serum|plasma|blood|circulating)[^.]{0,60}(lipid|cholesterol|triglycerid)"
+        r"|(lipid|cholesterol|triglycerid)[^.]{0,60}(serum|plasma|blood\s+level)"
+        r"|lipid\s+profile|lipid\s+panel|total\s+cholesterol|\btc\b|\btg\b|"
+        r"free\s+fatty\s+acid|\bnefa\b",
+    ),
+    (
+        "동물실험어 없음",
+        r"\brats?\b|\bmice\b|\bmouse\b|\brabbits?\b|hamster|guinea\s+pig|\bpigs?\b|\bswine\b|\bin\s*vivo\b|"
+        r"c57|balb|wistar|f344|fischer|sprague|ldlr|apoe|\bgavage\b|\bintraperitoneal\b|\bchow\b|"
+        r"\bdiet\b|animal\s+model|\bmurine\b|\brodent",
+    ),
+]
+
+
+def _gate_rule_masks(texts: np.ndarray, rules: list[tuple[str, str]]) -> dict[str, np.ndarray]:
+    """규칙별 '통과(해당 용어군이 존재)' 불린 마스크를 만든다."""
+    lowered = pd.Series([str(t).lower() for t in texts])
+    return {
+        name: lowered.str.contains(pattern, regex=True, na=False).to_numpy()
+        for name, pattern in rules
+    }
+
+
+def build_gate(
+    all_texts: np.ndarray,
+    labeled_pos: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray | None = None,
+    rules: list[tuple[str, str]] | None = None,
+) -> dict:
+    """규칙 게이트를 만들고 사람 라벨 위에서 검증한다.
+
+    반환 dict:
+        active        게이트를 실제로 적용해도 되는지
+        pass_mask     전체 문헌에 대한 통과 여부 (active=False면 전부 True)
+        reasons       전체 문헌에 대한 탈락 사유 문자열 ("" = 통과)
+        kept_rules    FN=0으로 검증을 통과해 실제 적용된 규칙 이름
+        dropped_rules {규칙명: 떨어뜨린 라벨 Include 편수}
+        stats         라벨/가중 기준 제거량과 FN
+    """
+    rules = list(rules if rules is not None else GATE_RULES_DEFAULT)
+    n_all = len(all_texts)
+    masks = _gate_rule_masks(all_texts, rules)
+
+    y = np.asarray(y, dtype=int)
+    inc = y == 1
+    kept: list[tuple[str, str]] = []
+    dropped: dict[str, int] = {}
+    for name, pattern in rules:
+        lab_mask = masks[name][labeled_pos]
+        fn = int((inc & ~lab_mask).sum())
+        if fn == 0:
+            kept.append((name, pattern))
+        else:
+            dropped[name] = fn
+
+    info = {
+        "active": False,
+        "pass_mask": np.ones(n_all, dtype=bool),
+        "reasons": np.array([""] * n_all, dtype=object),
+        "kept_rules": [n for n, _ in kept],
+        "dropped_rules": dropped,
+        "stats": {},
+    }
+    if not kept:
+        return info
+
+    pass_mask = np.ones(n_all, dtype=bool)
+    reasons = [[] for _ in range(n_all)]
+    for name, _ in kept:
+        m = masks[name]
+        pass_mask &= m
+        for i in np.flatnonzero(~m):
+            reasons[i].append(name)
+
+    lab_pass = pass_mask[labeled_pos]
+    if int((inc & lab_pass).sum()) < GATE_MIN_INCLUDE_AFTER or int(lab_pass.sum()) < GATE_MIN_LABELED_AFTER:
+        info["dropped_rules"] = {**dropped, "(게이트 통과 라벨 부족으로 미적용)": 0}
+        return info
+
+    w = _weights_or_ones(weights, len(y))
+    total_w = float(w.sum()) if float(w.sum()) > 0 else 1.0
+    info.update({
+        "active": True,
+        "pass_mask": pass_mask,
+        "reasons": np.array(["; ".join(r) for r in reasons], dtype=object),
+        "stats": {
+            "corpus_n": int(n_all),
+            "corpus_removed_n": int((~pass_mask).sum()),
+            "corpus_removed_pct": float((~pass_mask).sum() / n_all) if n_all else 0.0,
+            "labeled_n": int(len(y)),
+            "labeled_removed_n": int((~lab_pass).sum()),
+            "labeled_include_removed_n": int((inc & ~lab_pass).sum()),
+            "weighted_removed_pct": float(w[~lab_pass].sum() / total_w),
+            "labeled_prevalence_before": float(w[inc].sum() / total_w),
+            "labeled_prevalence_after": float(
+                w[inc & lab_pass].sum() / w[lab_pass].sum()) if w[lab_pass].sum() > 0 else 0.0,
+        },
+    })
+    return info
+
+
+def _weighted_screening_metrics(y: np.ndarray, pred: np.ndarray, weights=None) -> dict:
+    """게이트까지 포함한 파이프라인 전체의 (가중) Recall / WSS / 검토부담."""
+    y = np.asarray(y, dtype=int)
+    pred = np.asarray(pred, dtype=bool)
+    w = _weights_or_ones(weights, len(y))
+    tp = w[(y == 1) & pred].sum(); fn = w[(y == 1) & ~pred].sum()
+    fp = w[(y == 0) & pred].sum(); tn = w[(y == 0) & ~pred].sum()
+    rec = float(tp / (tp + fn)) if (tp + fn) else 0.0
+    return {
+        "recall_weighted": rec,
+        "wss_weighted": work_saved_over_sampling(tn, fn, tp, fp),
+        "burden_weighted": float((tp + fp) / w.sum()) if w.sum() else 1.0,
+    }
+
+
+def _crossfold_policy_evaluation(
+    probs: np.ndarray,
+    y: np.ndarray,
+    fold_ids: np.ndarray,
+    recall_target: float,
+    weights=None,
+    gate_pass: np.ndarray | None = None,
+) -> dict:
+    """Threshold/cutoff를 평가 행 자체의 라벨로 정하지 않도록 fold별 정책 검증을 수행한다.
+
+    각 fold의 문헌은 나머지 fold에서 정한 priority threshold와 safe-exclude cutoff로만 판정한다.
+    모델 score 자체는 OOF score를 사용한다. 이는 full nested CV보다 계산량이 작으면서도
+    '같은 200편 전체에서 cutoff를 맞춘 뒤 같은 200편으로 평가'하는 직접적인 재사용 편향을 줄인다.
+    """
+    probs = np.asarray(probs, dtype=float)
+    y = np.asarray(y, dtype=int)
+    folds = np.asarray(fold_ids, dtype=int)
+    w = _weights_or_ones(weights, len(y))
+    gate = np.ones(len(y), dtype=bool) if gate_pass is None else np.asarray(gate_pass, dtype=bool)
+    priority_pred = np.zeros(len(y), dtype=bool)
+    safe_excluded = np.zeros(len(y), dtype=bool)
+    details = []
+
+    for fold_no in sorted(int(x) for x in np.unique(folds) if int(x) > 0):
+        va = folds == fold_no
+        cal = ~va
+        cal_gate = cal & gate
+        # calibration fold에 두 클래스가 없으면 가장 보수적으로 전부 human review.
+        if cal_gate.sum() < 4 or np.unique(y[cal_gate]).size < 2:
+            thr = 0.0
+            safe_cut = 0.0
+        else:
+            thr, _ = _optimize_threshold_wss(
+                probs[cal_gate], y[cal_gate], recall_target,
+                w[cal_gate] if weights is not None else None,
+            )
+            safe_cut = min(_safe_exclude_cutoff(probs[cal_gate], y[cal_gate], SAFE_RECALL_TARGET), thr)
+        priority_pred[va] = (probs[va] >= thr) & gate[va]
+        safe_excluded[va] = (probs[va] < safe_cut) | ~gate[va]
+
+        pos = va & (y == 1)
+        fold_safe_recall = float((~safe_excluded[pos]).mean()) if pos.any() else np.nan
+        fold_priority_recall = float(priority_pred[pos].mean()) if pos.any() else np.nan
+        details.append({
+            "fold": fold_no,
+            "priority_threshold": float(thr),
+            "safe_cutoff": float(safe_cut),
+            "validation_n": int(va.sum()),
+            "include_n": int(pos.sum()),
+            "priority_recall": fold_priority_recall,
+            "safe_recall": fold_safe_recall,
+            "safe_fn": int((pos & safe_excluded).sum()),
+            "safe_excluded_n": int((va & safe_excluded).sum()),
+        })
+
+    priority_metrics = _weighted_screening_metrics(y, priority_pred, weights)
+    safe_metrics = _weighted_screening_metrics(y, ~safe_excluded, weights)
+    priority_metrics_unw = _weighted_screening_metrics(y, priority_pred, None)
+    safe_metrics_unw = _weighted_screening_metrics(y, ~safe_excluded, None)
+    safe_fn = int(((y == 1) & safe_excluded).sum())
+    priority_fn = int(((y == 1) & ~priority_pred).sum())
+    valid_safe_fold_recalls = [d["safe_recall"] for d in details if np.isfinite(d["safe_recall"])]
+    valid_priority_fold_recalls = [d["priority_recall"] for d in details if np.isfinite(d["priority_recall"])]
+    return {
+        "priority_pred": priority_pred,
+        "safe_excluded": safe_excluded,
+        "priority_recall_weighted": float(priority_metrics["recall_weighted"]),
+        "priority_recall_unweighted": float(priority_metrics_unw["recall_weighted"]),
+        "priority_wss_weighted": float(priority_metrics["wss_weighted"]),
+        "priority_burden_weighted": float(priority_metrics["burden_weighted"]),
+        "priority_fn": priority_fn,
+        "safe_recall_weighted": float(safe_metrics["recall_weighted"]),
+        "safe_recall_unweighted": float(safe_metrics_unw["recall_weighted"]),
+        "safe_wss_weighted": float(safe_metrics["wss_weighted"]),
+        "safe_burden_weighted": float(safe_metrics["burden_weighted"]),
+        "safe_fn": safe_fn,
+        "safe_excluded_n": int(safe_excluded.sum()),
+        "min_fold_safe_recall": float(min(valid_safe_fold_recalls)) if valid_safe_fold_recalls else 0.0,
+        "min_fold_priority_recall": float(min(valid_priority_fold_recalls)) if valid_priority_fold_recalls else 0.0,
+        "details": details,
+    }
+
 
 @dataclass
 class ZeroShotResult:
@@ -1084,8 +1436,8 @@ def _safe_exclude_cutoff(cv_probs: np.ndarray, y: np.ndarray, level: float = 0.9
         cut = sigmoid(mean - t_{level, n-1} · sd · sqrt(1 + 1/n))
     라벨 Include 중 최저값보다 더 아래로 외삽하므로, 라벨 Include가 적거나 점수가 흩어져
     있을수록 기준선이 자동으로 내려가 안전 제외가 줄어든다(라벨 Include 3편 미만이면 0편).
-    '가장 낮은 라벨 Include' 기준은 SYNERGY 벤치마크에서 실제 Recall이 27–89%까지
-    떨어져 폐기했다."""
+    컷오프는 관찰된 Include 점수의 단순 최솟값보다 보수적으로 설정해, 낮은 점수의
+    잠재적 Include를 자동 제외하는 위험을 줄인다."""
     probs = np.asarray(cv_probs, dtype=float)
     inc = probs[np.asarray(y) == 1]
     if len(inc) < 3:
@@ -1154,37 +1506,40 @@ def _sort_by_priority(pred_df: pd.DataFrame) -> pd.DataFrame:
     ).drop(columns="_priority_order").reset_index(drop=True)
 
 
-def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult:
-    """저장된 교차검증 확률(메인 모델 + 보조 신호들)을 사용해 재학습 없이
-    '허용 False Negative 개수'만 바꿔 임계값과 화면 분류(우선 검토 / 경계 문헌 /
-    안전 제외 후보)를 다시 계산한다.
-    """
-    updated = deepcopy(result)
-    pred_df = updated.predictions.copy()
-
-    if not {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
-        return updated
-
+def _labeled_view(pred_df: pd.DataFrame):
+    """저장된 예측 테이블에서 재타이어링에 필요한 라벨 뷰(라벨·CV확률·가중치·게이트)를 꺼낸다."""
     mask = pred_df["CV_Probability"].notna() & pred_df["Human_Label_Normalized"].isin([0, 1])
     y_labeled = pred_df.loc[mask, "Human_Label_Normalized"].astype(int).to_numpy()
-    cv_probs_main = pd.to_numeric(pred_df.loc[mask, "CV_Probability"], errors="coerce").to_numpy()
+    cv_probs = pd.to_numeric(pred_df.loc[mask, "CV_Probability"], errors="coerce").to_numpy()
     w_labeled = (pd.to_numeric(pred_df.loc[mask, "Sampling_Weight"], errors="coerce").to_numpy()
                  if "Sampling_Weight" in pred_df.columns else None)
-    threshold = _fn_budget_cutoff(cv_probs_main, y_labeled, allowed_fn, w_labeled)
-    updated.threshold = threshold
+    # 규칙 게이트 결과(Gate_Pass)는 재학습 없이도 그대로 유지한다.
+    if "Gate_Pass" in pred_df.columns:
+        gate_all = pred_df["Gate_Pass"].fillna(True).astype(bool).to_numpy()
+    else:
+        gate_all = np.ones(len(pred_df), dtype=bool)
+    return mask, y_labeled, cv_probs, w_labeled, gate_all, gate_all[mask.to_numpy()]
+
+
+def _retier(result: ScreeningResult, threshold: float, strategy: str) -> ScreeningResult:
+    """재학습 없이 임계값만 바꿔 3단계 분류와 성능 지표를 다시 계산한다.
+    게이트에서 떨어진 문헌은 임계값과 무관하게 항상 '안전 제외 후보'로 남는다."""
+    updated = deepcopy(result)
+    pred_df = updated.predictions.copy()
+    mask, y_labeled, cv_probs_main, w_labeled, gate_all, gate_lab = _labeled_view(pred_df)
+    updated.threshold = float(threshold)
 
     probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
-    safe_cut = min(_safe_exclude_cutoff(cv_probs_main, y_labeled, SAFE_RECALL_TARGET), threshold)
-    safe_all = probs < safe_cut
-    safe_cv = cv_probs_main < safe_cut
+    safe_cut = min(_safe_exclude_cutoff(cv_probs_main[gate_lab], y_labeled[gate_lab], SAFE_RECALL_TARGET), threshold)
+    safe_all = (probs < safe_cut) | ~gate_all
+    safe_cv = (cv_probs_main < safe_cut) | ~gate_lab
     pred_df["Unanimous_Exclude"] = safe_all
-    pred_df["AI_Recommendation"] = _priority_labels(probs, threshold, safe_all)
-    updated.metrics["allowed_fn"] = int(allowed_fn)
+    pred_df["AI_Recommendation"] = _priority_labels(np.where(gate_all, probs, -1.0), threshold, safe_all)
     updated.metrics["safe_cutoff"] = float(safe_cut)
     updated.metrics["safe_exclude_cv_n"] = int(safe_cv.sum())
     updated.metrics["safe_exclude_cv_false_negatives"] = int(((y_labeled == 1) & safe_cv).sum())
 
-    cv_pred = (cv_probs_main >= threshold).astype(int)
+    cv_pred = ((cv_probs_main >= threshold) & gate_lab).astype(int)
     pred_df.loc[:, "CV_Prediction"] = np.nan
     pred_df.loc[mask, "CV_Prediction"] = cv_pred
     pred_df.loc[:, "False_Negative"] = False
@@ -1200,10 +1555,24 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
         "measured_fn": int(fn),
         "wss": work_saved_over_sampling(tn, fn, tp, fp),
         "threshold": float(threshold),
-        "threshold_strategy": "FN-budget cutoff (manual)",
+        "threshold_strategy": strategy,
     })
-
+    updated.metrics.update(_weighted_screening_metrics(y_labeled, cv_pred.astype(bool), w_labeled))
     updated.predictions = _sort_by_priority(pred_df)
+    return updated
+
+
+def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult:
+    """저장된 교차검증 확률을 사용해 재학습 없이 '허용 False Negative 개수'만 바꿔
+    임계값과 화면 분류(우선 검토 / 경계 문헌 / 안전 제외 후보)를 다시 계산한다."""
+    pred_df = result.predictions
+    if not {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
+        return deepcopy(result)
+    _, y_labeled, cv_probs_main, w_labeled, _, gate_lab = _labeled_view(pred_df)
+    threshold = _fn_budget_cutoff(cv_probs_main[gate_lab], y_labeled[gate_lab], allowed_fn,
+                                  None if w_labeled is None else w_labeled[gate_lab])
+    updated = _retier(result, threshold, "FN-budget cutoff (manual)")
+    updated.metrics["allowed_fn"] = int(allowed_fn)
     return updated
 
 
@@ -1214,8 +1583,19 @@ def apply_recall_target(result: ScreeningResult, recall_target: float, confidenc
     사용자가 임의의 정수를 직접 입력할 일이 없다."""
     n_include = int(result.metrics.get("include_n", 0))
     allowed_fn = allowed_fn_from_recall_target(n_include, recall_target)
-    updated = apply_fn_budget(result, allowed_fn)
+    pred_df = result.predictions
+    if not {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
+        return deepcopy(result)
+    _, y_labeled, cv_probs_main, w_labeled, _, gate_lab = _labeled_view(pred_df)
+    # train_and_predict와 동일한 규칙으로 임계값을 잡는다: 게이트 통과 문헌 안에서
+    # (가중) Recall ≥ 목표를 만족하는 후보 중 WSS가 최대인 값. 정책만 바꿔도 학습 직후와
+    # 같은 임계값이 나오도록 두 경로를 일치시킨다.
+    threshold, _info = _optimize_threshold_wss(
+        cv_probs_main[gate_lab], y_labeled[gate_lab], recall_target,
+        None if w_labeled is None else w_labeled[gate_lab])
+    updated = _retier(result, threshold, "Recall-constrained WSS optimization")
     updated.metrics["recall_target"] = float(recall_target)
+    updated.metrics["allowed_fn"] = int(allowed_fn)
     updated.metrics["recall_lower_ci"] = recall_lower_confidence_bound(n_include, allowed_fn, confidence)
     return updated
 
@@ -1225,6 +1605,8 @@ def train_and_predict(
     recall_target: float = DEFAULT_RECALL_TARGET,
     allowed_fn: int | None = None,
     criteria_text: str = "",
+    gate_rules: list[tuple[str, str]] | None = None,
+    validation_expected_n: int | None = None,
 ) -> ScreeningResult:
     """recall_target: 목표 재현율(예: 0.95 = 95%). 라벨 Include 중 이 비율 이상을
     반드시 '우선 검토' 또는 '경계 문헌'에 남기도록 allowed_fn을 자동으로 계산한다.
@@ -1252,6 +1634,9 @@ def train_and_predict(
     if calib_cv < 2:
         raise ValueError(f"Include 라벨이 {min_class}편뿐이라 교차검증을 할 수 없습니다. Include가 최소 4편 이상 필요합니다.")
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+    cv_fold_id = np.zeros(len(y), dtype=int)
+    for fold_no, (_tr, va) in enumerate(cv.split(texts, y), start=1):
+        cv_fold_id[va] = fold_no
 
     # 의미 임베딩은 전체 문헌 텍스트에 대해 한 번만 계산한다 (고정 가중치 인코더라
     # fold별 재계산이 필요 없고, 데이터로 다시 학습되지 않으므로 fold 밖에서 계산해도
@@ -1259,10 +1644,16 @@ def train_and_predict(
     # 자동으로 이 신호 없이 나머지 모델들로만 동작한다 (기능 저하 없이 안전하게 폴백).
     # Embedding vector는 plain Title+Abstract에서 계산하되 StructuredText를 key로 사용한다.
     embedding_lookup = None
+    embedding_error = ""
     if embeddings_available():
-        model = _get_embed_model()
-        vecs = model.encode(all_plain_texts.tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
-        embedding_lookup = {str(k): v for k, v in zip(all_texts, vecs)}
+        try:
+            model = _get_embed_model()
+            vecs = model.encode(all_plain_texts.tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+            embedding_lookup = {str(k): v for k, v in zip(all_texts, vecs)}
+        except Exception as exc:
+            # sentence-transformers 패키지는 있으나 모델 다운로드/로드가 실패하는 배포 환경을 안전하게 폴백.
+            embedding_lookup = None
+            embedding_error = f"{type(exc).__name__}: {exc}"[:300]
     sentence_pico_lookup = build_sentence_pico_lookup(all_texts, data["Abstract"].to_numpy(), criteria_text)
 
     raw = df.reset_index(drop=True)
@@ -1284,9 +1675,28 @@ def train_and_predict(
     precision, recall, pr_thresholds = precision_recall_curve(y, probs)
     fpr, tpr, _ = roc_curve(y, probs)
 
+    # 규칙 게이트: 적격 문헌이라면 제목·초록에 반드시 나타나는 용어군을 AND로 걸어
+    # ML 앞에서 corpus를 줄인다. 라벨 Include를 한 편이라도 떨어뜨리는 규칙은 자동 폐기된다.
+    gate = build_gate(all_plain_texts, labeled_pos, y, weights, gate_rules)
+    gate_pass_all = gate["pass_mask"]
+    gate_pass_lab = gate_pass_all[labeled_pos]
+
+    # 품질 게이트용 cross-fold policy evaluation:
+    # 각 fold는 나머지 fold가 정한 threshold/cutoff만 적용받는다.
+    policy_eval = _crossfold_policy_evaluation(
+        probs, y, cv_fold_id, recall_target, weights=weights, gate_pass=gate_pass_lab
+    )
+
     # 우선 검토 임계값: (가중) Recall ≥ 목표를 만족하면서 WSS가 최대인 값.
-    threshold, threshold_info = _optimize_threshold_wss(probs, y, recall_target, weights)
-    pred = (probs >= threshold).astype(int)
+    # 게이트가 켜져 있으면 게이트 통과 문헌만으로 임계값을 잡는다 (게이트 밖은 이미 제외이므로
+    # 그 문헌들까지 넣고 최적화하면 임계값이 불필요하게 낮아진다).
+    if gate["active"]:
+        thr_probs, thr_y = probs[gate_pass_lab], y[gate_pass_lab]
+        thr_w = None if weights is None else np.asarray(weights)[gate_pass_lab]
+    else:
+        thr_probs, thr_y, thr_w = probs, y, weights
+    threshold, threshold_info = _optimize_threshold_wss(thr_probs, thr_y, recall_target, thr_w)
+    pred = ((probs >= threshold) & gate_pass_lab).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
 
     recall_v = float(recall_score(y, pred, zero_division=0))
@@ -1295,7 +1705,7 @@ def train_and_predict(
         "recall_target": float(recall_target),
         "allowed_fn": int(allowed_fn),
         "measured_fn": int(fn),
-        "recall_lower_ci": recall_lower_confidence_bound(n_include, allowed_fn),
+        "recall_lower_ci": recall_lower_confidence_bound(n_include, int(fn)),
         "recall": recall_v,
         "precision": precision_v,
         "accuracy": float(accuracy_score(y, pred)),
@@ -1303,19 +1713,47 @@ def train_and_predict(
         "roc_auc": float(roc_auc_score(y, probs)),
         "average_precision": float(average_precision_score(y, probs)),
         "labeled_n": int(len(labeled)),
+        "validation_expected_n": int(validation_expected_n) if validation_expected_n is not None else int(len(labeled)),
+        "validation_complete": bool(validation_expected_n is None or len(labeled) == int(validation_expected_n)),
         "include_n": n_include,
         "embedding_signal_used": embedding_lookup is not None,
+        "embedding_fallback_reason": embedding_error,
         "wss": work_saved_over_sampling(tn, fn, tp, fp),
         "recall_weighted": float(threshold_info.get("recall", 1.0)),
         "wss_weighted": float(threshold_info.get("wss", 0.0)),
+        "gate_active": bool(gate["active"]),
+        "gate_kept_rules": list(gate["kept_rules"]),
+        "gate_dropped_rules": dict(gate["dropped_rules"]),
+        "gate_stats": dict(gate["stats"]),
         "sampling_weighted": weights is not None,
         "threshold": float(threshold),
         "threshold_strategy": "Recall-constrained WSS optimization (sampling-weighted)" if weights is not None else "Recall-constrained WSS optimization",
         "tier_method": "stacking",
+        "algorithm_version": ALGORITHM_VERSION,
         "stack_coefficients": stack_coef,
     }
 
-    threshold_100, info_100 = _optimize_threshold_wss(probs, y, 1.0, weights)
+    metrics.update(_weighted_screening_metrics(y, pred.astype(bool), weights))
+    metrics.update({
+        "policy_priority_recall_weighted": policy_eval["priority_recall_weighted"],
+        "policy_priority_recall_unweighted": policy_eval["priority_recall_unweighted"],
+        "policy_priority_wss_weighted": policy_eval["priority_wss_weighted"],
+        "policy_priority_burden_weighted": policy_eval["priority_burden_weighted"],
+        "policy_priority_fn": policy_eval["priority_fn"],
+        "policy_safe_recall_weighted": policy_eval["safe_recall_weighted"],
+        "policy_safe_recall_unweighted": policy_eval["safe_recall_unweighted"],
+        "policy_safe_wss_weighted": policy_eval["safe_wss_weighted"],
+        "policy_safe_burden_weighted": policy_eval["safe_burden_weighted"],
+        "policy_safe_fn": policy_eval["safe_fn"],
+        "policy_safe_excluded_n": policy_eval["safe_excluded_n"],
+        "policy_min_fold_safe_recall": policy_eval["min_fold_safe_recall"],
+        "policy_min_fold_priority_recall": policy_eval["min_fold_priority_recall"],
+        "policy_fold_details": policy_eval["details"],
+        "policy_priority_recall_lower_ci": recall_lower_confidence_bound(n_include, int(policy_eval["priority_fn"]), VALIDATION_CONFIDENCE),
+        "policy_safe_recall_lower_ci": recall_lower_confidence_bound(n_include, int(policy_eval["safe_fn"]), VALIDATION_CONFIDENCE),
+    })
+
+    threshold_100, info_100 = _optimize_threshold_wss(thr_probs, thr_y, 1.0, thr_w)
     metrics["threshold_100"] = float(threshold_100)
     metrics["wss_100"] = float(info_100.get("wss", 0.0))
     metrics["burden_100"] = float(info_100.get("burden", 1.0))
@@ -1329,6 +1767,20 @@ def train_and_predict(
     result_df.loc[labeled.index, "CV_Probability"] = probs
     result_df["CV_Prediction"] = np.nan
     result_df.loc[labeled.index, "CV_Prediction"] = pred
+    result_df["CV_Fold"] = np.nan
+    result_df.loc[labeled.index, "CV_Fold"] = cv_fold_id
+    result_df["Policy_Priority_Prediction"] = np.nan
+    result_df.loc[labeled.index, "Policy_Priority_Prediction"] = policy_eval["priority_pred"].astype(int)
+    result_df["Policy_Safe_Excluded"] = np.nan
+    result_df.loc[labeled.index, "Policy_Safe_Excluded"] = policy_eval["safe_excluded"].astype(int)
+    fold_recalls = []
+    for fold_no in range(1, folds + 1):
+        fm = cv_fold_id == fold_no
+        if int((y[fm] == 1).sum()) == 0:
+            continue
+        fold_recalls.append(float(recall_score(y[fm], pred[fm], zero_division=0)))
+    metrics["cv_fold_recalls"] = fold_recalls
+    metrics["min_fold_recall"] = float(min(fold_recalls)) if fold_recalls else 0.0
     result_df["False_Negative"] = False
     result_df.loc[labeled.index, "False_Negative"] = (y == 1) & (pred == 0)
 
@@ -1338,17 +1790,73 @@ def train_and_predict(
         result_df.loc[labeled.index, f"CV_Prob_{name}"] = sig["cv"]
 
     # 안전 제외: 라벨 Include 점수 분포의 99% 단측 예측구간 하한 아래(_safe_exclude_cutoff).
-    safe_cut = min(_safe_exclude_cutoff(probs, y, SAFE_RECALL_TARGET), threshold)
-    safe_all = all_probs < safe_cut
-    safe_cv = probs < safe_cut
+    # 게이트가 켜져 있으면 게이트 통과 라벨만으로 분포를 추정한다.
+    safe_cut = min(_safe_exclude_cutoff(thr_probs, thr_y, SAFE_RECALL_TARGET), threshold)
+    safe_all = (all_probs < safe_cut) | ~gate_pass_all
+    safe_cv = (probs < safe_cut) | ~gate_pass_lab
     metrics["safe_cutoff"] = float(safe_cut)
     metrics["safe_recall_target"] = float(SAFE_RECALL_TARGET)
     metrics["safe_exclude_cv_n"] = int(safe_cv.sum())
-    metrics["safe_exclude_cv_false_negatives"] = int(((y == 1) & safe_cv).sum())
+    safe_fn = int(((y == 1) & safe_cv).sum())
+    metrics["safe_exclude_cv_false_negatives"] = safe_fn
+
+    # 최종 운영정책의 안전성: 경계 문헌도 사람이 읽으므로 '사람 검토 유지'를 positive로 본다.
+    # 이것이 실제 자동제외 때문에 relevant record를 놓치는지를 직접 측정하는 지표다.
+    human_review_cv = ~safe_cv
+    safe_unweighted = _weighted_screening_metrics(y, human_review_cv, None)
+    safe_weighted = _weighted_screening_metrics(y, human_review_cv, weights)
+    metrics["safe_recall"] = float(safe_unweighted["recall_weighted"])
+    metrics["safe_wss"] = float(safe_unweighted["wss_weighted"])
+    metrics["safe_burden"] = float(safe_unweighted["burden_weighted"])
+    metrics["safe_recall_weighted"] = float(safe_weighted["recall_weighted"])
+    metrics["safe_wss_weighted"] = float(safe_weighted["wss_weighted"])
+    metrics["safe_burden_weighted"] = float(safe_weighted["burden_weighted"])
+    metrics["safe_recall_lower_ci"] = recall_lower_confidence_bound(n_include, safe_fn, VALIDATION_CONFIDENCE)
+
+    gate_fn = int(gate.get("stats", {}).get("labeled_include_removed_n", 0)) if gate.get("active") else 0
+    complete = bool(metrics.get("validation_complete", False))
+    enough_include = n_include >= MIN_INCLUDE_FOR_SUPERVISED
+    ranking_ok = (
+        float(metrics.get("policy_priority_recall_weighted", 0.0)) + 1e-12 >= float(recall_target)
+        and float(metrics.get("policy_priority_recall_unweighted", 0.0)) + 1e-12 >= float(recall_target)
+    )
+    policy_safe_fn = int(metrics.get("policy_safe_fn", 0))
+    safe_ok = (
+        float(metrics.get("policy_safe_recall_weighted", 0.0)) + 1e-12 >= float(recall_target)
+        and float(metrics.get("policy_safe_recall_unweighted", 0.0)) + 1e-12 >= float(recall_target)
+    )
+    gate_ok = gate_fn == 0
+
+    quality_reasons = []
+    if not complete:
+        quality_reasons.append("human validation 표본이 완전히 라벨링되지 않음")
+    if not enough_include:
+        quality_reasons.append(f"Include가 {n_include}편으로 내부 검증에 부족함(권장 최소 {MIN_INCLUDE_FOR_SUPERVISED}편)")
+    if not ranking_ok:
+        quality_reasons.append(f"fold-held-out priority Recall(가중/비가중)이 목표 {recall_target*100:.0f}% 미만")
+    if not safe_ok:
+        quality_reasons.append(
+            f"fold-held-out safe-exclude Recall(가중/비가중)이 목표 {recall_target*100:.0f}% 미만 "
+            f"(관찰 FN {policy_safe_fn}편)"
+        )
+    if not gate_ok:
+        quality_reasons.append(f"규칙 게이트가 human Include {gate_fn}편을 제외함")
+
+    metrics["quality_gate_status"] = "PASS" if (complete and enough_include and ranking_ok and safe_ok and gate_ok) else "REVIEW"
+    metrics["auto_exclusion_enabled"] = bool(metrics["quality_gate_status"] == "PASS")
+    metrics["quality_gate_reasons"] = quality_reasons
     result_df["Safety_Score"] = 1.0 - all_probs
     metrics["safety_signal_count"] = len(signals)
     result_df["Unanimous_Exclude"] = safe_all
-    result_df["AI_Recommendation"] = _priority_labels(all_probs, threshold, safe_all)
+    result_df["Gate_Pass"] = gate_pass_all
+    result_df["Gate_Fail_Reason"] = gate["reasons"]
+    result_df["AI_Recommendation"] = _priority_labels(
+        np.where(gate_pass_all, all_probs, -1.0), threshold, safe_all)
+    result_df["Operational_Action"] = np.where(
+        bool(metrics.get("auto_exclusion_enabled", False)) & safe_all,
+        "AUTO_EXCLUDE",
+        "HUMAN_REVIEW",
+    )
     result_df["AI_Exclusion_Signal"] = [_obvious_exclusion_reason(t, a) for t, a in zip(data["Title"], data["Abstract"])]
 
     result_df = _sort_by_priority(result_df)
@@ -1440,3 +1948,134 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+
+
+def validation_methods_text(result: ScreeningResult) -> str:
+    """현재 validation 결과를 Methods에 옮길 수 있는 보수적 문구를 만든다."""
+    m = result.metrics
+    expected = int(m.get("validation_expected_n", m.get("labeled_n", 0)))
+    labeled = int(m.get("labeled_n", 0))
+    inc = int(m.get("include_n", 0))
+    target = float(m.get("recall_target", DEFAULT_RECALL_TARGET)) * 100
+    safe_fn = int(m.get("policy_safe_fn", 0))
+    safe_rec = float(m.get("policy_safe_recall_weighted", 0.0)) * 100
+    status = str(m.get("quality_gate_status", "REVIEW"))
+    return (
+        f"A fixed human-validation sample of {expected} records was selected using PICO/PECO-enriched "
+        f"stratified sampling (high-, mid-, and low-relevance strata). All {labeled} records were manually "
+        f"labelled as potentially eligible or excluded ({inc} potentially eligible). Inverse-probability "
+        f"sampling weights were retained for performance estimation. Model predictions for labelled records "
+        f"were generated out-of-fold. For policy validation, each fold was classified using review-priority and "
+        f"safe-exclusion cutoffs derived only from the remaining folds, targeting at least {target:.0f}% recall. "
+        f"The fold-held-out auto-exclusion policy retained a sampling-weighted recall of {safe_rec:.1f}% in the "
+        f"human-validation sample, with {safe_fn} potentially eligible records assigned to the auto-exclusion region. "
+        f"The operational quality-gate status was {status}. "
+        "These internal validation results were used as a quality-control safeguard and were not interpreted as a "
+        "guarantee that no eligible records remained among unlabelled records."
+    )
+
+
+def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
+    """Human-validation/AI screening 품질관리 결과를 감사 가능한 Excel report로 내보낸다."""
+    m = result.metrics
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Validation_Summary"
+    header_fill = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    ws.append(["Metric", "Value"])
+    for c in ws[1]:
+        c.fill = header_fill; c.font = header_font
+
+    rows = [
+        ("Algorithm version", m.get("algorithm_version", ALGORITHM_VERSION)),
+        ("Generated UTC", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        ("Quality gate", m.get("quality_gate_status", "REVIEW")),
+        ("Auto-exclusion enabled", bool(m.get("auto_exclusion_enabled", False))),
+        ("Validation expected n", int(m.get("validation_expected_n", m.get("labeled_n", 0)))),
+        ("Validation labelled n", int(m.get("labeled_n", 0))),
+        ("Human Include n", int(m.get("include_n", 0))),
+        ("Human Exclude n", int(m.get("labeled_n", 0)) - int(m.get("include_n", 0))),
+        ("Target Recall", float(m.get("recall_target", DEFAULT_RECALL_TARGET))),
+        ("OOF Recall (unweighted)", float(m.get("recall", 0.0))),
+        ("OOF Recall (sampling-weighted, globally tuned)", float(m.get("recall_weighted", 0.0))),
+        ("Fold-held-out priority Recall (sampling-weighted)", float(m.get("policy_priority_recall_weighted", 0.0))),
+        ("Fold-held-out priority Recall (unweighted)", float(m.get("policy_priority_recall_unweighted", 0.0))),
+        ("OOF Recall one-sided 95% lower bound", float(m.get("recall_lower_ci", 0.0))),
+        ("OOF min-fold Recall", float(m.get("min_fold_recall", 0.0))),
+        ("Safe-exclude Recall (globally tuned, unweighted)", float(m.get("safe_recall", 0.0))),
+        ("Safe-exclude Recall (globally tuned, sampling-weighted)", float(m.get("safe_recall_weighted", 0.0))),
+        ("Safe-exclude Recall one-sided 95% lower bound (globally tuned)", float(m.get("safe_recall_lower_ci", 0.0))),
+        ("Fold-held-out safe Recall one-sided 95% lower bound", float(m.get("policy_safe_recall_lower_ci", 0.0))),
+        ("Fold-held-out safe Recall (sampling-weighted)", float(m.get("policy_safe_recall_weighted", 0.0))),
+        ("Fold-held-out safe Recall (unweighted)", float(m.get("policy_safe_recall_unweighted", 0.0))),
+        ("Fold-held-out safe FN", int(m.get("policy_safe_fn", 0))),
+        ("Fold-held-out safe-excluded n", int(m.get("policy_safe_excluded_n", 0))),
+        ("Fold-held-out final WSS (sampling-weighted)", float(m.get("policy_safe_wss_weighted", 0.0))),
+        ("Fold-held-out final human-review burden (sampling-weighted)", float(m.get("policy_safe_burden_weighted", 1.0))),
+        ("ROC-AUC", float(m.get("roc_auc", 0.0))),
+        ("Average precision", float(m.get("average_precision", 0.0))),
+        ("Quality-gate reasons", "; ".join(map(str, m.get("quality_gate_reasons", []))) or "None"),
+    ]
+    for r in rows:
+        ws.append(list(r))
+    ws.column_dimensions["A"].width = 46
+    ws.column_dimensions["B"].width = 80
+    ws.freeze_panes = "A2"
+
+    # Human validation rows only
+    pred = result.predictions.copy()
+    val = pred[pred.get("Human_Label_Normalized", pd.Series(np.nan, index=pred.index)).isin([0, 1])].copy()
+    preferred = [
+        "Training_No", "Validation_Record_ID", "Training_Stratum", "Sampling_Weight",
+        "Title", "제목", "Abstract", "초록", "Human_Label_Normalized", "CV_Fold",
+        "CV_Probability", "CV_Prediction", "Policy_Priority_Prediction", "Policy_Safe_Excluded",
+        "False_Negative", "AI_Recommendation",
+        "AI_Probability", "Gate_Pass", "Gate_Fail_Reason",
+    ]
+    cols = [c for c in preferred if c in val.columns]
+    val = val[cols]
+    vws = wb.create_sheet("Human_Validation")
+    for row in dataframe_to_rows(val, index=False, header=True):
+        vws.append(row)
+    if vws.max_row >= 1:
+        for c in vws[1]: c.fill = header_fill; c.font = header_font
+        vws.freeze_panes = "A2"
+        vws.auto_filter.ref = vws.dimensions
+    for j, name in enumerate(val.columns, start=1):
+        vws.column_dimensions[get_column_letter(j)].width = 42 if name in {"Title", "제목"} else (70 if name in {"Abstract", "초록"} else 20)
+
+    # 실제 자동 제외 영역에서 발견된 human Include를 별도 표시
+    _policy_safe = pd.to_numeric(val.get("Policy_Safe_Excluded", pd.Series(0, index=val.index)), errors="coerce").fillna(0).astype(int)
+    safe_err = val[(val.get("Human_Label_Normalized", 0) == 1) & (_policy_safe == 1)].copy()
+    ews = wb.create_sheet("Safe_Exclude_Errors")
+    for row in dataframe_to_rows(safe_err, index=False, header=True):
+        ews.append(row)
+    if ews.max_row >= 1:
+        for c in ews[1]: c.fill = header_fill; c.font = header_font
+        ews.freeze_panes = "A2"
+
+    mws = wb.create_sheet("Methods_Text")
+    mws["A1"] = "Suggested Methods wording"
+    mws["A1"].font = Font(bold=True)
+    mws["A2"] = validation_methods_text(result)
+    mws["A2"].alignment = __import__('openpyxl').styles.Alignment(wrap_text=True, vertical="top")
+    mws.column_dimensions["A"].width = 120
+    mws.row_dimensions[2].height = 160
+
+    nws = wb.create_sheet("Interpretation")
+    notes = [
+        ["Item", "Interpretation"],
+        ["PASS", "Human validation이 완전하며 최소 Include 수를 충족하고, fold-held-out priority 및 safe-exclude Recall이 weighted·unweighted 모두 목표 이상이며, 활성 custom gate가 human Include를 제거하지 않는 경우."],
+        ["REVIEW", "위 조건 중 하나라도 충족하지 못한 경우. 모델 순위는 참고할 수 있으나 자동 제외는 잠금 상태로 취급해야 함."],
+        ["Confidence bound", "표본의 유한한 Include 수 때문에 생기는 불확실성을 보여주는 보조 지표. PASS를 통계적 무누락 보장으로 해석하지 않음."],
+        ["Scope", "현재 결과는 해당 review의 200편 내부 human-validation 및 OOF 예측에 대한 품질관리 결과이며, 미라벨 전체 코퍼스에 대한 절대적 보장이 아님."],
+    ]
+    for row in notes: nws.append(row)
+    for c in nws[1]: c.fill = header_fill; c.font = header_font
+    nws.column_dimensions["A"].width = 24; nws.column_dimensions["B"].width = 120
+    for row in nws.iter_rows(min_row=2): row[1].alignment = __import__('openpyxl').styles.Alignment(wrap_text=True, vertical="top")
+
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()

@@ -1,6 +1,8 @@
-# SR Studio v9.0.0
+# SR Studio VER 30
 
-GitHub-ready Streamlit application for systematic-review literature management, AI-assisted screening prioritization, and Python-based visualization of R meta-analysis results.
+Streamlit application for systematic-review literature management, AI-assisted title/abstract screening, human-validation quality control, and meta-analysis result visualization.
+
+> **VER 30 screening policy:** the required human-validation set is fixed at 200 records. All 200 must be labelled O/X. Auto-exclusion is enabled only after the fold-held-out operational quality gate passes; otherwise the model may rank records but `AUTO_EXCLUDE` remains locked. See `README_V30.txt`.
 
 ## Included features
 
@@ -20,13 +22,14 @@ GitHub-ready Streamlit application for systematic-review literature management, 
 
 ## Intended AI use
 
-The AI module is a screening-assistance tool. It ranks records so that likely relevant studies are reviewed first and clear low-probability records can be reviewed efficiently.
+The AI module is a review-specific screening system designed to reduce manual title/abstract screening while preserving high recall.
 
-- `Human_Label = 1`: Include
-- `Human_Label = 0`: Exclude
-- A low AI probability is not an automatic final exclusion.
-- Final exclusion should be confirmed by a human reviewer using the title and abstract.
-- Displayed performance is a cross-validation estimate from the labeled records and is not a guarantee for unseen records.
+- `O` / `Human_Label = 1`: potentially eligible; keep for human review.
+- `X` / `Human_Label = 0`: clearly ineligible at title/abstract screening.
+- The 200-record human-validation set is selected once using PICO/PECO relevance strata and inverse-probability sampling weights.
+- A project can enter `PASS` only when the complete validation set meets the configured recall quality gate in fold-held-out policy evaluation.
+- `REVIEW` locks automatic exclusion; ranking can still be used to prioritize human screening.
+- `PASS` is an operational internal-validation result, not proof that unseen eligible records cannot be missed.
 
 ## Meta-analysis workflow
 
@@ -102,3 +105,7 @@ Projects are saved under `data/projects/` on the running machine. Streamlit Comm
 - Excel 추출표 다운로드
 
 스캔 PDF, 표·Figure 수치 자동 추출은 현재 지원하지 않습니다. 자동 추출 결과는 반드시 원문과 대조해야 합니다.
+
+## VER 30 screening validation
+
+V30 changes the AI-screening workflow to a fixed **200-record human-validation design**. All 200 records must be labelled O/X. The app then performs out-of-fold model scoring plus fold-held-out policy validation and enables auto-exclusion only when the operational recall quality gate passes. Project-specific hidden regex gates are disabled by default. See `README_V30.txt` for details.

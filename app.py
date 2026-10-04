@@ -28,18 +28,17 @@ from projects import (
 )
 from screening import (
     train_and_predict,
-    apply_recall_target,
     build_grouped_excel_bytes,
-    RECALL_TARGET_PRESETS,
     DEFAULT_RECALL_TARGET,
     zero_shot_screen,
     detect_label_count,
     build_training_sample,
     merge_training_labels,
+    build_validation_report_excel_bytes,
+    validation_methods_text,
     TRAINING_SAMPLE_SIZE,
     MIN_LABELS_FOR_SUPERVISED,
     MIN_INCLUDE_FOR_SUPERVISED,
-    REFERENCE_BENCHMARK,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -295,25 +294,6 @@ def _analyze_workbook(file_bytes: bytes, ci_mode: str):
     results = [_af.analyze_outcome(d, o, ci_mode) for o, d in outs.items() if d["Study"].nunique() >= 2]
     return results, qc
 
-
-def _render_reference_benchmark() -> None:
-    """라벨 유무와 관계없이 항상 확인할 수 있는 사전 검증 성능을 표시한다."""
-    b = REFERENCE_BENCHMARK
-    st.markdown("**검증된 기준 성능**")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Recall", f"{b['recall']*100:.1f}%", help="검증 데이터에서 실제 Include 문헌을 보존한 비율")
-    c2.metric("False Negative", f"{int(b['false_negative'])}편", help="검증 데이터에서 실제 Include를 놓친 문헌 수")
-    c3.metric("ROC-AUC", f"{b['roc_auc']:.3f}")
-    c4.metric("검토 감소", f"{b['work_saved']*100:.1f}%", help="기준 검증에서 사람이 직접 검토해야 하는 양이 감소한 비율")
-
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Precision", f"{b['precision']*100:.1f}%")
-    d2.metric("Average Precision", f"{b['average_precision']:.3f}")
-    d3.metric("검증 문헌", f"{int(b['n']):,}편")
-    st.caption(
-        f"기준 데이터: {b['name']}. 이 값은 현재 업로드한 프로젝트의 실시간 성능이 아니라 "
-        "이전 모델에서 사전에 라벨된 검증 데이터로 얻은 참고 성능입니다. V16 구조 변경 후에는 현재 프로젝트 교차검증 성능을 우선 해석하고, V16 독립 재검증 완료 후 기준 성능을 업데이트해야 합니다."
-    )
 
 
 if not st.session_state.active_project:
@@ -734,7 +714,7 @@ elif nav == "pico":
 elif nav == "screen":
     hero(
         "AI 문헌 선별",
-        "전체 문헌에서 AI 학습 가치가 높은 200편만 먼저 판정한 뒤, 그 라벨로 나머지 문헌을 한 번에 우선순위화합니다.",
+        "전체 문헌에서 Human validation 200편만 사람이 판정하고, 그 결과로 AI 선별의 안전성과 효율성을 검증한 뒤 전체 문헌을 우선순위화합니다.",
         eyebrow="AI SCREENING",
     )
 
@@ -752,7 +732,7 @@ elif nav == "screen":
     )
 
     st.info(
-        "가장 효율적인 고정 흐름입니다: ① 전체 문헌 업로드 → ② AI가 학습용 200편 선정 → "
+        "고정 흐름입니다: ① 전체 문헌 업로드 → ② AI가 Human validation 200편 선정 → "
         "③ 그 200편만 O/X 판정 → ④ 라벨 파일 업로드 → ⑤ 전체 문헌을 한 번에 AI 선별. "
         "이후 추가 라벨링은 요구하지 않습니다."
     )
@@ -787,17 +767,17 @@ elif nav == "screen":
         a1, a2, a3 = st.columns(3)
         a1.metric("전체 문헌", f"{len(df):,}편")
         a2.metric("기존 유효 라벨", f"{labeled_n:,}편")
-        a3.metric("학습용 목표", f"{min(TRAINING_SAMPLE_SIZE, len(df)):,}편")
+        a3.metric("Validation 목표", f"{min(TRAINING_SAMPLE_SIZE, len(df)):,}편")
 
         with st.expander("업로드 파일 미리보기", expanded=False):
             st.dataframe(df.head(20), use_container_width=True)
 
         if not criteria_text:
-            st.warning("학습용 200편을 선정하려면 PICO를 먼저 저장해 주세요.")
+            st.warning("Human validation 200편을 선정하려면 PICO/PECO를 먼저 저장해 주세요.")
         else:
-            if st.button("② AI 학습용 200편 만들기", type="primary", use_container_width=True):
+            if st.button("② AI가 Human validation 200편 선정", type="primary", use_container_width=True):
                 try:
-                    with st.spinner("PICO 적합도 층별로 학습용 200편을 무작위 선정하는 중입니다..."):
+                    with st.spinner("PICO/PECO 적합도를 이용해 High/Mid/Low 층화 validation 표본을 만드는 중입니다..."):
                         training_sample = build_training_sample(
                             df,
                             pico_sectioned_text,
@@ -806,7 +786,10 @@ elif nav == "screen":
                         )
                     st.session_state["training_sample"] = training_sample
                     save_project_state(active, "training_sample", training_sample)
-                    st.success(f"학습용 문헌 {len(training_sample):,}편을 만들었습니다. Human_Label 열에 O(포함) 또는 X(제외)만 입력하세요.")
+                    st.success(
+                        f"Human validation 문헌 {len(training_sample):,}편을 만들었습니다. "
+                        "Human_Label 열에 O(포함 가능) 또는 X(확실히 제외)를 모두 입력하세요."
+                    )
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -817,69 +800,73 @@ elif nav == "screen":
                 s1.metric("High PICO", f"{int(tcounts.get('High PICO relevance', 0)):,}편")
                 s2.metric("Mid PICO", f"{int(tcounts.get('Mid PICO relevance', 0)):,}편")
                 s3.metric("Low PICO", f"{int(tcounts.get('Low PICO relevance', 0)):,}편")
-                st.caption("PICO 점수 상위 100편은 전수, 나머지는 중간·하위 층에서 무작위로 뽑습니다. Sampling_Weight 열은 Recall 추정에 쓰이니 지우지 마세요.")
+                st.caption(
+                    "기본 200편은 High 100편(상위 적합도 전수) + Mid 70편 + Low 30편(층화 무작위)입니다. "
+                    "Sampling_Weight와 Validation_Record_ID는 앱이 검증에 사용하므로 수정하지 마세요."
+                )
                 st.download_button(
-                    "학습용 200편 다운로드",
+                    f"Human validation {len(training_sample)}편 다운로드",
                     dataframe_to_excel_bytes(training_sample),
-                    "AI_Training_200.xlsx",
+                    "AI_Human_Validation_200.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
                     use_container_width=True,
                 )
 
                 labeled_file = st.file_uploader(
-                    "③ O/X 판정을 완료한 AI_Training_200.xlsx 업로드",
+                    "③ O/X 판정을 완료한 AI_Human_Validation_200.xlsx 업로드",
                     type=["xlsx", "xls", "csv"],
                     key="screen_labeled_training_200",
-                    help="Human_Label 열에 O=Include, X=Exclude를 입력한 파일을 업로드하세요. 빈 행은 학습에서 제외됩니다.",
+                    help="Human_Label만 입력하세요. O=포함 가능, X=확실히 제외. 200편 모두 판정되어야 다음 단계로 진행됩니다.",
                 )
 
                 if labeled_file:
                     try:
                         label_df, label_sheet = _read_screening_upload(labeled_file)
-                        merged_df, label_stats = merge_training_labels(df, label_df)
-                        l1, l2, l3 = st.columns(3)
-                        l1.metric("학습 라벨", f"{label_stats['labeled_n']:,}편")
-                        l2.metric("Include", f"{label_stats['include_n']:,}편")
-                        l3.metric("Exclude", f"{label_stats['exclude_n']:,}편")
-
-                        enough_classes = (
-                            label_stats["labeled_n"] >= MIN_LABELS_FOR_SUPERVISED
-                            and label_stats["include_n"] > 0
-                            and label_stats["exclude_n"] > 0
+                        merged_df, label_stats = merge_training_labels(
+                            df, label_df, expected_sample_df=training_sample
                         )
-                        if label_stats["labeled_n"] < MIN_LABELS_FOR_SUPERVISED:
-                            st.warning(f"유효 라벨이 {label_stats['labeled_n']}편입니다. 최소 {MIN_LABELS_FOR_SUPERVISED}편 이상 판정해야 학습을 시작할 수 있습니다. 가능하면 200편 모두 판정하세요.")
-                        elif label_stats["labeled_n"] < 180:
-                            st.info("일부 문헌이 미판정 상태입니다. 학습은 가능하지만 200편을 모두 판정하는 것이 가장 안정적입니다.")
+                        l1, l2, l3 = st.columns(3)
+                        l1.metric("Human validation", f"{label_stats['labeled_n']:,}/{label_stats['expected_n']:,}편")
+                        l2.metric("O · 포함 가능", f"{label_stats['include_n']:,}편")
+                        l3.metric("X · 제외", f"{label_stats['exclude_n']:,}편")
+                        st.success("표본 무결성과 O/X 완전 라벨링을 확인했습니다.")
+
+                        enough_classes = label_stats["include_n"] >= 4 and label_stats["exclude_n"] >= 4
                         if label_stats["include_n"] < MIN_INCLUDE_FOR_SUPERVISED:
                             st.warning(
-                                f"Include가 {label_stats['include_n']}편으로 적습니다. 학습은 가능하지만 높은 Recall을 유지하면 검토 감소 폭이 작을 수 있습니다. "
-                                "추가 라벨링을 강제하지는 않습니다."
+                                f"O가 {label_stats['include_n']}편입니다. 모델 계산은 가능할 수 있지만, "
+                                f"품질 PASS에는 최소 {MIN_INCLUDE_FOR_SUPERVISED}편의 O를 권장 기준으로 사용합니다."
                             )
+                        if not enough_classes:
+                            st.error("O와 X가 각각 최소 4편 이상 필요합니다. 현재 표본만으로는 교차검증 모델을 만들 수 없습니다.")
 
                         if st.button(
-                            "④ 200편으로 AI 학습 및 전체 문헌 선별",
+                            "④ 200편으로 AI 학습·교차검증·전체 선별",
                             type="primary",
                             use_container_width=True,
                             disabled=not enough_classes,
                         ):
-                            with st.spinner("200편의 사람 판정을 학습하고 전체 문헌의 우선순위를 계산하는 중입니다..."):
+                            with st.spinner("200편의 사람 판정을 이용해 OOF 교차검증과 전체 문헌 선별을 계산하는 중입니다..."):
                                 result = train_and_predict(
                                     merged_df,
                                     recall_target=DEFAULT_RECALL_TARGET,
                                     criteria_text=criteria_text,
+                                    gate_rules=[],
+                                    validation_expected_n=len(training_sample),
                                 )
-                            result.metrics["training_design"] = "fixed_200_pico_enriched"
-                            result.metrics["training_sample_requested"] = int(TRAINING_SAMPLE_SIZE)
+                            result.metrics["training_design"] = "fixed_200_pico_enriched_stratified_validation"
+                            result.metrics["training_sample_requested"] = int(len(training_sample))
                             result.metrics["training_sample_labeled"] = int(label_stats["labeled_n"])
+                            result.metrics["validation_set_id"] = label_stats.get("validation_set_id", "")
                             st.session_state["screening_result"] = result
                             st.session_state.pop("zero_shot_result", None)
                             save_project_state(active, "screening_result", result)
                             safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                            status0 = result.metrics.get("quality_gate_status", "REVIEW")
                             log_activity(
                                 "🤖", "AI 문헌 선별 완료",
-                                f"200편 고정 학습 → 전체 {len(result.predictions):,}편 / 검토 필요 {len(result.predictions)-safe_n0:,}편 / 안전 제외 후보 {safe_n0:,}편",
+                                f"Human validation {len(training_sample)}편 · {status0} → 전체 {len(result.predictions):,}편 / 안전 제외 후보 {safe_n0:,}편",
                             )
                             st.rerun()
                     except Exception as exc:
@@ -888,57 +875,115 @@ elif nav == "screen":
     result = st.session_state.get("screening_result")
     if result:
         total_n = len(result.predictions)
-        safe_n = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-        review_n = total_n - safe_n
-        reduction_rate = (safe_n / total_n * 100) if total_n else 0.0
+        gm = result.metrics
+        quality_status = str(gm.get("quality_gate_status", "REVIEW"))
+        auto_enabled = bool(gm.get("auto_exclusion_enabled", False))
+        safe_candidate_n = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+        operational_safe_n = safe_candidate_n if auto_enabled else 0
+        review_n = total_n - operational_safe_n
+        reduction_rate = (operational_safe_n / total_n * 100) if total_n else 0.0
 
         st.markdown('<div class="section-title" style="margin-top:18px;">최종 선별 결과</div>', unsafe_allow_html=True)
-        r1, r2, r3 = st.columns(3)
-        r1.metric("사람이 확인할 문헌", f"{review_n:,}편")
-        r2.metric("안전 제외 후보", f"{safe_n:,}편")
-        r3.metric("검토 부담 감소", f"{reduction_rate:.1f}%")
-        st.caption("AI는 200편의 사람 판정을 학습한 뒤 전체 문헌을 한 번에 순위화합니다. 이후 추가 라벨링 단계는 없습니다.")
+        if quality_status == "PASS":
+            st.success(
+                "Human validation 품질 게이트: PASS · 자동 제외가 활성화되었습니다. "
+                "200편의 사람 판정과 out-of-fold 검증에서 정한 운영 기준을 충족했습니다."
+            )
+        else:
+            reasons = gm.get("quality_gate_reasons", [])
+            detail = " · ".join(map(str, reasons)) if reasons else "운영 기준을 충족하지 못했습니다."
+            st.warning(
+                "Human validation 품질 게이트: REVIEW · 자동 제외는 잠금 상태입니다. "
+                f"AI 순위는 참고할 수 있지만 전체 문헌을 사람이 확인해야 합니다. {detail}"
+            )
 
-        with st.expander("성능 확인", expanded=False):
-            st.markdown("**현재 프로젝트 교차검증 성능**")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("사람이 확인할 문헌", f"{review_n:,}편")
+        r2.metric("자동 제외 적용", f"{operational_safe_n:,}편")
+        r3.metric("자동 제외 후보", f"{safe_candidate_n:,}편")
+        r4.metric("실제 검토 부담 감소", f"{reduction_rate:.1f}%")
+        st.caption(
+            "필수 human screening은 처음 선정된 validation 표본 200편입니다. 그 200편으로 학습·OOF 검증·품질판정을 수행하며, "
+            "PASS이면 안전 제외 후보를 자동 제외에 사용합니다. 별도의 추가 감사 표본은 필수가 아닙니다."
+        )
+        st.caption(
+            "주의: PASS는 해당 200편 내부 human-validation과 OOF 예측에 근거한 운영상 품질 기준이며, "
+            "라벨되지 않은 전체 코퍼스에서 관련 문헌이 절대 누락되지 않는다는 통계적 보장은 아닙니다."
+        )
+
+        st.download_button(
+            "Human validation 품질관리 보고서 다운로드",
+            build_validation_report_excel_bytes(result),
+            "AI_Human_Validation_QC_Report.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if gm.get("gate_active"):
+            gs = gm.get("gate_stats", {})
+            st.info(
+                "이 프로젝트에는 사용자가 명시적으로 제공한 규칙 게이트가 적용되었습니다. "
+                f"게이트 제외 {int(gs.get('corpus_removed_n', 0)):,}편 · human Include 탈락 {int(gs.get('labeled_include_removed_n', 0))}편"
+            )
+        else:
+            st.caption("V30 범용 모드에서는 프로젝트 특이적 hidden regex gate를 기본 적용하지 않습니다.")
+
+        with st.expander("검증 성능 자세히 보기", expanded=False):
             m = result.metrics
             conf = result.confusion
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Recall", f"{m.get('recall', 0.0)*100:.1f}%")
-            p2.metric("False Negative", f"{int(conf.get('fn', 0))}편")
-            p3.metric("Precision", f"{m.get('precision', 0.0)*100:.1f}%")
-            p4.metric("WSS", f"{m.get('wss', 0.0)*100:.1f}%")
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("ROC-AUC", f"{m.get('roc_auc', 0.0):.3f}")
-            q2.metric("Average Precision", f"{m.get('average_precision', 0.0):.3f}")
-            q3.metric("안전 제외 FN", f"{int(m.get('safe_exclude_cv_false_negatives', 0))}편")
-            q4.metric("학습 라벨", f"{int(m.get('labeled_n', 0)):,}편")
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("목표 Recall", f"{m.get('recall_target', 0.95)*100:.0f}%")
-            r2.metric("WSS@95", f"{m.get('wss', 0.0)*100:.1f}%")
-            r3.metric("WSS@100", f"{m.get('wss_100', 0.0)*100:.1f}%")
-            r4.metric("선택 Threshold", f"{m.get('threshold', result.threshold):.3f}")
-            st.caption("Threshold는 200편의 교차검증 예측에서 Recall ≥95%를 만족하는 후보 중 WSS가 최대가 되도록 자동 고정됩니다. 이후 추가 라벨링이나 반복 재학습은 하지 않습니다.")
-            st.caption("WSS@100은 같은 200편 CV 예측에서 FN=0을 강제했을 때의 참고값이며, 추가 human screening을 의미하지 않습니다.")
-            st.caption("이 성능은 200편 라벨 내 교차검증 결과입니다. 아직 라벨되지 않은 전체 문헌에서 동일한 성능을 보장하는 독립 검증 결과는 아닙니다.")
+            st.markdown("**A. 실제 자동 제외 정책 안전성**")
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Safe-exclude Recall (가중)", f"{m.get('policy_safe_recall_weighted', 0.0)*100:.1f}%")
+            a2.metric("Safe-exclude FN", f"{int(m.get('policy_safe_fn', 0))}편")
+            a3.metric("95% 단측 Recall 하한", f"{m.get('policy_safe_recall_lower_ci', 0.0)*100:.1f}%")
+            a4.metric("Final WSS (가중)", f"{m.get('policy_safe_wss_weighted', 0.0)*100:.1f}%")
+            st.caption(
+                "Safe-exclude Recall은 '우선 검토 + 경계 문헌'을 모두 사람이 읽는 것으로 두고, "
+                "자동 제외 영역 때문에 human Include가 사라지는지를 직접 계산한 핵심 안전성 지표입니다."
+            )
 
-            # False-negative 문헌을 바로 확인/다운로드할 수 있게 제공
-            fn_df = result.predictions[result.predictions.get("False_Negative", False) == True].copy()
-            if len(fn_df):
-                st.markdown("**False-negative error analysis 대상**")
-                fn_cols = [c for c in ["Title", "Abstract", "Human_Label_Normalized", "CV_Probability", "CV_Prediction", "AI_Probability", "AI_Recommendation"] if c in fn_df.columns]
-                st.dataframe(fn_df[fn_cols], use_container_width=True, hide_index=True)
-                st.download_button(
-                    "False Negative 문헌 Excel 다운로드",
-                    dataframe_to_excel_bytes(fn_df),
-                    "AI_Screening_False_Negatives.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+            st.markdown("**B. AI 우선순위 모델 성능**")
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("OOF Recall (가중)", f"{m.get('policy_priority_recall_weighted', 0.0)*100:.1f}%")
+            b2.metric("OOF Recall (비가중)", f"{m.get('policy_priority_recall_unweighted', 0.0)*100:.1f}%")
+            b3.metric("Min-fold Recall", f"{m.get('policy_min_fold_priority_recall', 0.0)*100:.1f}%")
+            b4.metric("Priority FN", f"{int(m.get('policy_priority_fn', 0))}편")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("ROC-AUC", f"{m.get('roc_auc', 0.0):.3f}")
+            c2.metric("Average Precision", f"{m.get('average_precision', 0.0):.3f}")
+            c3.metric("WSS@95 (가중)", f"{m.get('wss_weighted', 0.0)*100:.1f}%")
+            c4.metric("Threshold", f"{m.get('threshold', result.threshold):.3f}")
+            st.caption(
+                "OOF(out-of-fold) 예측은 각 validation 문헌을 그 문헌을 학습에 사용하지 않은 fold 모델로 예측합니다. "
+                "Threshold는 sampling-weighted Recall ≥95%를 만족하는 후보 중 WSS가 최대가 되도록 고정됩니다."
+            )
 
+            st.markdown("**C. Human validation 구성**")
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Validation", f"{int(m.get('labeled_n', 0)):,}/{int(m.get('validation_expected_n', 0)):,}편")
+            d2.metric("Include", f"{int(m.get('include_n', 0)):,}편")
+            d3.metric("목표 Recall", f"{m.get('recall_target', 0.95)*100:.0f}%")
+            d4.metric("Algorithm", str(m.get("algorithm_version", "V30")))
+
+            _policy_safe_series = result.predictions.get(
+                "Policy_Safe_Excluded", pd.Series(0, index=result.predictions.index)
+            )
+            safe_err_df = result.predictions[
+                (result.predictions.get("Human_Label_Normalized", pd.Series(np.nan, index=result.predictions.index)) == 1)
+                & (pd.to_numeric(_policy_safe_series, errors="coerce").fillna(0).astype(int) == 1)
+            ].copy()
+            if len(safe_err_df):
+                st.markdown("**자동 제외 영역에서 발견된 human Include**")
+                cols = [c for c in ["Title", "Abstract", "Training_Stratum", "Sampling_Weight", "CV_Probability", "AI_Probability", "Gate_Fail_Reason"] if c in safe_err_df.columns]
+                st.dataframe(safe_err_df[cols], use_container_width=True, hide_index=True)
+                st.error("이 문헌이 존재하므로 자동 제외 품질 게이트는 PASS가 될 수 없습니다.")
+
+            st.markdown("**논문 Methods용 자동 생성 문구**")
+            st.code(validation_methods_text(result), language="text")
 
             st.markdown("**성능 Figure**")
-            perf_figs = _screening_performance_figure_bytes(result, total_n, safe_n)
+            perf_figs = _screening_performance_figure_bytes(result, total_n, operational_safe_n)
             figure_order = [
                 ("01_ROC_Curve.png", "ROC Curve"),
                 ("02_Precision_Recall_Curve.png", "Precision–Recall Curve"),
@@ -959,7 +1004,7 @@ elif nav == "screen":
                     "성능 Figure 4개 ZIP 다운로드",
                     _zip_bytes(perf_figs),
                     "AI_Screening_Performance_Figures.zip", "application/zip",
-                    type="primary", use_container_width=True,
+                    use_container_width=True,
                 )
 
         counts = result.predictions["AI_Recommendation"].value_counts()
@@ -983,7 +1028,7 @@ elif nav == "screen":
             height=540,
         )
         st.download_button(
-            "AI 선별 결과 다운로드",
+            "AI 선별 결과 전체 다운로드",
             build_grouped_excel_bytes(result.predictions),
             "AI_Screening_Ranked.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -991,9 +1036,13 @@ elif nav == "screen":
             use_container_width=True,
         )
 
-        # 실제 screening workflow에 바로 사용할 수 있도록 검토군/안전제외군도 별도 저장
-        review_df = result.predictions[result.predictions["AI_Recommendation"] != "안전 제외 후보"].copy()
-        safe_df = result.predictions[result.predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+        if auto_enabled:
+            review_df = result.predictions[result.predictions["AI_Recommendation"] != "안전 제외 후보"].copy()
+            safe_df = result.predictions[result.predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+        else:
+            review_df = result.predictions.copy()
+            safe_df = result.predictions[result.predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+
         d1, d2 = st.columns(2)
         with d1:
             st.download_button(
@@ -1005,17 +1054,26 @@ elif nav == "screen":
                 use_container_width=True,
             )
         with d2:
+            safe_label = "자동 제외 문헌 다운로드" if auto_enabled else "안전 제외 후보(참고용) 다운로드"
+            safe_name = "AI_Auto_Exclude_PASS.xlsx" if auto_enabled else "AI_Safe_Exclude_Candidates_REVIEW_ONLY.xlsx"
             st.download_button(
-                "AI 안전 제외 후보 다운로드",
+                safe_label,
                 dataframe_to_excel_bytes(safe_df),
-                "AI_Safe_Exclude_Candidates.xlsx",
+                safe_name,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                disabled=(len(safe_df) == 0),
                 use_container_width=True,
             )
 
-# ===========================================================================
-# 5. PDF 분석 — 1단계 연구 특성 자동 추출
-# ===========================================================================
+        if auto_enabled:
+            st.info(
+                "필수 검증은 여기까지입니다. 추가 무작위 audit 없이 Human validation 200편의 품질 게이트 결과를 기준으로 진행하도록 설계했습니다."
+            )
+        else:
+            st.warning(
+                "현재는 자동 제외를 사용하지 마세요. 품질관리 보고서의 원인과 safe-exclude error를 확인한 뒤 PICO/PECO 또는 모델 설정을 수정해 새 200편 validation으로 재평가하는 것이 안전합니다."
+            )
+
 elif nav == "pdf_analysis":
     hero(
         "PDF 분석",
