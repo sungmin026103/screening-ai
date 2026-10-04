@@ -831,6 +831,14 @@ elif nav == "screen":
                         l2.metric("O · 포함 가능", f"{label_stats['include_n']:,}편")
                         l3.metric("X · 제외", f"{label_stats['exclude_n']:,}편")
                         st.success("표본 무결성과 O/X 완전 라벨링을 확인했습니다.")
+                        # validation 표본 확장 단계에서 쓰기 위해 라벨된 validation을 보관한다.
+                        _lv = label_df.copy()
+                        if "_Source_Index" not in _lv.columns and "_Source_Index" in training_sample.columns:
+                            _lv = _lv.merge(
+                                training_sample[["Validation_Record_ID", "_Source_Index"]],
+                                on="Validation_Record_ID", how="left")
+                        st.session_state.setdefault("screen_labeled_validation", _lv)
+                        st.session_state["screen_labeled_validation_initial"] = _lv
 
                         enough_classes = label_stats["include_n"] >= 4 and label_stats["exclude_n"] >= 4
                         if label_stats["include_n"] < MIN_INCLUDE_FOR_SUPERVISED:
@@ -910,6 +918,87 @@ elif nav == "screen":
             "주의: PASS는 해당 200편 내부 human-validation과 OOF 예측에 근거한 운영상 품질 기준이며, "
             "라벨되지 않은 전체 코퍼스에서 관련 문헌이 절대 누락되지 않는다는 통계적 보장은 아닙니다."
         )
+
+        # ------------------------------------------------------------------
+        # Include가 부족해 자동 제외가 잠긴 경우: validation 표본을 '추가로' 뽑는다.
+        # 학습에 쓴 라벨을 validation에 합치면 독립성이 깨져 추정이 낙관적으로 편향된다.
+        # ------------------------------------------------------------------
+        include_n_now = int(gm.get("include_n", 0))
+        if not auto_enabled and include_n_now > 0:
+            st.markdown('<div class="section-title" style="margin-top:18px;">Validation 표본 확장</div>', unsafe_allow_html=True)
+            st.caption(
+                f"현재 validation Include {include_n_now}편입니다. Include가 적으면 safe-exclude Recall의 "
+                "신뢰구간이 넓어 자동 제외를 열 수 없습니다. 학습에 쓴 라벨을 합치면 독립성이 깨지므로, "
+                "같은 코퍼스에서 validation 표본을 추가로 뽑아 라벨링합니다. "
+                "추가 표본은 PICO 층 × AI 확률구간으로 사후층화해 Include가 실제로 있는 셀에 집중 배분하며, "
+                "가중치는 셀별 N/n으로 다시 계산되므로 추정의 불편성이 유지됩니다."
+            )
+            ext_n = st.selectbox("추가로 라벨링할 편수", [100, 200, 300, 400], index=1, key="ext_n")
+            labeled_val = st.session_state.get("screen_labeled_validation")
+            probs_corpus = result.predictions.sort_values("_Source_Index")["AI_Probability"].to_numpy() \
+                if "_Source_Index" in result.predictions.columns else result.predictions["AI_Probability"].to_numpy()
+
+            if st.button("① 추가 표본 배분 계획 보기", use_container_width=True, key="ext_plan"):
+                try:
+                    plan = plan_validation_extension(
+                        df, labeled_val, probs_corpus, pico_sectioned_text,
+                        pico.get("exclusion_criteria", ""), n_add=int(ext_n))
+                    st.session_state["ext_plan"] = plan
+                except Exception as exc:
+                    st.error(str(exc))
+
+            plan = st.session_state.get("ext_plan")
+            if isinstance(plan, pd.DataFrame) and not plan.empty:
+                show = plan[plan["allocate"] > 0][
+                    ["Cell", "N_corpus", "n_labeled", "include_labeled", "prevalence_est", "allocate", "expected_new_includes"]]
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                exp_inc = float(plan["expected_new_includes"].sum())
+                st.caption(
+                    f"{int(ext_n)}편을 추가로 읽으면 Include가 약 {exp_inc:.1f}편 늘어날 것으로 추정됩니다 "
+                    f"(현재 {include_n_now}편 → 약 {include_n_now + exp_inc:.0f}편). "
+                    "자동 제외를 열려면 Include 10편 이상이 필요합니다."
+                )
+                if st.button("② 추가 표본 뽑기", use_container_width=True, key="ext_build"):
+                    try:
+                        ext = build_validation_extension(
+                            df, labeled_val, probs_corpus, pico_sectioned_text,
+                            pico.get("exclusion_criteria", ""), n_add=int(ext_n))
+                        st.session_state["ext_sample"] = ext
+                        save_project_state(active, "ext_sample", ext)
+                        st.success(f"{len(ext)}편을 뽑았습니다. Human_Label 열에 O 또는 X를 입력하세요.")
+                    except Exception as exc:
+                        st.error(str(exc))
+
+            ext_sample = st.session_state.get("ext_sample")
+            if isinstance(ext_sample, pd.DataFrame) and not ext_sample.empty:
+                st.download_button(
+                    f"③ 추가 validation {len(ext_sample)}편 다운로드",
+                    dataframe_to_excel_bytes(ext_sample),
+                    "AI_Human_Validation_Extension.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary", use_container_width=True,
+                )
+                ext_file = st.file_uploader(
+                    "④ 판정을 완료한 AI_Human_Validation_Extension.xlsx 업로드",
+                    type=["xlsx", "xls", "csv"], key="ext_upload")
+                if ext_file:
+                    try:
+                        ext_df, _sheet = _read_screening_upload(ext_file)
+                        merged_val, mstats = merge_validation_extension(
+                            df, labeled_val, ext_df, probs_corpus,
+                            pico_sectioned_text, pico.get("exclusion_criteria", ""))
+                        st.session_state["screen_labeled_validation"] = merged_val
+                        save_project_state(active, "screen_labeled_validation", merged_val)
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("합산 validation", f"{mstats['n_total']:,}편")
+                        m2.metric("Include", f"{mstats['include_n']:,}편")
+                        m3.metric("최대 가중치", f"{mstats['max_weight']:.1f}")
+                        st.success(
+                            "표본을 합치고 셀별 N/n으로 가중치를 다시 계산했습니다. "
+                            "위의 학습 단계를 다시 실행하면 확장된 validation으로 품질 판정이 이루어집니다."
+                        )
+                    except Exception as exc:
+                        st.error(str(exc))
 
         st.download_button(
             "Human validation 품질관리 보고서 다운로드",
@@ -1008,10 +1097,16 @@ elif nav == "screen":
                 )
 
         counts = result.predictions["AI_Recommendation"].value_counts()
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("우선 검토", f"{int(counts.get('우선 검토', 0)):,}편")
         c2.metric("경계 문헌", f"{int(counts.get('경계 문헌', 0)):,}편")
-        c3.metric("안전 제외 후보", f"{int(counts.get('안전 제외 후보', 0)):,}편")
+        c3.metric("초록 없음", f"{int(counts.get(MANUAL_REVIEW_TIER, 0)):,}편")
+        c4.metric("안전 제외 후보", f"{int(counts.get('안전 제외 후보', 0)):,}편")
+        if int(counts.get(MANUAL_REVIEW_TIER, 0)) > 0:
+            st.caption(
+                "초록이 없는 레코드는 제목만으로 PECO 판정이 불가능하므로 자동 제외하지 않고, "
+                "임계값·안전 컷오프 추정에서도 제외한 뒤 별도로 분리했습니다. 이 묶음은 사람이 직접 확인하세요."
+            )
 
         def _shade_priority(row):
             status = row.get("AI_Recommendation", "")

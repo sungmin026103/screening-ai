@@ -45,7 +45,11 @@ except Exception:  # pragma: no cover
     _HAS_SENTENCE_TRANSFORMERS = False
 
 # 화면에 표시되는 3단계 우선순위 (정렬 순서 그대로 사용)
-PRIORITY_ORDER = ["우선 검토", "경계 문헌", "안전 제외 후보"]
+MANUAL_REVIEW_TIER = "초록 없음 · 수기 확인"
+PRIORITY_ORDER = ["우선 검토", "경계 문헌", MANUAL_REVIEW_TIER, "안전 제외 후보"]
+# 초록이 이보다 짧으면 제목만으로는 PECO 판정이 불가능한 레코드로 보고,
+# 자동 제외에서 빼고 임계값 추정에서도 제외한 뒤 별도 수기 확인 더미로 보낸다.
+ABSTRACT_MIN_CHARS = 30
 
 # 지도학습(재현율 통계적 보장) 모드로 전환되는 최소 라벨 수. 이 미만이면 앱은
 # 자동으로 zero-shot 모드로 동작한다 — 사람이 매번 "어느 모드로 할지" 고르는 게
@@ -55,7 +59,7 @@ TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
 VALIDATION_RECALL_TARGET = 0.95
 VALIDATION_CONFIDENCE = 0.95
-ALGORITHM_VERSION = "V30.0"
+ALGORITHM_VERSION = "V31.0"
 # 층화 추출: PICO 점수 순위 경계(상위 10%, 상위 40%)와 층별 표본 배분(합 1.0)
 STRATUM_BOUNDS = (None, 0.40)  # High는 상위 n_high편 전수, Mid는 그 아래~상위 40%
 STRATUM_ALLOCATION = (0.50, 0.35, 0.15)
@@ -63,10 +67,11 @@ STRATUM_ALLOCATION = (0.50, 0.35, 0.15)
 # 엑셀 다운로드 시 구간 순서와 배경색. False Negative는 실제 라벨이 Include인데
 # 컷오프 밖으로 밀려난, 눈에 띄어야 하는 문헌이라 원래 버킷에서 따로 떼어내
 # 독립된 구간으로 모은다 (행이 두 번 나오지 않도록 한 구간에만 배치한다).
-EXPORT_GROUP_ORDER = ["우선 검토", "경계 문헌", "False Negative", "안전 제외 후보"]
+EXPORT_GROUP_ORDER = ["우선 검토", "경계 문헌", MANUAL_REVIEW_TIER, "False Negative", "안전 제외 후보"]
 EXPORT_GROUP_COLORS = {
     "우선 검토": "FFFFFF",       # 흰색
     "경계 문헌": "E9ECF1",       # 중간 회색
+    MANUAL_REVIEW_TIER: "FFF2CC",  # 노란색 — 텍스트가 없어 자동 판정 불가
     "False Negative": "F7D6D2",  # 경고용 붉은색 (기존 FN 탭과 동일 색)
     "안전 제외 후보": "B8BDC6",  # 진한 회색
 }
@@ -857,6 +862,13 @@ GATE_MIN_LABELED_AFTER = 20    # 게이트 통과 라벨이 이보다 적으면 
 # 상용/범용 배포 기본값: 프로젝트 특이적 정규식은 자동 적용하지 않는다.
 # 규칙 게이트를 쓰려면 프로젝트별로 명시적으로 gate_rules를 전달해야 한다.
 GATE_RULES_DEFAULT: list[tuple[str, str]] = []
+# 프로젝트별 규칙은 custom gate로 주입한다. 비워 두면 게이트는 비활성이다.
+
+
+def _missing_abstract_mask(abstracts) -> np.ndarray:
+    """초록이 없거나 지나치게 짧은 레코드(제목만 있는 레코드)를 표시한다."""
+    ser = pd.Series(abstracts).fillna("").astype(str).str.strip()
+    return (ser.str.len() < ABSTRACT_MIN_CHARS).to_numpy()
 
 # V29에 포함됐던 특정 니트로사민-심혈관-동물실험용 규칙은 하위 참고용으로만 보존한다.
 # 절대로 기본 적용되지 않는다.
@@ -905,6 +917,7 @@ def build_gate(
     y: np.ndarray,
     weights: np.ndarray | None = None,
     rules: list[tuple[str, str]] | None = None,
+    exempt: np.ndarray | None = None,
 ) -> dict:
     """규칙 게이트를 만들고 사람 라벨 위에서 검증한다.
 
@@ -919,6 +932,14 @@ def build_gate(
     rules = list(rules if rules is not None else GATE_RULES_DEFAULT)
     n_all = len(all_texts)
     masks = _gate_rule_masks(all_texts, rules)
+    # 초록이 없는 레코드는 용어 기반 규칙으로 판정할 수 없다. 규칙을 면제해 통과시키고,
+    # 규칙 검증(FN 집계)에서도 제외한다. 이 레코드들은 별도 수기 확인 더미로 간다.
+    if exempt is not None:
+        exempt = np.asarray(exempt, dtype=bool)
+        for name in masks:
+            masks[name] = masks[name] | exempt
+    else:
+        exempt = np.zeros(n_all, dtype=bool)
 
     y = np.asarray(y, dtype=int)
     inc = y == 1
@@ -1000,6 +1021,7 @@ def _crossfold_policy_evaluation(
     recall_target: float,
     weights=None,
     gate_pass: np.ndarray | None = None,
+    manual_review: np.ndarray | None = None,
 ) -> dict:
     """Threshold/cutoff를 평가 행 자체의 라벨로 정하지 않도록 fold별 정책 검증을 수행한다.
 
@@ -1012,6 +1034,7 @@ def _crossfold_policy_evaluation(
     folds = np.asarray(fold_ids, dtype=int)
     w = _weights_or_ones(weights, len(y))
     gate = np.ones(len(y), dtype=bool) if gate_pass is None else np.asarray(gate_pass, dtype=bool)
+    manual = np.zeros(len(y), dtype=bool) if manual_review is None else np.asarray(manual_review, dtype=bool)
     priority_pred = np.zeros(len(y), dtype=bool)
     safe_excluded = np.zeros(len(y), dtype=bool)
     details = []
@@ -1019,7 +1042,7 @@ def _crossfold_policy_evaluation(
     for fold_no in sorted(int(x) for x in np.unique(folds) if int(x) > 0):
         va = folds == fold_no
         cal = ~va
-        cal_gate = cal & gate
+        cal_gate = cal & gate & ~manual
         # calibration fold에 두 클래스가 없으면 가장 보수적으로 전부 human review.
         if cal_gate.sum() < 4 or np.unique(y[cal_gate]).size < 2:
             thr = 0.0
@@ -1030,8 +1053,8 @@ def _crossfold_policy_evaluation(
                 w[cal_gate] if weights is not None else None,
             )
             safe_cut = min(_safe_exclude_cutoff(probs[cal_gate], y[cal_gate], SAFE_RECALL_TARGET), thr)
-        priority_pred[va] = (probs[va] >= thr) & gate[va]
-        safe_excluded[va] = (probs[va] < safe_cut) | ~gate[va]
+        priority_pred[va] = ((probs[va] >= thr) & gate[va]) | manual[va]
+        safe_excluded[va] = ((probs[va] < safe_cut) | ~gate[va]) & ~manual[va]
 
         pos = va & (y == 1)
         fold_safe_recall = float((~safe_excluded[pos]).mean()) if pos.any() else np.nan
@@ -1518,7 +1541,11 @@ def _labeled_view(pred_df: pd.DataFrame):
         gate_all = pred_df["Gate_Pass"].fillna(True).astype(bool).to_numpy()
     else:
         gate_all = np.ones(len(pred_df), dtype=bool)
-    return mask, y_labeled, cv_probs, w_labeled, gate_all, gate_all[mask.to_numpy()]
+    if "No_Abstract" in pred_df.columns:
+        na_all = pred_df["No_Abstract"].fillna(False).astype(bool).to_numpy()
+    else:
+        na_all = _missing_abstract_mask(pred_df.get("Abstract", pd.Series([""] * len(pred_df))).to_numpy())
+    return mask, y_labeled, cv_probs, w_labeled, gate_all, gate_all[mask.to_numpy()], na_all, na_all[mask.to_numpy()]
 
 
 def _retier(result: ScreeningResult, threshold: float, strategy: str) -> ScreeningResult:
@@ -1526,20 +1553,25 @@ def _retier(result: ScreeningResult, threshold: float, strategy: str) -> Screeni
     게이트에서 떨어진 문헌은 임계값과 무관하게 항상 '안전 제외 후보'로 남는다."""
     updated = deepcopy(result)
     pred_df = updated.predictions.copy()
-    mask, y_labeled, cv_probs_main, w_labeled, gate_all, gate_lab = _labeled_view(pred_df)
+    mask, y_labeled, cv_probs_main, w_labeled, gate_all, gate_lab, na_all, na_lab = _labeled_view(pred_df)
     updated.threshold = float(threshold)
 
     probs = pd.to_numeric(pred_df["AI_Probability"], errors="coerce").fillna(0).to_numpy()
-    safe_cut = min(_safe_exclude_cutoff(cv_probs_main[gate_lab], y_labeled[gate_lab], SAFE_RECALL_TARGET), threshold)
-    safe_all = (probs < safe_cut) | ~gate_all
-    safe_cv = (cv_probs_main < safe_cut) | ~gate_lab
+    tune = gate_lab & ~na_lab
+    if int(((y_labeled == 1) & tune).sum()) < 2:
+        tune = gate_lab
+    safe_cut = min(_safe_exclude_cutoff(cv_probs_main[tune], y_labeled[tune], SAFE_RECALL_TARGET), threshold)
+    safe_all = ((probs < safe_cut) | ~gate_all) & ~na_all
+    safe_cv = ((cv_probs_main < safe_cut) | ~gate_lab) & ~na_lab
     pred_df["Unanimous_Exclude"] = safe_all
-    pred_df["AI_Recommendation"] = _priority_labels(np.where(gate_all, probs, -1.0), threshold, safe_all)
+    pred_df["AI_Recommendation"] = np.where(
+        na_all, MANUAL_REVIEW_TIER,
+        _priority_labels(np.where(gate_all, probs, -1.0), threshold, safe_all))
     updated.metrics["safe_cutoff"] = float(safe_cut)
     updated.metrics["safe_exclude_cv_n"] = int(safe_cv.sum())
     updated.metrics["safe_exclude_cv_false_negatives"] = int(((y_labeled == 1) & safe_cv).sum())
 
-    cv_pred = ((cv_probs_main >= threshold) & gate_lab).astype(int)
+    cv_pred = (((cv_probs_main >= threshold) & gate_lab) | na_lab).astype(int)
     pred_df.loc[:, "CV_Prediction"] = np.nan
     pred_df.loc[mask, "CV_Prediction"] = cv_pred
     pred_df.loc[:, "False_Negative"] = False
@@ -1568,9 +1600,12 @@ def apply_fn_budget(result: ScreeningResult, allowed_fn: int) -> ScreeningResult
     pred_df = result.predictions
     if not {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
         return deepcopy(result)
-    _, y_labeled, cv_probs_main, w_labeled, _, gate_lab = _labeled_view(pred_df)
-    threshold = _fn_budget_cutoff(cv_probs_main[gate_lab], y_labeled[gate_lab], allowed_fn,
-                                  None if w_labeled is None else w_labeled[gate_lab])
+    _, y_labeled, cv_probs_main, w_labeled, _, gate_lab, _na_all, na_lab = _labeled_view(pred_df)
+    tune = gate_lab & ~na_lab
+    if int(((y_labeled == 1) & tune).sum()) < 2:
+        tune = gate_lab
+    threshold = _fn_budget_cutoff(cv_probs_main[tune], y_labeled[tune], allowed_fn,
+                                  None if w_labeled is None else w_labeled[tune])
     updated = _retier(result, threshold, "FN-budget cutoff (manual)")
     updated.metrics["allowed_fn"] = int(allowed_fn)
     return updated
@@ -1586,13 +1621,16 @@ def apply_recall_target(result: ScreeningResult, recall_target: float, confidenc
     pred_df = result.predictions
     if not {"CV_Probability", "Human_Label_Normalized"}.issubset(pred_df.columns):
         return deepcopy(result)
-    _, y_labeled, cv_probs_main, w_labeled, _, gate_lab = _labeled_view(pred_df)
+    _, y_labeled, cv_probs_main, w_labeled, _, gate_lab, _na_all, na_lab = _labeled_view(pred_df)
     # train_and_predict와 동일한 규칙으로 임계값을 잡는다: 게이트 통과 문헌 안에서
     # (가중) Recall ≥ 목표를 만족하는 후보 중 WSS가 최대인 값. 정책만 바꿔도 학습 직후와
     # 같은 임계값이 나오도록 두 경로를 일치시킨다.
+    tune = gate_lab & ~na_lab
+    if int(((y_labeled == 1) & tune).sum()) < 2:
+        tune = gate_lab
     threshold, _info = _optimize_threshold_wss(
-        cv_probs_main[gate_lab], y_labeled[gate_lab], recall_target,
-        None if w_labeled is None else w_labeled[gate_lab])
+        cv_probs_main[tune], y_labeled[tune], recall_target,
+        None if w_labeled is None else w_labeled[tune])
     updated = _retier(result, threshold, "Recall-constrained WSS optimization")
     updated.metrics["recall_target"] = float(recall_target)
     updated.metrics["allowed_fn"] = int(allowed_fn)
@@ -1677,26 +1715,35 @@ def train_and_predict(
 
     # 규칙 게이트: 적격 문헌이라면 제목·초록에 반드시 나타나는 용어군을 AND로 걸어
     # ML 앞에서 corpus를 줄인다. 라벨 Include를 한 편이라도 떨어뜨리는 규칙은 자동 폐기된다.
-    gate = build_gate(all_plain_texts, labeled_pos, y, weights, gate_rules)
+    # 초록이 없는 레코드: 제목만으로는 PECO 판정이 불가능하므로 자동 제외 대상에서 빼고,
+    # 임계값·안전컷오프·정책검증 어디에도 넣지 않는다. 별도 수기 확인 더미로 보낸다.
+    no_abstract_all = _missing_abstract_mask(data["Abstract"].to_numpy())
+    no_abstract_lab = no_abstract_all[labeled_pos]
+
+    gate = build_gate(all_plain_texts, labeled_pos, y, weights, gate_rules, exempt=no_abstract_all)
     gate_pass_all = gate["pass_mask"]
     gate_pass_lab = gate_pass_all[labeled_pos]
 
     # 품질 게이트용 cross-fold policy evaluation:
     # 각 fold는 나머지 fold가 정한 threshold/cutoff만 적용받는다.
     policy_eval = _crossfold_policy_evaluation(
-        probs, y, cv_fold_id, recall_target, weights=weights, gate_pass=gate_pass_lab
+        probs, y, cv_fold_id, recall_target, weights=weights, gate_pass=gate_pass_lab,
+        manual_review=no_abstract_lab,
     )
 
     # 우선 검토 임계값: (가중) Recall ≥ 목표를 만족하면서 WSS가 최대인 값.
     # 게이트가 켜져 있으면 게이트 통과 문헌만으로 임계값을 잡는다 (게이트 밖은 이미 제외이므로
     # 그 문헌들까지 넣고 최적화하면 임계값이 불필요하게 낮아진다).
     if gate["active"]:
-        thr_probs, thr_y = probs[gate_pass_lab], y[gate_pass_lab]
-        thr_w = None if weights is None else np.asarray(weights)[gate_pass_lab]
+        tuning_lab = gate_pass_lab & ~no_abstract_lab
     else:
-        thr_probs, thr_y, thr_w = probs, y, weights
+        tuning_lab = ~no_abstract_lab
+    if int(((y == 1) & tuning_lab).sum()) < 2:   # 추정 불가 시 전체로 되돌림
+        tuning_lab = np.ones(len(y), dtype=bool)
+    thr_probs, thr_y = probs[tuning_lab], y[tuning_lab]
+    thr_w = None if weights is None else np.asarray(weights)[tuning_lab]
     threshold, threshold_info = _optimize_threshold_wss(thr_probs, thr_y, recall_target, thr_w)
-    pred = ((probs >= threshold) & gate_pass_lab).astype(int)
+    pred = (((probs >= threshold) & gate_pass_lab) | no_abstract_lab).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
 
     recall_v = float(recall_score(y, pred, zero_division=0))
@@ -1792,8 +1839,8 @@ def train_and_predict(
     # 안전 제외: 라벨 Include 점수 분포의 99% 단측 예측구간 하한 아래(_safe_exclude_cutoff).
     # 게이트가 켜져 있으면 게이트 통과 라벨만으로 분포를 추정한다.
     safe_cut = min(_safe_exclude_cutoff(thr_probs, thr_y, SAFE_RECALL_TARGET), threshold)
-    safe_all = (all_probs < safe_cut) | ~gate_pass_all
-    safe_cv = (probs < safe_cut) | ~gate_pass_lab
+    safe_all = ((all_probs < safe_cut) | ~gate_pass_all) & ~no_abstract_all
+    safe_cv = ((probs < safe_cut) | ~gate_pass_lab) & ~no_abstract_lab
     metrics["safe_cutoff"] = float(safe_cut)
     metrics["safe_recall_target"] = float(SAFE_RECALL_TARGET)
     metrics["safe_exclude_cv_n"] = int(safe_cv.sum())
@@ -1833,7 +1880,9 @@ def train_and_predict(
     if not enough_include:
         quality_reasons.append(f"Include가 {n_include}편으로 내부 검증에 부족함(권장 최소 {MIN_INCLUDE_FOR_SUPERVISED}편)")
     if not ranking_ok:
-        quality_reasons.append(f"fold-held-out priority Recall(가중/비가중)이 목표 {recall_target*100:.0f}% 미만")
+        quality_reasons.append(
+            f"fold-held-out priority Recall(가중/비가중)이 목표 {recall_target*100:.0f}% 미만 "
+            "— 우선 검토/경계 문헌 순위 품질 문제이며, 경계 문헌도 사람이 읽으므로 자동 제외 잠금 사유는 아님")
     if not safe_ok:
         quality_reasons.append(
             f"fold-held-out safe-exclude Recall(가중/비가중)이 목표 {recall_target*100:.0f}% 미만 "
@@ -1842,16 +1891,29 @@ def train_and_predict(
     if not gate_ok:
         quality_reasons.append(f"규칙 게이트가 human Include {gate_fn}편을 제외함")
 
-    metrics["quality_gate_status"] = "PASS" if (complete and enough_include and ranking_ok and safe_ok and gate_ok) else "REVIEW"
-    metrics["auto_exclusion_enabled"] = bool(metrics["quality_gate_status"] == "PASS")
+    # 자동 제외의 안전성은 safe-exclude Recall과 게이트 FN으로만 결정된다.
+    # priority/경계 분할(ranking_ok)은 '우선 검토'와 '경계 문헌' 사이의 순서 문제이며,
+    # 경계 문헌도 사람이 모두 읽으므로 자동 제외의 안전성과는 무관하다.
+    # V30까지는 ranking_ok를 자동 제외 잠금 조건에 함께 넣어, 순위 품질이 낮다는 이유만으로
+    # 안전성이 입증된 자동 제외까지 잠겼다.
+    metrics["ranking_quality_ok"] = bool(ranking_ok)
+    metrics["auto_exclusion_enabled"] = bool(complete and enough_include and safe_ok and gate_ok)
+    metrics["quality_gate_status"] = "PASS" if (metrics["auto_exclusion_enabled"] and ranking_ok) else "REVIEW"
     metrics["quality_gate_reasons"] = quality_reasons
     result_df["Safety_Score"] = 1.0 - all_probs
     metrics["safety_signal_count"] = len(signals)
     result_df["Unanimous_Exclude"] = safe_all
     result_df["Gate_Pass"] = gate_pass_all
+    result_df["No_Abstract"] = no_abstract_all
     result_df["Gate_Fail_Reason"] = gate["reasons"]
-    result_df["AI_Recommendation"] = _priority_labels(
-        np.where(gate_pass_all, all_probs, -1.0), threshold, safe_all)
+    result_df["AI_Recommendation"] = np.where(
+        no_abstract_all,
+        MANUAL_REVIEW_TIER,
+        _priority_labels(np.where(gate_pass_all, all_probs, -1.0), threshold, safe_all),
+    )
+    metrics["no_abstract_n"] = int(no_abstract_all.sum())
+    metrics["no_abstract_labeled_n"] = int(no_abstract_lab.sum())
+    metrics["no_abstract_include_n"] = int(((y == 1) & no_abstract_lab).sum())
     result_df["Operational_Action"] = np.where(
         bool(metrics.get("auto_exclusion_enabled", False)) & safe_all,
         "AUTO_EXCLUDE",
@@ -2079,3 +2141,208 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
     for row in nws.iter_rows(min_row=2): row[1].alignment = __import__('openpyxl').styles.Alignment(wrap_text=True, vertical="top")
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Validation 표본 확장 (post-stratified extension)
+# ---------------------------------------------------------------------------
+# Include가 적어 safe-exclude Recall의 신뢰구간이 넓을 때, 정확도를 올리는 올바른 방법은
+# 학습에 쓴 라벨을 validation에 합치는 것이 아니다(독립성이 깨져 추정이 낙관적으로 편향된다).
+# 대신 같은 코퍼스에서 validation 표본을 '추가로' 뽑아야 한다.
+#
+# 단순 무작위 추가는 유병률이 1% 수준이라 비효율적이므로, PICO 층 × AI 확률구간으로
+# 사후층화(post-stratification)한 뒤 Include가 실제로 있는 셀에 표본을 집중한다.
+# AI 확률은 독립된 training 표본으로 적합된 모델의 출력이고 validation 라벨과 무관한
+# 공변량이므로, 이 사후층화는 설계상 유효하다. 각 셀 안에서는 기존 라벨도 추가 표본도
+# 그 셀의 단순무작위표본이므로, 가중치는 셀별 N/n으로 다시 계산하면 불편추정이 유지된다.
+# ---------------------------------------------------------------------------
+
+PROB_BAND_EDGES = (0.30, 0.60)
+
+
+def _prob_band(p: np.ndarray, edges: tuple[float, float] = PROB_BAND_EDGES) -> np.ndarray:
+    lo, hi = edges
+    p = np.asarray(p, dtype=float)
+    return np.where(p >= hi, f"P>={hi:.2f}", np.where(p >= lo, f"P {lo:.2f}-{hi:.2f}", f"P<{lo:.2f}"))
+
+
+def pico_rank_strata(
+    df: pd.DataFrame,
+    criteria_text: str,
+    exclusion_text: str = "",
+    sample_size: int = TRAINING_SAMPLE_SIZE,
+) -> pd.Series:
+    """build_training_sample과 동일한 점수·경계로 코퍼스 전체의 PICO 층을 복원한다."""
+    base = df.copy().reset_index(drop=True)
+    title_col = _find_col(base, ["title", "제목"])
+    abstract_col = _find_col(base, ["abstract", "초록"])
+    titles = base[title_col].fillna("").astype(str)
+    abstracts = base[abstract_col].fillna("").astype(str) if abstract_col else pd.Series([""] * len(base))
+    docs = (titles + " " + abstracts).str.strip().tolist()
+
+    sections = _parse_pico_sections(criteria_text)
+    queries = [q.strip() for q in sections.values() if q and q.strip()] or [criteria_text.strip()]
+    exclusion_items = _split_bullet_items(exclusion_text)
+    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=60000,
+                          sublinear_tf=True, stop_words="english")
+    mat = vec.fit_transform(docs + queries + exclusion_items)
+    doc_mat = mat[:len(docs)]
+    pico_sim = cosine_similarity(doc_mat, mat[len(docs):len(docs) + len(queries)])
+    scores = 0.65 * pico_sim.mean(axis=1) + 0.35 * pico_sim.min(axis=1)
+    if exclusion_items:
+        scores = scores - 0.75 * cosine_similarity(doc_mat, mat[len(docs) + len(queries):]).max(axis=1)
+
+    n_total = len(base)
+    n = min(int(sample_size), n_total)
+    order = np.argsort(-np.asarray(scores, dtype=float), kind="stable")
+    high_n = min(int(round(n * STRATUM_ALLOCATION[0])), n_total)
+    cut_mid = max(high_n, min(n_total, int(np.ceil(n_total * STRATUM_BOUNDS[1]))))
+    out = np.array(["Low PICO relevance"] * n_total, dtype=object)
+    out[order[:high_n]] = "High PICO relevance"
+    out[order[high_n:cut_mid]] = "Mid PICO relevance"
+    return pd.Series(out, index=base.index)
+
+
+def plan_validation_extension(
+    corpus: pd.DataFrame,
+    labeled_validation: pd.DataFrame,
+    probabilities: np.ndarray,
+    criteria_text: str,
+    exclusion_text: str = "",
+    n_add: int = 200,
+) -> pd.DataFrame:
+    """셀(PICO 층 × 확률구간)별 추가 표본 배분 계획과 기대 Include 수를 돌려준다."""
+    strata = pico_rank_strata(corpus, criteria_text, exclusion_text).to_numpy()
+    bands = _prob_band(probabilities)
+    cell_all = pd.Series([f"{s} | {b}" for s, b in zip(strata, bands)])
+
+    lab = labeled_validation.copy()
+    key = _find_col(lab, ["_source_index", "_Source_Index"])
+    lab_idx = lab[key].astype(int).to_numpy() if key is not None else np.array([], dtype=int)
+    y = lab.get("Human_Label_Normalized")
+    if y is None:
+        y = lab["Human_Label"].map(_normalize_label_value)
+    y = pd.to_numeric(y, errors="coerce").fillna(-1).to_numpy()
+
+    rows = []
+    for cell in sorted(cell_all.unique()):
+        in_cell = (cell_all == cell).to_numpy()
+        N = int(in_cell.sum())
+        lab_in = np.isin(lab_idx, np.flatnonzero(in_cell))
+        n_lab = int(lab_in.sum())
+        inc = int((y[lab_in] == 1).sum())
+        # Include 수가 적으므로 Jeffreys 사전(0.5)으로 평활한 유병률을 쓴다.
+        p_hat = (inc + 0.5) / (n_lab + 1.0) if n_lab else 0.5 / 1.0
+        rows.append({"Cell": cell, "N_corpus": N, "n_labeled": n_lab,
+                     "include_labeled": inc, "prevalence_est": p_hat,
+                     "expected_includes_per_label": p_hat})
+    plan = pd.DataFrame(rows)
+    # 추가 라벨은 '기대 Include 수'가 큰 셀에 배분한다 (남은 미라벨 수로 상한).
+    plan["remaining"] = (plan["N_corpus"] - plan["n_labeled"]).clip(lower=0)
+    score = plan["prevalence_est"] * plan["remaining"]
+    plan["allocate"] = 0
+    if score.sum() > 0:
+        raw = (n_add * score / score.sum()).round().astype(int)
+        plan["allocate"] = np.minimum(raw, plan["remaining"])
+    plan["expected_new_includes"] = (plan["allocate"] * plan["prevalence_est"]).round(2)
+    return plan.sort_values("expected_new_includes", ascending=False).reset_index(drop=True)
+
+
+def build_validation_extension(
+    corpus: pd.DataFrame,
+    labeled_validation: pd.DataFrame,
+    probabilities: np.ndarray,
+    criteria_text: str,
+    exclusion_text: str = "",
+    n_add: int = 200,
+    random_state: int = 20260101,
+) -> pd.DataFrame:
+    """추가로 라벨링할 validation 표본을 뽑는다 (셀 내 단순무작위, 기존 라벨과 중복 없음)."""
+    plan = plan_validation_extension(corpus, labeled_validation, probabilities,
+                                     criteria_text, exclusion_text, n_add)
+    strata = pico_rank_strata(corpus, criteria_text, exclusion_text).to_numpy()
+    bands = _prob_band(probabilities)
+    cell_all = np.array([f"{s} | {b}" for s, b in zip(strata, bands)], dtype=object)
+
+    key = _find_col(labeled_validation, ["_source_index", "_Source_Index"])
+    already = set(labeled_validation[key].astype(int).tolist()) if key is not None else set()
+
+    base = corpus.copy().reset_index(drop=True)
+    base["_Source_Index"] = np.arange(len(base), dtype=int)
+    title_col = _find_col(base, ["title", "제목"])
+    rng = np.random.default_rng(random_state)
+
+    picks = []
+    for _, r in plan.iterrows():
+        take = int(r["allocate"])
+        if take <= 0:
+            continue
+        pool = [i for i in np.flatnonzero(cell_all == r["Cell"]) if int(i) not in already]
+        if not pool:
+            continue
+        take = min(take, len(pool))
+        chosen = rng.choice(np.array(pool), size=take, replace=False)
+        for i in chosen:
+            row = base.iloc[int(i)].copy()
+            row["Validation_Cell"] = r["Cell"]
+            row["Validation_Phase"] = "extension"
+            row["Validation_Record_ID"] = _stable_record_id(int(i), str(base[title_col].iloc[int(i)]))
+            picks.append(row)
+
+    out = pd.DataFrame(picks).reset_index(drop=True)
+    if out.empty:
+        raise ValueError("추가로 뽑을 수 있는 미라벨 문헌이 없습니다.")
+    out.insert(0, "Extension_No", np.arange(1, len(out) + 1))
+    out["Human_Label"] = ""
+    return out
+
+
+def merge_validation_extension(
+    corpus: pd.DataFrame,
+    labeled_validation: pd.DataFrame,
+    labeled_extension: pd.DataFrame,
+    probabilities: np.ndarray,
+    criteria_text: str,
+    exclusion_text: str = "",
+) -> tuple[pd.DataFrame, dict]:
+    """기존 validation + 확장 표본을 합치고, 셀별 N/n으로 Sampling_Weight를 다시 계산한다."""
+    strata = pico_rank_strata(corpus, criteria_text, exclusion_text).to_numpy()
+    bands = _prob_band(probabilities)
+    cell_all = np.array([f"{s} | {b}" for s, b in zip(strata, bands)], dtype=object)
+    N_cell = pd.Series(cell_all).value_counts().to_dict()
+
+    frames = []
+    for part, phase in ((labeled_validation, "initial"), (labeled_extension, "extension")):
+        if part is None or len(part) == 0:
+            continue
+        d = part.copy()
+        d["Validation_Phase"] = phase
+        frames.append(d)
+    merged = pd.concat(frames, ignore_index=True)
+
+    key = _find_col(merged, ["_source_index", "_Source_Index"])
+    if key is None:
+        raise ValueError("_Source_Index 열이 없어 표본을 합칠 수 없습니다.")
+    merged = merged.drop_duplicates(subset=[key], keep="first").reset_index(drop=True)
+    idx = merged[key].astype(int).to_numpy()
+    merged["Validation_Cell"] = cell_all[idx]
+
+    n_cell = merged["Validation_Cell"].value_counts().to_dict()
+    merged["Sampling_Stratum_N"] = merged["Validation_Cell"].map(N_cell).astype(int)
+    merged["Sampling_Stratum_n"] = merged["Validation_Cell"].map(n_cell).astype(int)
+    merged["Sampling_Weight"] = (merged["Sampling_Stratum_N"] / merged["Sampling_Stratum_n"]).round(8)
+    merged["Sampling_Probability"] = (1.0 / merged["Sampling_Weight"]).round(8)
+
+    lab = merged.get("Human_Label_Normalized")
+    if lab is None:
+        lab = merged["Human_Label"].map(_normalize_label_value)
+    lab = pd.to_numeric(lab, errors="coerce")
+    stats = {
+        "n_total": int(len(merged)),
+        "n_initial": int((merged["Validation_Phase"] == "initial").sum()),
+        "n_extension": int((merged["Validation_Phase"] == "extension").sum()),
+        "include_n": int((lab == 1).sum()),
+        "cells_used": int(merged["Validation_Cell"].nunique()),
+        "max_weight": float(merged["Sampling_Weight"].max()),
+    }
+    return merged, stats
