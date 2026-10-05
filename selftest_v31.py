@@ -83,11 +83,46 @@ def check_pipeline() -> None:
     known = r.predictions.loc[r.predictions["Human_Label_Normalized"] == 1, "제목"].head(3).tolist()
     tbl, ks = S.known_item_recovery(r.predictions, known)
     assert ks["n_found_in_corpus"] == len(known), "알려진 문헌을 코퍼스에서 못 찾음"
+    # 재현성: 같은 입력이면 두 번 돌려도 완전히 같은 결과여야 한다
+    r2 = S.train_and_predict(df)
+    a = r.predictions.sort_values("_Corpus_Row")["AI_Probability"].to_numpy()
+    b = r2.predictions.sort_values("_Corpus_Row")["AI_Probability"].to_numpy()
+    assert np.array_equal(a, b), "같은 입력에서 결과가 달라짐(비결정적 동작)"
+    assert r.metrics["run_fingerprint"] == r2.metrics["run_fingerprint"]
+    assert "f1" in r.metrics and "precision" in r.metrics
+    lc, lst = S.label_consistency_check(r.predictions)
+    assert "flagged" in lst
+
+    # Include가 부족해 학습이 불가능한 상황에서도 확장 표본을 뽑을 수 있어야 한다(교착 방지)
+    corpus = df[["제목", "초록"]].copy()
+    corpus["_Source_Index"] = np.arange(len(corpus))
+    bp = S.bootstrap_extension_probabilities(corpus, "Outcome: cardiovascular atherosclerosis")
+    assert len(bp) == len(corpus) and float(np.nanmax(bp)) <= 1.0
+
+    # 규칙 기반 단독 모드: 모델 없이도 돌고, 두 번 돌려 결과가 완전히 같아야 한다
+    ro1 = S.rule_only_screen(df, "Outcome: cardiovascular atherosclerosis serum lipid")
+    ro2 = S.rule_only_screen(df, "Outcome: cardiovascular atherosclerosis serum lipid")
+    k1 = ro1.predictions.sort_values("_Corpus_Row")["AI_Recommendation"].tolist()
+    k2 = ro2.predictions.sort_values("_Corpus_Row")["AI_Recommendation"].tolist()
+    assert k1 == k2, "규칙 모드가 비결정적"
+    assert ro1.metrics["gate_fn_on_labels"] == 0
+    assert ro1.metrics["mode"] == "rule_only"
+    # 읽는 순서 밴드: 동점이 많아도 한 밴드로 몰리지 않고, 재현 가능해야 한다
+    rv = ro1.predictions[ro1.predictions["AI_Recommendation"] == "사람 검토"]
+    if len(rv) >= 9:
+        counts = rv["검토_우선도"].value_counts().to_dict()
+        assert set(counts) <= {"상", "중", "하"} and len(counts) >= 2, f"밴드 쏠림: {counts}"
+    assert (ro1.predictions.sort_values("_Corpus_Row")["검토_우선도"].tolist()
+            == ro2.predictions.sort_values("_Corpus_Row")["검토_우선도"].tolist())
+    assert len(S.build_validation_report_excel_bytes(ro1)) > 5000
+    na_ro = ro1.predictions["No_Abstract"].astype(bool)
+    assert not (ro1.predictions.loc[na_ro, "AI_Recommendation"] == "안전 제외 후보").any()
+
     rep = S.build_validation_report_excel_bytes(r)
     assert len(rep) > 5000
     import io as _io, openpyxl as _ox
     wb = _ox.load_workbook(_io.BytesIO(rep))
-    for sheet in ("PRISMA_Flow", "Audit_Design", "Methods_Text", "Interpretation"):
+    for sheet in ("PRISMA_Flow", "Audit_Design", "Methods_Text", "Interpretation", "Label_Consistency"):
         assert sheet in wb.sheetnames, f"{sheet} 시트 누락"
     # 비율이 TRUE로 보이지 않도록 % 문자열인지
     vals = [c.value for row in wb["Validation_Summary"].iter_rows(min_col=2, max_col=2) for c in row]

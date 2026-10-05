@@ -50,6 +50,9 @@ from screening import (
     build_risk_audit_sample,
     summarize_audit,
     known_item_recovery,
+    label_consistency_check,
+    bootstrap_extension_probabilities,
+    rule_only_screen,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -788,6 +791,17 @@ elif nav == "screen":
         if not criteria_text:
             st.warning("Human validation 200편을 선정하려면 PICO/PECO를 먼저 저장해 주세요.")
         else:
+            seed_text = st.text_area(
+                "이미 적격임을 아는 문헌 제목 (선택, 한 줄에 하나)",
+                height=110, key="sample_seed_titles",
+                help="연구계획서 인용문헌, 선행 리뷰의 포함문헌 등. 넣으면 적격 문헌이 표본 상단으로 올라옵니다.",
+            )
+            st.caption(
+                "유병률이 1% 미만인 주제에서는 200편을 무작정 층화 추출해도 Include가 2~3편밖에 안 잡혀 "
+                "교차검증 자체가 불가능합니다. 이미 아는 적격 문헌을 넣으면 그 문헌과 비슷한 문헌이 "
+                "표본 상단에 모여 같은 노동으로 Include를 더 확보합니다. "
+                "적격 기준(PECO)을 바꾸는 것이 아니라 '먼저 읽을 순서'만 바꾸며, 층별 가중치는 그대로 적용됩니다."
+            )
             if st.button("② AI가 Human validation 200편 선정", type="primary", use_container_width=True):
                 try:
                     with st.spinner("PICO/PECO 적합도를 이용해 High/Mid/Low 층화 validation 표본을 만드는 중입니다..."):
@@ -796,6 +810,8 @@ elif nav == "screen":
                             pico_sectioned_text,
                             pico.get("exclusion_criteria", ""),
                             sample_size=TRAINING_SAMPLE_SIZE,
+                            seed_texts=[t.strip() for t in str(
+                                st.session_state.get("sample_seed_titles", "")).splitlines() if t.strip()] or None,
                         )
                     st.session_state["training_sample"] = training_sample
                     save_project_state(active, "training_sample", training_sample)
@@ -862,6 +878,34 @@ elif nav == "screen":
                         if not enough_classes:
                             st.error("O와 X가 각각 최소 4편 이상 필요합니다. 현재 표본만으로는 교차검증 모델을 만들 수 없습니다.")
 
+                        st.caption(
+                            "적격 문헌이 10편 미만이면 지도학습 모델은 만들 수 없거나 만들어도 불안정합니다. "
+                            "그럴 때는 아래 '규칙 기반 선별'을 쓰세요. 확률 모델 없이 규칙만으로 제외하므로 "
+                            "실행마다 결과가 완전히 동일하고, 200편 라벨은 '규칙이 적격 문헌을 떨어뜨리지 "
+                            "않는가'를 확인하는 데 쓰입니다."
+                        )
+                        if st.button(
+                            "④-B 규칙 기반으로 바로 선별 (모델 없음 · 결과 고정)",
+                            use_container_width=True,
+                        ):
+                            try:
+                                with st.spinner("규칙 게이트로 전체 문헌을 선별하는 중입니다..."):
+                                    rres = rule_only_screen(
+                                        merged_df, criteria_text,
+                                        pico.get("exclusion_criteria", ""), gate_rules=None)
+                                st.session_state["screening_result"] = rres
+                                st.session_state.pop("zero_shot_result", None)
+                                save_project_state(active, "screening_result", rres)
+                                log_activity(
+                                    "📏", "규칙 기반 선별 완료",
+                                    f"자동 제외 {rres.metrics['auto_excluded_n']:,}편 / "
+                                    f"사람 검토 {rres.metrics['human_review_n']:,}편 · "
+                                    f"Include 탈락 {rres.metrics['gate_fn_on_labels']}편",
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+
                         if st.button(
                             "④ 200편으로 AI 학습·교차검증·전체 선별",
                             type="primary",
@@ -892,11 +936,50 @@ elif nav == "screen":
                             st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
+                        # Include가 너무 적어 교차검증 자체가 불가능한 경우: 모델이 없으니
+                        # validation 표본을 늘릴 방법도 막히는 교착이 생긴다. 이때는 라벨이
+                        # 필요 없는 PICO 유사도(zero-shot) 점수로 사후층화해 추가 표본을 뽑는다.
+                        if "Include" in str(exc) and "교차검증" in str(exc):
+                            st.info(
+                                "적격 문헌이 너무 적어 모델을 만들 수 없습니다. 이 상태에서는 성능 지표도, "
+                                "자동 제외도 의미가 없습니다. 아래에서 validation 표본을 추가로 뽑아 "
+                                "적격 문헌을 10편 이상 확보한 뒤 다시 학습하세요."
+                            )
+                            bn = st.selectbox("추가로 라벨링할 편수", [200, 300, 400, 600],
+                                              index=1, key="boot_ext_n")
+                            if st.button("추가 validation 표본 뽑기 (PICO 유사도 기준)",
+                                         use_container_width=True, key="btn_boot_ext"):
+                                try:
+                                    bp = bootstrap_extension_probabilities(
+                                        df, criteria_text, pico.get("exclusion_criteria", ""))
+                                    bext = build_validation_extension(
+                                        df, label_df, bp, criteria_text,
+                                        pico.get("exclusion_criteria", ""), n_add=int(bn))
+                                    st.session_state["ext_sample_df"] = bext
+                                    save_project_state(active, "ext_sample_df", bext)
+                                    st.success(f"{len(bext)}편을 뽑았습니다. 아래에서 받아 O/X를 입력하세요.")
+                                except Exception as exc2:
+                                    st.error(str(exc2))
+                            bext = st.session_state.get("ext_sample_df")
+                            if isinstance(bext, pd.DataFrame) and not bext.empty:
+                                st.download_button(
+                                    f"추가 validation {len(bext)}편 다운로드",
+                                    dataframe_to_excel_bytes(bext),
+                                    "AI_Human_Validation_Extension.xlsx",
+                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    type="primary", use_container_width=True,
+                                )
+                                st.caption(
+                                    "판정을 끝낸 뒤, 기존 200편 라벨 파일과 이 파일을 합쳐 "
+                                    "③ 라벨 업로드 단계에 올리면 됩니다."
+                                )
 
     result = st.session_state.get("screening_result")
     if result:
         total_n = len(result.predictions)
         gm = result.metrics
+        # 규칙 기반 단독 모드: 모델이 없으므로 ROC/F1/혼동행렬 같은 모델 지표는 존재하지 않는다.
+        is_rule_only = str(gm.get("mode", "")) == "rule_only"
         quality_status = str(gm.get("quality_gate_status", "REVIEW"))
         auto_enabled = bool(gm.get("auto_exclusion_enabled", False))
         safe_candidate_n = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
@@ -1127,6 +1210,19 @@ elif nav == "screen":
                                 "자동 제외를 적용하면 안 됩니다."
                             )
 
+        if is_rule_only:
+            st.info(
+                "규칙 기반 단독 모드입니다. 확률 모델을 쓰지 않으므로 ROC-AUC·F1·혼동행렬은 "
+                "존재하지 않습니다. 제외는 전부 규칙으로 이루어지고 결과는 실행마다 완전히 동일합니다. "
+                f"규칙 적용: {', '.join(gm.get('gate_kept_rules', []))} · "
+                f"human Include 탈락 {int(gm.get('gate_fn_on_labels', 0))}편 · "
+                f"입력 지문 {str(gm.get('run_fingerprint',''))[:8]}"
+            )
+            st.caption(
+                "읽는 순서는 PICO 유사도로만 정합니다. 순위의 정밀도는 지도학습 모드보다 낮으므로 "
+                "'사람 검토'로 분류된 문헌은 순서와 무관하게 전부 읽으셔야 합니다."
+            )
+
         st.download_button(
             "Human validation 품질관리 보고서 다운로드",
             build_validation_report_excel_bytes(result),
@@ -1148,7 +1244,8 @@ elif nav == "screen":
                 "게이트 통과 라벨이 부족한 경우입니다. 위 품질관리 보고서에서 사유를 확인하세요."
             )
 
-        with st.expander("검증 성능 자세히 보기", expanded=False):
+        if not is_rule_only:
+          with st.expander("검증 성능 자세히 보기", expanded=False):
             m = result.metrics
             conf = result.confusion
             st.markdown("**A. 실제 자동 제외 정책 안전성**")
@@ -1162,6 +1259,25 @@ elif nav == "screen":
                 "자동 제외 영역 때문에 human Include가 사라지는지를 직접 계산한 핵심 안전성 지표입니다."
             )
 
+            try:
+                lc_tbl, lc_stats = label_consistency_check(result.predictions)
+                if len(lc_tbl):
+                    flagged = int(lc_stats.get("flagged", 0))
+                    st.markdown("**A-2. 라벨 일관성**")
+                    l1, l2 = st.columns(2)
+                    l1.metric("Include 간 유사도(중앙값)", f"{lc_stats.get('median_inc_similarity', 0.0):.3f}")
+                    l2.metric("재확인 권고", f"{flagged}편")
+                    if lc_stats.get("median_inc_similarity", 1.0) < 0.10:
+                        st.error(
+                            "Include끼리 어휘가 거의 겹치지 않습니다. 같은 적격 기준으로 판정했다면 나타나기 어려운 "
+                            "패턴이며, 서로 성격이 다른 문헌이 Include로 섞였을 가능성이 큽니다. "
+                            "아래 표의 '재확인_권고' 문헌부터 기준을 다시 적용해 보세요. "
+                            "모델 성능(ROC-AUC, F1)은 이 문제가 해결되기 전에는 의미가 없습니다."
+                        )
+                    st.dataframe(lc_tbl, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
             st.markdown("**B. AI 우선순위 모델 성능**")
             b1, b2, b3, b4 = st.columns(4)
             b1.metric("OOF Recall (가중)", f"{m.get('policy_priority_recall_weighted', 0.0)*100:.1f}%")
@@ -1171,8 +1287,19 @@ elif nav == "screen":
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("ROC-AUC", f"{m.get('roc_auc', 0.0):.3f}")
             c2.metric("Average Precision", f"{m.get('average_precision', 0.0):.3f}")
-            c3.metric("WSS@95 (가중)", f"{m.get('wss_weighted', 0.0)*100:.1f}%")
-            c4.metric("Threshold", f"{m.get('threshold', result.threshold):.3f}")
+            c3.metric("F1 (OOF)", f"{m.get('f1', 0.0):.3f}")
+            c4.metric("Precision (OOF)", f"{m.get('precision', 0.0)*100:.1f}%")
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("WSS@95 (가중)", f"{m.get('wss_weighted', 0.0)*100:.1f}%")
+            d2.metric("Threshold", f"{m.get('threshold', result.threshold):.3f}")
+            d3.metric("Random seed", f"{int(m.get('random_seed', 42))}")
+            d4.metric("입력 지문", f"{str(m.get('run_fingerprint',''))[:8]}")
+            st.caption(
+                "F1은 희귀 사건 선별에서 단독 판단 기준이 되기 어렵습니다(Include 비율이 낮으면 "
+                "Recall을 올릴수록 Precision이 급격히 떨어져 F1이 낮게 나옵니다). "
+                "Recall과 WSS를 주 지표로 보고 F1·Precision은 함께 보고하는 보조 지표로 쓰세요. "
+                "입력 지문은 코퍼스·라벨·버전·seed의 해시입니다. 지문이 같으면 결과도 항상 같습니다."
+            )
             st.caption(
                 "OOF(out-of-fold) 예측은 각 validation 문헌을 그 문헌을 학습에 사용하지 않은 fold 모델로 예측합니다. "
                 "Threshold는 sampling-weighted Recall ≥95%를 만족하는 후보 중 WSS가 최대가 되도록 고정됩니다."
@@ -1238,15 +1365,27 @@ elif nav == "screen":
                 "임계값·안전 컷오프 추정에서도 제외한 뒤 별도로 분리했습니다. 이 묶음은 사람이 직접 확인하세요."
             )
 
+        _BAND_CSS = {"상": "#D3E8D3", "중": "#FBF0C4", "하": "#EEF0F3", "초록없음": "#FFF2CC"}
+
         def _shade_priority(row):
             status = row.get("AI_Recommendation", "")
             if status == "안전 제외 후보":
                 return ["background-color: #B8BDC6; color: #111827"] * len(row)
+            band = str(row.get("검토_우선도", "") or "")
+            if band in _BAND_CSS:
+                return [f"background-color: {_BAND_CSS[band]}; color: #111827"] * len(row)
             if status == "경계 문헌":
                 return ["background-color: #EEF0F3; color: #111827"] * len(row)
             return ["background-color: #FFFFFF; color: #111827"] * len(row)
 
         st.markdown('<div class="section-title">AI 순위 결과</div>', unsafe_allow_html=True)
+        if "검토_우선도" in result.predictions.columns:
+            st.caption(
+                "색은 읽는 순서를 돕는 표시일 뿐이며 제외 결정과 무관합니다. "
+                "초록 = PICO와 가장 가까움, 노랑 = 중간, 회색 = 먼 쪽, 연노랑 = 초록 없음. "
+                "**'사람 검토'로 분류된 문헌은 색과 상관없이 전부 읽으셔야 합니다** — "
+                "실제로 적격 문헌이 '하' 밴드에서도 나옵니다."
+            )
         st.dataframe(
             result.predictions.head(1000).style.apply(_shade_priority, axis=1),
             use_container_width=True,

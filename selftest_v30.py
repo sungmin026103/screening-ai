@@ -21,9 +21,12 @@ def main():
     sample = screening.build_training_sample(df, criteria, "review\nin vitro", 200, 42)
     assert len(sample) == 200
     counts = sample["Training_Stratum"].value_counts().to_dict()
-    assert counts.get("High PICO relevance") == 100
-    assert counts.get("Mid PICO relevance") == 70
-    assert counts.get("Low PICO relevance") == 30
+    # V33에서 상단 농축을 위해 배분을 70/20/10으로 바꿨다. 상수와 일치하는지로 검사한다.
+    exp = [int(round(200 * a)) for a in screening.STRATUM_ALLOCATION]
+    exp[-1] = 200 - sum(exp[:-1])
+    assert counts.get("High PICO relevance") == exp[0]
+    assert counts.get("Mid PICO relevance") == exp[1]
+    assert counts.get("Low PICO relevance") == exp[2]
     assert sample["Validation_Record_ID"].nunique() == 200
     assert sample["Validation_Set_ID"].nunique() == 1
     assert abs(float(sample["Sampling_Weight"].sum()) - n) < 1e-3

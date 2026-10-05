@@ -59,10 +59,18 @@ TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
 VALIDATION_RECALL_TARGET = 0.95
 VALIDATION_CONFIDENCE = 0.95
-ALGORITHM_VERSION = "V32.0"
+ALGORITHM_VERSION = "V34.1"
+# 재현성: 같은 입력(코퍼스 + 라벨)이면 항상 같은 결과가 나와야 한다.
+# 난수를 쓰는 모든 지점(폴드 분할, 캘리브레이션, SVM 좌표하강, 표본추출)에 이 seed를 건다.
+RANDOM_SEED = 42
 # 층화 추출: PICO 점수 순위 경계(상위 10%, 상위 40%)와 층별 표본 배분(합 1.0)
 STRATUM_BOUNDS = (None, 0.40)  # High는 상위 n_high편 전수, Mid는 그 아래~상위 40%
-STRATUM_ALLOCATION = (0.50, 0.35, 0.15)
+# 적격 문헌은 PICO 순위 상단에 몰린다. 200편을 50/35/15로 나누면 상위 전수가 100편에 그쳐
+# 유병률 1% 미만인 주제에서는 Include가 2~3편밖에 잡히지 않고, 그러면 교차검증 자체가 불가능하다.
+# 상단 비중을 키워 '같은 라벨 노동으로 Include를 더 확보'하도록 기본값을 바꾼다.
+# 하단 층 표본이 줄면 그 층의 가중치가 커져 분산이 늘지만, 애초에 Include가 없으면
+# 분산을 논할 지표 자체가 만들어지지 않는다. 필요하면 plan_validation_extension으로 보강한다.
+STRATUM_ALLOCATION = (0.70, 0.20, 0.10)
 
 # 엑셀 다운로드 시 구간 순서와 배경색. False Negative는 실제 라벨이 Include인데
 # 컷오프 밖으로 밀려난, 눈에 띄어야 하는 문헌이라 원래 버킷에서 따로 떼어내
@@ -200,6 +208,7 @@ def build_training_sample(
     exclusion_text: str = "",
     sample_size: int = TRAINING_SAMPLE_SIZE,
     random_state: int = 42,
+    seed_texts: list[str] | None = None,
 ) -> pd.DataFrame:
     """전체 코퍼스에서 1회성 human-validation 표본을 만든다.
 
@@ -245,6 +254,22 @@ def build_training_sample(
     else:
         excl_score = np.zeros(len(docs), dtype=float)
     scores = np.asarray(pico_score - 0.75 * excl_score, dtype=float)
+
+    # 이미 적격임을 아는 문헌(seed)이 있으면 그 문헌과의 유사도를 순위에 섞는다.
+    # PICO 문장은 연구자가 쓴 '기준'이고 seed는 실제 적격 '문헌'이라, 적격 문헌을 끌어올리는
+    # 힘이 훨씬 세다. 유병률이 1% 미만인 주제에서 Include를 먼저 확보하는 가장 싼 방법이다.
+    # seed는 PECO 기준을 바꾸지 않는다 — 어떤 문헌을 '먼저 읽을지'만 바꾸며,
+    # 층별 가중치(N/n)가 그대로 적용되므로 추정의 불편성은 유지된다.
+    if seed_texts:
+        seeds = [str(t).strip() for t in seed_texts if str(t).strip()]
+        if seeds:
+            seed_mat = vec.transform(seeds)
+            seed_sim = cosine_similarity(doc_mat, seed_mat).max(axis=1)
+            def _z(v):
+                v = np.asarray(v, dtype=float)
+                sd = v.std()
+                return (v - v.mean()) / sd if sd > 0 else np.zeros_like(v)
+            scores = 0.5 * _z(scores) + 0.5 * _z(seed_sim)
 
     n_total = len(base)
     n = min(int(sample_size), n_total)
@@ -1204,6 +1229,8 @@ def zero_shot_screen(
     recommendation[borderline_mask] = "경계 문헌"
     data["AI_Recommendation"] = pd.Categorical(recommendation, categories=PRIORITY_ORDER, ordered=True)
     data["AI_Exclusion_Signal"] = [_obvious_exclusion_reason(t, a) for t, a in zip(data["Title"], data["Abstract"])]
+    # 정렬 전에 입력 행 순서를 남긴다(확장 표본 설계에서 코퍼스와 정렬할 때 필요).
+    data["_Corpus_Row"] = np.arange(len(data), dtype=int)
 
     data = data.sort_values(
         ["AI_Recommendation", "Combined_Score"], ascending=[True, False]
@@ -1272,8 +1299,9 @@ def _build_pipeline(
     calib_cv: int = 3,
 ) -> Pipeline:
     features = _build_feature_union(criteria_text, embedding_lookup, sentence_pico_lookup)
-    base = LinearSVC(class_weight="balanced")
-    model = CalibratedClassifierCV(base, method="sigmoid", cv=calib_cv)
+    base = LinearSVC(class_weight="balanced", random_state=RANDOM_SEED)
+    model = CalibratedClassifierCV(base, method="sigmoid",
+                                   cv=StratifiedKFold(n_splits=calib_cv, shuffle=True, random_state=RANDOM_SEED))
     return Pipeline([("features", features), ("model", model)])
 
 # ---------------------------------------------------------------------------
@@ -1286,18 +1314,18 @@ def _build_pipeline(
 
 def _build_word_only_pipeline() -> Pipeline:
     word = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=50000, sublinear_tf=True)
-    return Pipeline([("word", word), ("model", LogisticRegression(max_iter=2000, class_weight="balanced"))])
+    return Pipeline([("word", word), ("model", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_SEED))])
 
 
 def _build_char_only_pipeline() -> Pipeline:
     char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_features=50000, sublinear_tf=True)
-    return Pipeline([("char", char), ("model", LogisticRegression(max_iter=2000, class_weight="balanced"))])
+    return Pipeline([("char", char), ("model", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_SEED))])
 
 
 def _build_pico_only_pipeline(criteria_text: str) -> Pipeline:
     return Pipeline([
         ("pico", CriteriaSimilarity(criteria_text=criteria_text)),
-        ("model", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ("model", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_SEED)),
     ])
 
 
@@ -1306,20 +1334,20 @@ def _build_embedding_only_pipeline(embedding_lookup: dict) -> Pipeline:
     '의미가 비슷한가'라는 근거를 안전 제외 후보 판정에 추가한다."""
     return Pipeline([
         ("embedding", EmbeddingLookup(lookup=embedding_lookup)),
-        ("model", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ("model", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_SEED)),
     ])
 
 
 def _build_sentence_pico_only_pipeline(sentence_pico_lookup: dict) -> Pipeline:
     return Pipeline([
         ("sentence_pico", NumericLookup(lookup=sentence_pico_lookup, dim=4)),
-        ("model", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ("model", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_SEED)),
     ])
 
 
 def _build_logreg_full_pipeline(criteria_text: str = "", embedding_lookup: dict | None = None, sentence_pico_lookup: dict | None = None) -> Pipeline:
     features = _build_feature_union(criteria_text, embedding_lookup, sentence_pico_lookup)
-    return Pipeline([("features", features), ("model", LogisticRegression(max_iter=2000, class_weight="balanced"))])
+    return Pipeline([("features", features), ("model", LogisticRegression(max_iter=2000, class_weight="balanced", random_state=RANDOM_SEED))])
 
 
 def _compute_safety_signals(
@@ -1530,7 +1558,7 @@ def _stack_signals(signals: dict, y: np.ndarray, cv: StratifiedKFold, labeled_po
     names = sorted(signals)
     x_cv = np.column_stack([_logit(signals[n]["cv"]) for n in names])
     x_all = np.column_stack([_logit(signals[n]["all"]) for n in names])
-    meta = LogisticRegression(C=1.0, class_weight="balanced", max_iter=2000)
+    meta = LogisticRegression(C=1.0, class_weight="balanced", max_iter=2000, random_state=RANDOM_SEED)
     oof = cross_val_predict(meta, x_cv, y, cv=cv, method="predict_proba")[:, 1]
     meta.fit(x_cv, y)
     all_p = meta.predict_proba(x_all)[:, 1]
@@ -1702,7 +1730,7 @@ def train_and_predict(
     calib_cv = min(3, min_class - int(np.ceil(min_class / folds)))
     if calib_cv < 2:
         raise ValueError(f"Include 라벨이 {min_class}편뿐이라 교차검증을 할 수 없습니다. Include가 최소 4편 이상 필요합니다.")
-    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=RANDOM_SEED)
     cv_fold_id = np.zeros(len(y), dtype=int)
     for fold_no, (_tr, va) in enumerate(cv.split(texts, y), start=1):
         cv_fold_id[va] = fold_no
@@ -1921,6 +1949,15 @@ def train_and_predict(
         )
     if not gate_ok:
         quality_reasons.append(f"규칙 게이트가 human Include {gate_fn}편을 제외함")
+    # AUC가 우연 수준이면 모델 문제가 아니라 Include 라벨이 서로 다른 성격의 문헌을 섞고 있을
+    # 가능성이 크다. 같은 PECO로 라벨했다면 포함문헌끼리 어휘가 겹쳐야 한다.
+    auc_now = float(metrics.get("roc_auc", 0.0) or 0.0)
+    if n_include > 0 and auc_now < 0.60:
+        quality_reasons.append(
+            f"ROC-AUC {auc_now:.2f} — 우연 수준. 모델 성능 문제이기 이전에 Include 라벨이 "
+            "서로 성격이 다른 문헌을 섞고 있는지(적격 기준 해석 일관성) 먼저 확인할 것"
+        )
+        metrics["label_consistency_warning"] = True
 
     # 자동 제외의 안전성은 safe-exclude Recall과 게이트 FN으로만 결정된다.
     # priority/경계 분할(ranking_ok)은 '우선 검토'와 '경계 문헌' 사이의 순서 문제이며,
@@ -1934,6 +1971,8 @@ def train_and_predict(
     # 예측 테이블은 우선순위대로 정렬되므로, 입력 코퍼스의 행 순서를 복원할 키를 남긴다.
     # (validation 확장에서 '코퍼스 행 ↔ 확률'을 정렬하는 데 필요하다.)
     result_df["_Corpus_Row"] = np.arange(len(result_df), dtype=int)
+    metrics["run_fingerprint"] = run_fingerprint(data)
+    metrics["random_seed"] = int(RANDOM_SEED)
     result_df["Safety_Score"] = 1.0 - all_probs
     metrics["safety_signal_count"] = len(signals)
     result_df["Unanimous_Exclude"] = safe_all
@@ -2011,8 +2050,12 @@ def build_grouped_excel_bytes(predictions: pd.DataFrame) -> bytes:
         cell.fill = header_fill
         cell.font = header_font
 
+    bands = (export_df["검토_우선도"].astype(str).tolist()
+             if "검토_우선도" in export_df.columns else [""] * len(export_df))
     for i, grp in enumerate(group_labels, start=2):  # 1행은 헤더
-        color = EXPORT_GROUP_COLORS.get(grp, "FFFFFF")
+        band = bands[i - 2]
+        # 사람이 읽을 문헌은 그룹색 대신 '읽는 순서' 밴드색으로 칠한다(제외 결정과 무관).
+        color = REVIEW_BAND_COLORS.get(band, EXPORT_GROUP_COLORS.get(grp, "FFFFFF"))
         fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
         for cell in ws[i]:
             cell.fill = fill
@@ -2131,12 +2174,27 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ("Fold-held-out safe-excluded n", int(m.get("policy_safe_excluded_n", 0))),
         ("Fold-held-out final WSS (sampling-weighted)", float(m.get("policy_safe_wss_weighted", 0.0))),
         ("Fold-held-out final human-review burden (sampling-weighted)", float(m.get("policy_safe_burden_weighted", 1.0))),
+        ("F1 (OOF, unweighted)", f"{float(m.get('f1', 0.0)):.3f}"),
+        ("Precision (OOF, unweighted)", _pct(m.get("precision", 0.0))),
         ("ROC-AUC", float(m.get("roc_auc", 0.0))),
         ("Average precision", float(m.get("average_precision", 0.0))),
+        ("Run fingerprint (input hash)", str(m.get("run_fingerprint", ""))),
+        ("Random seed", int(m.get("random_seed", RANDOM_SEED))),
         ("Quality-gate reasons", "; ".join(map(str, m.get("quality_gate_reasons", []))) or "None"),
     ]
     for r in rows:
-        ws.append(list(r))
+        # 값은 전부 문자열로 적는다. 숫자 0이 엑셀에서 FALSE로 보이거나 1.0이 TRUE로 보이는
+        # 혼동을 없애기 위해서다(심사자가 보는 표라 모호하면 안 된다).
+        v = r[1]
+        if isinstance(v, bool):          # bool은 int의 하위형이라 먼저 걸러야 한다
+            txt = "Yes" if v else "No"
+        elif isinstance(v, str):
+            txt = v
+        elif isinstance(v, (int, np.integer)):
+            txt = f"{int(v):,}"
+        else:
+            txt = str(v)
+        ws.append([str(r[0]), txt])
     ws.column_dimensions["A"].width = 46
     ws.column_dimensions["B"].width = 80
     ws.freeze_panes = "A2"
@@ -2210,6 +2268,22 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         for j, wdt in enumerate([46, 14, 12, 14, 18, 18], start=1):
             aws.column_dimensions[get_column_letter(j)].width = wdt
         result.metrics["audit_max_missed_current"] = float(strata["최대_누락_추정"].sum())
+    except Exception:
+        pass
+
+    try:
+        lc, lstats = label_consistency_check(result.predictions)
+        if len(lc):
+            lws = wb.create_sheet("Label_Consistency")
+            lws.append(["Include 라벨끼리의 어휘 유사도 점검 — '재확인_권고'가 True면 적격 기준을 다시 적용해 볼 것"])
+            lws["A1"].font = Font(bold=True)
+            lws.append([])
+            for row in dataframe_to_rows(lc, index=False, header=True): lws.append(row)
+            hdr_row = lws.max_row - len(lc)
+            for c in lws[hdr_row]: c.fill = header_fill; c.font = header_font
+            lws.column_dimensions["A"].width = 80
+            for j in range(2, 6): lws.column_dimensions[get_column_letter(j)].width = 24
+            result.metrics["label_flagged_n"] = int(lstats.get("flagged", 0))
     except Exception:
         pass
 
@@ -2510,7 +2584,8 @@ def audit_risk_strata(
     reason = reason.where(reason.astype(str).str.len() > 0, "확률 기준 제외")
     pool["_audit_cell"] = [f"{r} | 노출어 {'있음' if e else '없음'}" for r, e in zip(reason, has_exp)]
 
-    w = pd.to_numeric(pool.get("Sampling_Weight", pd.Series([1.0] * len(pool))), errors="coerce").fillna(1.0)
+    # 셀 크기는 '실제 문헌 수'다. 표본가중치는 라벨 표본을 코퍼스로 환산할 때만 쓰는 값이라,
+    # 이미 코퍼스 전체 행을 들고 있는 예측 테이블에 다시 곱하면 셀 합이 코퍼스를 초과한다.
     lab = pd.to_numeric(pool.get("Human_Label_Normalized", pd.Series([np.nan] * len(pool))), errors="coerce")
 
     extra_n: dict[str, int] = {}
@@ -2533,7 +2608,7 @@ def audit_risk_strata(
     rows = []
     for cell, grp in pool.groupby("_audit_cell"):
         idx = grp.index
-        N = float(w.loc[idx].sum())
+        N = float(len(idx))
         n_lab = int(lab.loc[idx].isin([0, 1]).sum()) + extra_n.get(str(cell), 0)
         k = int((lab.loc[idx] == 1).sum()) + extra_k.get(str(cell), 0)
         ub = _cp_upper(n_lab, k)
@@ -2698,3 +2773,260 @@ def known_item_recovery(
         "passed": bool(len(out) > 0 and len(auto_excluded) == 0),
     }
     return out, stats
+
+
+# ---------------------------------------------------------------------------
+# 라벨 일관성 점검
+# ---------------------------------------------------------------------------
+# 같은 PECO로 판정했다면 Include끼리는 어휘가 겹쳐야 한다. 한 편만 성격이 전혀 다르면
+# 기준 해석이 흔들렸다는 신호이고, 그 한 편이 임계값과 자동 제외 정책 전체를 좌우한다.
+# (실제로 간문맥 혈역학 논문 몇 편이 Include로 들어오자 ROC-AUC가 0.85에서 0.53으로 떨어졌다.)
+# ---------------------------------------------------------------------------
+
+def label_consistency_check(predictions: pd.DataFrame, flag_quantile: float = 0.34) -> tuple[pd.DataFrame, dict]:
+    """Include 라벨끼리의 어휘 유사도를 보고, 성격이 동떨어진 Include를 표시한다.
+
+    반환 표의 '재확인_권고'가 True인 문헌은 적격 기준을 다시 적용해 볼 대상이다.
+    자동으로 라벨을 바꾸지는 않는다 — 판단은 연구자 몫이다.
+    """
+    lab = pd.to_numeric(predictions.get("Human_Label_Normalized", pd.Series([np.nan] * len(predictions))),
+                        errors="coerce")
+    inc = predictions[lab == 1].copy()
+    exc = predictions[lab == 0].copy()
+    if len(inc) < 3:
+        return pd.DataFrame(), {"n_include": int(len(inc)), "flagged": 0, "note": "Include가 3편 미만이라 점검 불가"}
+
+    def _txt(df):
+        t = df.get("Title", df.get("제목", pd.Series([""] * len(df)))).fillna("").astype(str)
+        a = df.get("Abstract", df.get("초록", pd.Series([""] * len(df)))).fillna("").astype(str)
+        return (t + " " + a).str.strip().tolist()
+
+    inc_txt, exc_txt = _txt(inc), _txt(exc)
+    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True, stop_words="english")
+    mat = vec.fit_transform(inc_txt + exc_txt)
+    M_inc = mat[:len(inc_txt)]
+    M_exc = mat[len(inc_txt):]
+
+    sim_inc = cosine_similarity(M_inc, M_inc)
+    np.fill_diagonal(sim_inc, 0.0)
+    best_inc = sim_inc.max(axis=1)
+    best_exc = cosine_similarity(M_inc, M_exc).max(axis=1) if M_exc.shape[0] else np.zeros(len(inc_txt))
+
+    cut = float(np.quantile(best_inc, flag_quantile))
+    out = pd.DataFrame({
+        "제목": inc.get("Title", inc.get("제목")).to_numpy(),
+        "다른_Include와_최대유사도": np.round(best_inc, 3),
+        "Exclude와_최대유사도": np.round(best_exc, 3),
+        "AI_확률": np.round(pd.to_numeric(inc.get("AI_Probability", pd.Series([np.nan] * len(inc))),
+                                        errors="coerce").to_numpy(), 3),
+        "재확인_권고": (best_inc <= cut) | (best_exc > best_inc),
+    }).sort_values("다른_Include와_최대유사도").reset_index(drop=True)
+
+    stats = {
+        "n_include": int(len(inc)),
+        "flagged": int(out["재확인_권고"].sum()),
+        "median_inc_similarity": float(np.median(best_inc)),
+    }
+    return out, stats
+
+
+def run_fingerprint(df: pd.DataFrame, extra: str = "") -> str:
+    """같은 입력이면 같은 결과임을 증명할 수 있도록, 입력의 해시를 남긴다."""
+    title_col = _find_col(df, ["title", "제목"]) or ""
+    abs_col = _find_col(df, ["abstract", "초록"]) or ""
+    lab_col = _find_col(df, ["human_label", "human_label_normalized", "label"]) or ""
+    parts = []
+    for col in (title_col, abs_col, lab_col):
+        if col and col in df.columns:
+            parts.append("\u0001".join(df[col].fillna("").astype(str).tolist()))
+    payload = ("\u0002".join(parts) + f"|{ALGORITHM_VERSION}|seed={RANDOM_SEED}|{extra}").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16].upper()
+
+
+def bootstrap_extension_probabilities(
+    corpus: pd.DataFrame,
+    criteria_text: str,
+    exclusion_text: str = "",
+) -> np.ndarray:
+    """학습된 모델이 없을 때(Include가 너무 적어 교차검증 자체가 불가능할 때) 쓰는 확률.
+
+    적격 문헌이 2~3편뿐이면 모델을 만들 수 없고, 그러면 validation 표본을 늘릴 방법도
+    없어지는 교착이 생긴다. 이때는 라벨이 필요 없는 PICO 유사도(zero-shot) 점수로
+    확률구간을 나눠 추가 표본을 뽑는다. 사후층화에 쓰는 공변량은 라벨과 무관하기만 하면
+    되므로, 모델 확률 대신 zero-shot 점수를 써도 설계의 불편성은 유지된다.
+    """
+    zs = zero_shot_screen(corpus, criteria_text=criteria_text, exclusion_text=exclusion_text)
+    pred = zs.predictions
+    col = "AI_Probability" if "AI_Probability" in pred.columns else "Combined_Score"
+    score = pd.to_numeric(pred[col], errors="coerce").fillna(0.0).to_numpy()
+    # Combined_Score는 0~1 척도가 아니므로 min-max로 맞춘다(확률구간 분할에만 쓰인다).
+    lo, hi = float(np.nanmin(score)), float(np.nanmax(score))
+    score = (score - lo) / (hi - lo) if hi > lo else np.zeros_like(score)
+    out = np.zeros(len(corpus), dtype=float)
+    out[pred["_Corpus_Row"].to_numpy()] = score
+    return out
+
+
+def estimate_include_yield(labeled: pd.DataFrame) -> pd.DataFrame:
+    """라벨된 validation 표본에서 층별 Include 수확량과 코퍼스 투영치를 계산한다.
+
+    '200편을 다 읽었는데 Include가 2편'인 상황을 라벨링 직후 바로 알 수 있게 한다.
+    추가로 몇 편을 어디서 읽어야 하는지는 plan_validation_extension이 계산한다.
+    """
+    d = labeled.copy()
+    lab = d.get("Human_Label_Normalized")
+    if lab is None:
+        lab = d["Human_Label"].map(_normalize_label_value)
+    lab = pd.to_numeric(lab, errors="coerce")
+    strat = d.get("Training_Stratum", pd.Series(["(층 정보 없음)"] * len(d)))
+    w = pd.to_numeric(d.get("Sampling_Weight", pd.Series([1.0] * len(d))), errors="coerce").fillna(1.0)
+
+    rows = []
+    for st_name, grp in d.assign(_l=lab, _w=w, _s=strat).groupby("_s"):
+        n = int(grp["_l"].isin([0, 1]).sum())
+        k = int((grp["_l"] == 1).sum())
+        rows.append({
+            "층": st_name,
+            "라벨_편수": n,
+            "Include": k,
+            "층내_유병률": (k / n) if n else 0.0,
+            "코퍼스_투영_Include": float(grp.loc[grp["_l"] == 1, "_w"].sum()),
+        })
+    out = pd.DataFrame(rows).sort_values("Include", ascending=False).reset_index(drop=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 규칙 기반 단독 모드 (rule-only screening)
+# ---------------------------------------------------------------------------
+# 적격 문헌이 몇 편 없으면 지도학습 모델은 만들 수 없다. 그런데 실제로 자동 제외를 만들어낸
+# 것은 모델이 아니라 규칙 게이트였다(확률로 제외된 문헌은 0편이었다). 그렇다면 모델 없이
+# 규칙만으로 선별하고, 라벨 200편은 '학습 데이터'가 아니라 '규칙의 안전성 점검'으로 쓰는 편이
+# 정직하고 안정적이다.
+#
+# 이 모드의 성질:
+#   - 완전 결정론. 폴드 분할도, 확률 추정도 없으므로 실행 간 편차가 원리적으로 0이다.
+#   - Include 수에 흔들리지 않는다. 라벨은 "규칙이 적격 문헌을 떨어뜨리지 않는가"만 확인한다.
+#   - 제외 근거가 전부 문장으로 설명된다(어떤 용어군이 없어서 빠졌는지).
+#   - 대신 '우선 검토' 순위의 정밀도는 포기한다. 읽는 순서는 PICO 유사도로만 정한다.
+# ---------------------------------------------------------------------------
+
+RULE_ONLY_MIN_LABELED_PASS = 20
+
+# 사람 검토 대상 안에서의 '읽는 순서' 표시. 제외 결정과 무관한 참고용 색 구분이다.
+# 임계값을 만들지 않으므로 밴드 경계가 바뀌어도 무엇을 읽을지는 달라지지 않는다.
+REVIEW_BAND_ORDER = ["상", "중", "하"]
+REVIEW_BAND_COLORS = {"상": "D3E8D3", "중": "FBF0C4", "하": "EEF0F3"}
+REVIEW_BAND_CUTS = (0.34, 0.67)   # 사람 검토 집합 내부의 분위수
+
+
+def rule_only_screen(
+    df: pd.DataFrame,
+    criteria_text: str,
+    exclusion_text: str = "",
+    gate_rules: list[tuple[str, str]] | None = None,
+) -> ScreeningResult:
+    """모델 없이 규칙 게이트만으로 선별하고, 라벨은 규칙 점검에만 쓴다."""
+    data, _ = prepare_screening_data(df)
+    texts = (data["Title"].fillna("") + " " + data["Abstract"].fillna("")).to_numpy()
+    # prepare_screening_data는 정규화된 라벨을 Human_Label(0/1/NaN)로 돌려준다.
+    y_all = pd.to_numeric(data.get("Human_Label", pd.Series([np.nan] * len(data), index=data.index)),
+                          errors="coerce")
+    data["Human_Label_Normalized"] = y_all
+    # 표본가중치 등 원본의 부가 열을 그대로 가져온다(코퍼스 투영·보고서에 필요).
+    src = df.reset_index(drop=True)
+    for col in ("Sampling_Weight", "Training_Stratum", "Validation_Record_ID", "_Source_Index"):
+        if col in src.columns and col not in data.columns:
+            data[col] = src[col].to_numpy()
+    labeled_pos = np.flatnonzero(y_all.isin([0, 1]).to_numpy())
+    y = y_all.iloc[labeled_pos].astype(int).to_numpy() if len(labeled_pos) else np.array([], dtype=int)
+    weights = (pd.to_numeric(data["Sampling_Weight"], errors="coerce").fillna(1.0).to_numpy()[labeled_pos]
+               if "Sampling_Weight" in data.columns and len(labeled_pos) else None)
+
+
+    no_abs = _missing_abstract_mask(data["Abstract"].to_numpy())
+    gate = build_gate(texts, labeled_pos, y, weights, gate_rules, exempt=no_abs)
+
+    # 지도학습 모드와 달리 Include 수 하한을 두지 않는다. 게이트의 근거는 "적격이려면 반드시
+    # 등장하는 용어"라는 논리이고, 라벨은 그 논리가 깨지지 않았는지(FN=0) 확인할 뿐이다.
+    kept = gate["kept_rules"]
+    pass_mask = gate["pass_mask"]
+    reasons = gate["reasons"]
+    if not gate["active"] and kept:
+        rules_kept = [(n, p) for n, p in (gate_rules or GATE_RULES_DEFAULT) if n in kept]
+        masks = _gate_rule_masks(texts, rules_kept)
+        pass_mask = np.ones(len(texts), dtype=bool)
+        why = [[] for _ in range(len(texts))]
+        for name, _p in rules_kept:
+            m = masks[name] | no_abs
+            pass_mask &= m
+            for i in np.flatnonzero(~m):
+                why[i].append(name)
+        reasons = np.array(["; ".join(r) for r in why], dtype=object)
+    lab_pass = pass_mask[labeled_pos] if len(labeled_pos) else np.array([], dtype=bool)
+    gate_fn = int(((y == 1) & ~lab_pass).sum()) if len(labeled_pos) else 0
+    usable = bool(kept) and gate_fn == 0 and int(lab_pass.sum()) >= min(RULE_ONLY_MIN_LABELED_PASS, len(labeled_pos))
+
+    # 읽는 순서: PICO 유사도(zero-shot). 제외 여부에는 쓰지 않는다.
+    score = bootstrap_extension_probabilities(data, criteria_text, exclusion_text)
+
+    rec = np.where(no_abs, MANUAL_REVIEW_TIER,
+                   np.where(pass_mask if usable else True, "사람 검토", "안전 제외 후보"))
+    out = data.copy()
+    out["_Corpus_Row"] = np.arange(len(out), dtype=int)
+    out["Gate_Pass"] = pass_mask
+    out["Gate_Fail_Reason"] = reasons
+    out["No_Abstract"] = no_abs
+    out["PICO_Similarity"] = np.round(score, 4)
+    out["AI_Probability"] = score            # 순서 표시용. 확률 해석을 하지 않는다.
+    out["AI_Probability_%"] = np.round(score * 100, 1)
+    out["AI_Recommendation"] = rec
+    out["Unanimous_Exclude"] = (rec == "안전 제외 후보")
+
+    # 사람 검토 대상 안에서만 PICO 유사도 분위수로 상/중/하를 매긴다.
+    # 전부 읽는다는 사실은 바뀌지 않고, 어느 쪽부터 읽을지 눈으로 구분만 해 준다.
+    band = np.array([""] * len(out), dtype=object)
+    review = (rec == "사람 검토")
+    if review.sum() >= 3:
+        pos = np.flatnonzero(review)
+        v = out.loc[review, "PICO_Similarity"].to_numpy()
+        # 값 분위수는 동점이 많으면 한 밴드로 몰린다. 순위로 3등분한다(동점은 안정 정렬).
+        order = np.argsort(-v, kind="stable")
+        rank = np.empty(len(v), dtype=int)
+        rank[order] = np.arange(len(v))
+        frac = rank / max(len(v) - 1, 1)
+        band[pos] = np.where(frac <= 1 - REVIEW_BAND_CUTS[1], "상",
+                             np.where(frac <= 1 - REVIEW_BAND_CUTS[0], "중", "하"))
+    elif review.sum():
+        band[np.flatnonzero(review)] = "중"
+    band[rec == MANUAL_REVIEW_TIER] = "초록없음"
+    out["검토_우선도"] = band
+    out = out.sort_values(["AI_Recommendation", "PICO_Similarity"], ascending=[True, False]).reset_index(drop=True)
+
+    w_all = pd.to_numeric(data.get("Sampling_Weight", pd.Series([1.0] * len(data))), errors="coerce").fillna(1.0)
+    metrics = {
+        "mode": "rule_only",
+        "algorithm_version": ALGORITHM_VERSION,
+        "random_seed": int(RANDOM_SEED),
+        "run_fingerprint": run_fingerprint(data, extra="rule_only"),
+        "n_total": int(len(data)),
+        "labeled_n": int(len(labeled_pos)),
+        "include_n": int((y == 1).sum()) if len(labeled_pos) else 0,
+        "gate_active": bool(usable),
+        "gate_kept_rules": list(kept),
+        "gate_dropped_rules": dict(gate["dropped_rules"]),
+        "gate_fn_on_labels": gate_fn,
+        "auto_exclusion_enabled": bool(usable),
+        "auto_excluded_n": int((rec == "안전 제외 후보").sum()),
+        "human_review_n": int((rec != "안전 제외 후보").sum()),
+        "no_abstract_n": int(no_abs.sum()),
+        "quality_gate_status": "PASS" if usable else "REVIEW",
+        "quality_gate_reasons": ([] if usable else
+                                 ["규칙이 human Include를 제외했거나 적용 가능한 규칙이 없음"]),
+        "deterministic": True,
+    }
+    if len(labeled_pos):
+        metrics["labeled_include_retained"] = int(((y == 1) & lab_pass).sum())
+        metrics["weighted_excluded_share"] = float(
+            w_all.to_numpy()[labeled_pos][~lab_pass].sum() / max(w_all.to_numpy()[labeled_pos].sum(), 1e-9))
+    return ScreeningResult(predictions=out, metrics=metrics, threshold=float("nan"), confusion={})
