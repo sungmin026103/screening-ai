@@ -118,6 +118,33 @@ def check_pipeline() -> None:
     na_ro = ro1.predictions["No_Abstract"].astype(bool)
     assert not (ro1.predictions.loc[na_ro, "AI_Recommendation"] == "안전 제외 후보").any()
 
+    # 사람 검토 고정: 초록을 나중에 확보해도 자동 제외로 되돌아가면 안 된다
+    d_lock = df.copy()
+    d_lock["Human_Review_Locked"] = 0
+    tier = ro1.predictions.sort_values("_Corpus_Row")["AI_Recommendation"].to_numpy()
+    lock_idx = np.flatnonzero(tier != "안전 제외 후보")
+    d_lock.loc[lock_idx, "Human_Review_Locked"] = 1
+    d_lock.loc[lock_idx, "초록"] = "Unrelated spectroscopy method development text."
+    ro3 = S.rule_only_screen(d_lock, "Outcome: cardiovascular atherosclerosis serum lipid")
+    after = ro3.predictions.set_index("_Corpus_Row").loc[lock_idx, "AI_Recommendation"]
+    assert not (after == "안전 제외 후보").any(), "lock된 문헌이 자동 제외로 되돌아감"
+
+    # 논문용 3-패널 Figure가 4개 포맷으로 생성되는지
+    figs = S.build_rule_performance_figure(
+        ro1,
+        [{"label": "Internal QC", "retained": 2, "total": 2, "kind": S.RETENTION_KIND_DEV},
+         {"label": "Known-item", "retained": 5, "total": 5, "kind": S.RETENTION_KIND_IND}],
+        formats=("pdf", "svg", "png"), dpi=120)
+    want = {f"{pre}{fmt}" for pre in ("", "A_", "B_", "C_") for fmt in ("pdf", "svg", "png")}
+    assert want <= set(figs), f"개별 패널 누락: {sorted(want - set(figs))}"
+    assert all(len(v) > 1000 for v in figs.values())
+    figs_audit = S.build_rule_performance_figure(
+        ro1, [{"label": "QC", "retained": 2, "total": 2, "kind": S.RETENTION_KIND_DEV}],
+        formats=("png",), dpi=100, audit={"n_read": 300, "n_found": 0, "pool_n": 4000})
+    assert len(figs_audit["B_png"]) > 1000
+    p_, lo_, hi_ = S.retention_ci(5, 5)
+    assert p_ == 1.0 and lo_ > 0.4 and hi_ == 1.0
+
     rep = S.build_validation_report_excel_bytes(r)
     assert len(rep) > 5000
     import io as _io, openpyxl as _ox

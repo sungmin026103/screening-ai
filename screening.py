@@ -59,7 +59,7 @@ TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
 VALIDATION_RECALL_TARGET = 0.95
 VALIDATION_CONFIDENCE = 0.95
-ALGORITHM_VERSION = "V34.1"
+ALGORITHM_VERSION = "V35.1"
 # 재현성: 같은 입력(코퍼스 + 라벨)이면 항상 같은 결과가 나와야 한다.
 # 난수를 쓰는 모든 지점(폴드 분할, 캘리브레이션, SVM 좌표하강, 표본추출)에 이 seed를 건다.
 RANDOM_SEED = 42
@@ -2139,6 +2139,14 @@ def validation_methods_text(result: ScreeningResult) -> str:
 def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
     """Human-validation/AI screening 품질관리 결과를 감사 가능한 Excel report로 내보낸다."""
     m = result.metrics
+    rule_only = str(m.get("mode", "")) == "rule_only"
+
+    def _mv(key, fmt=None):
+        """규칙 모드에는 존재하지 않는 모델 지표를 0.0%로 찍지 않는다."""
+        if rule_only:
+            return "N/A (규칙 기반 단독 모드 — 확률 모델 없음)"
+        return (fmt or _pct)(m.get(key, 0.0))
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Validation_Summary"
@@ -2158,25 +2166,25 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ("Human Include n", int(m.get("include_n", 0))),
         ("Human Exclude n", int(m.get("labeled_n", 0)) - int(m.get("include_n", 0))),
         ("Target Recall", float(m.get("recall_target", DEFAULT_RECALL_TARGET))),
-        ("OOF Recall (unweighted)", _pct(m.get("recall", 0.0))),
-        ("OOF Recall (sampling-weighted, globally tuned)", _pct(m.get("recall_weighted", 0.0))),
-        ("Fold-held-out priority Recall (sampling-weighted)", _pct(m.get("policy_priority_recall_weighted", 0.0))),
-        ("Fold-held-out priority Recall (unweighted)", _pct(m.get("policy_priority_recall_unweighted", 0.0))),
-        ("OOF Recall one-sided 95% lower bound", _pct(m.get("recall_lower_ci", 0.0))),
-        ("OOF min-fold Recall", _pct(m.get("min_fold_recall", 0.0))),
-        ("Safe-exclude Recall (globally tuned, unweighted)", _pct(m.get("safe_recall", 0.0))),
-        ("Safe-exclude Recall (globally tuned, sampling-weighted)", _pct(m.get("safe_recall_weighted", 0.0))),
-        ("Safe-exclude Recall one-sided 95% lower bound (globally tuned)", _pct(m.get("safe_recall_lower_ci", 0.0))),
-        ("Fold-held-out safe Recall one-sided 95% lower bound", _pct(m.get("policy_safe_recall_lower_ci", 0.0))),
-        ("Fold-held-out safe Recall (sampling-weighted)", _pct(m.get("policy_safe_recall_weighted", 0.0))),
-        ("Fold-held-out safe Recall (unweighted)", _pct(m.get("policy_safe_recall_unweighted", 0.0))),
+        ("OOF Recall (unweighted)", _mv("recall")),
+        ("OOF Recall (sampling-weighted, globally tuned)", _mv("recall_weighted")),
+        ("Fold-held-out priority Recall (sampling-weighted)", _mv("policy_priority_recall_weighted")),
+        ("Fold-held-out priority Recall (unweighted)", _mv("policy_priority_recall_unweighted")),
+        ("OOF Recall one-sided 95% lower bound", _mv("recall_lower_ci")),
+        ("OOF min-fold Recall", _mv("min_fold_recall")),
+        ("Safe-exclude Recall (globally tuned, unweighted)", _mv("safe_recall")),
+        ("Safe-exclude Recall (globally tuned, sampling-weighted)", _mv("safe_recall_weighted")),
+        ("Safe-exclude Recall one-sided 95% lower bound (globally tuned)", _mv("safe_recall_lower_ci")),
+        ("Fold-held-out safe Recall one-sided 95% lower bound", _mv("policy_safe_recall_lower_ci")),
+        ("Fold-held-out safe Recall (sampling-weighted)", _mv("policy_safe_recall_weighted")),
+        ("Fold-held-out safe Recall (unweighted)", _mv("policy_safe_recall_unweighted")),
         ("Fold-held-out safe FN", int(m.get("policy_safe_fn", 0))),
         ("Fold-held-out safe-excluded n", int(m.get("policy_safe_excluded_n", 0))),
         ("Fold-held-out final WSS (sampling-weighted)", float(m.get("policy_safe_wss_weighted", 0.0))),
         ("Fold-held-out final human-review burden (sampling-weighted)", float(m.get("policy_safe_burden_weighted", 1.0))),
-        ("F1 (OOF, unweighted)", f"{float(m.get('f1', 0.0)):.3f}"),
-        ("Precision (OOF, unweighted)", _pct(m.get("precision", 0.0))),
-        ("ROC-AUC", float(m.get("roc_auc", 0.0))),
+        ("F1 (OOF, unweighted)", _mv("f1", lambda v: f"{float(v):.3f}")),
+        ("Precision (OOF, unweighted)", _mv("precision")),
+        ("ROC-AUC", _mv("roc_auc", lambda v: f"{float(v):.3f}")),
         ("Average precision", float(m.get("average_precision", 0.0))),
         ("Run fingerprint (input hash)", str(m.get("run_fingerprint", ""))),
         ("Random seed", int(m.get("random_seed", RANDOM_SEED))),
@@ -2245,8 +2253,13 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ["Records retained for human title/abstract screening", int(len(pred)) - auto_n],
         ["  priority tier", int(counts.get("우선 검토", 0))],
         ["  borderline tier", int(counts.get("경계 문헌", 0))],
+        ["  human-review tier (rule-only mode)", int(counts.get("사람 검토", 0))],
         ["  no-abstract tier (title-only, manual)", int(counts.get(MANUAL_REVIEW_TIER, 0))],
     ]
+    if str(result.metrics.get("mode", "")) == "rule_only" and "검토_우선도" in pred.columns:
+        # 규칙 모드에는 우선/경계 구분이 없다. 대신 읽는 순서 밴드별 편수를 적는다.
+        for b in REVIEW_BAND_ORDER:
+            flow.append([f"    reading band {b}", int((pred["검토_우선도"] == b).sum())])
     fws = wb.create_sheet("PRISMA_Flow")
     for row in flow: fws.append(row)
     for c in fws[1]: c.fill = header_fill; c.font = header_font
@@ -2302,6 +2315,11 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ["REVIEW", "위 조건 중 하나라도 충족하지 못한 경우. 모델 순위는 참고할 수 있으나 자동 제외는 잠금 상태로 취급해야 함."],
         ["Confidence bound", "표본의 유한한 Include 수 때문에 생기는 불확실성을 보여주는 보조 지표. PASS를 통계적 무누락 보장으로 해석하지 않음."],
         ["Scope", "현재 결과는 해당 review의 200편 내부 human-validation 및 OOF 예측에 대한 품질관리 결과이며, 미라벨 전체 코퍼스에 대한 절대적 보장이 아님."],
+        ["운영 규칙(고정)", "초록 있음 + safe-exclusion 규칙 충족 → 자동 제외 / 규칙 미충족 → 사람 검토 / 초록 없음 → 무조건 사람 검토. 나중에 초록을 확보하더라도 이미 사람 검토로 분류된 문헌은 규칙에 다시 넣지 않는다(Human_Review_Locked)."],
+        ["초록 없음 티어의 의미", "이 문헌들은 Include가 아니라 'Retain for human screening'이다. 적격 여부 판정은 사람이 제목·초록 또는 원문을 확인한 뒤 내린다."],
+        ["Figure 구성", "A 선별 효율(사람이 읽는 비율 대비 적격 보존율), B 집합별 보존율과 95% CI, C 작업량 감소와 잘못된 자동 제외 수. ROC/PR/AUC/F1은 결정론적 규칙에 정의되지 않으므로 넣지 않는다."],
+        ["규칙 기반 단독 모드", "확률 모델을 쓰지 않으므로 Recall/ROC-AUC/F1은 정의되지 않는다(N/A). 보고할 수치는 (1) 적용된 규칙과 제외 편수, (2) human Include 탈락 수, (3) 위험층별 누락 상한, (4) known-item 복구 결과다."],
+        ["노출어 셀 vs 결과어 셀", "노출어가 없어 제외된 셀은 논리로 방어된다(PECO상 노출이 필수이므로 제목·초록에 노출어가 없으면 적격 판정 자체가 불가능). 표본 감사가 필요한 것은 노출어는 있는데 결과어가 없어 제외된 셀뿐이다. 전체 셀을 한꺼번에 목표 상한에 맞추려 하면 불필요하게 많이 읽게 된다."],
         ["보고 원칙", "Recall은 점추정 100%가 아니라 단측 95% 하한과 함께 보고한다. Include 수가 적을수록 하한은 낮아지며, 이것이 실제 불확실성이다."],
         ["Audit_Design", "자동 제외 집합을 '제외 사유 × 노출어 포함 여부'로 나눈 뒤 셀별 누락 상한을 계산한 표. 노출어가 있는데 제외된 셀이 가장 위험하다(주제는 맞는데 결과어 규칙이 못 잡은 경우). 목표 상한을 정하고 그만큼 추가로 읽는 것이 동료심사 대응의 핵심이다."],
         ["논리적 근거 vs 통계적 근거", "노출어가 아예 없어 제외된 문헌은 PECO상 노출이 필수이므로 제목·초록 단계에서 적격 판정 자체가 불가능하다(논리적 근거). 반면 노출어는 있으나 결과어가 없어 제외된 문헌은 결과어 사전의 누락 가능성이 있으므로 표본 감사로 뒷받침해야 한다(통계적 근거)."],
@@ -2945,7 +2963,11 @@ def rule_only_screen(
 
 
     no_abs = _missing_abstract_mask(data["Abstract"].to_numpy())
-    gate = build_gate(texts, labeled_pos, y, weights, gate_rules, exempt=no_abs)
+    # 이전 단계에서 이미 사람 검토로 확정된 문헌은 규칙 대상에서 제외한다.
+    # (초록을 나중에 확보해도 자동 제외로 되돌리지 않기 위한 장치)
+    locked = _human_review_lock_mask(df.reset_index(drop=True))
+    exempt = no_abs | locked
+    gate = build_gate(texts, labeled_pos, y, weights, gate_rules, exempt=exempt)
 
     # 지도학습 모드와 달리 Include 수 하한을 두지 않는다. 게이트의 근거는 "적격이려면 반드시
     # 등장하는 용어"라는 논리이고, 라벨은 그 논리가 깨지지 않았는지(FN=0) 확인할 뿐이다.
@@ -2958,7 +2980,7 @@ def rule_only_screen(
         pass_mask = np.ones(len(texts), dtype=bool)
         why = [[] for _ in range(len(texts))]
         for name, _p in rules_kept:
-            m = masks[name] | no_abs
+            m = masks[name] | exempt
             pass_mask &= m
             for i in np.flatnonzero(~m):
                 why[i].append(name)
@@ -2971,12 +2993,14 @@ def rule_only_screen(
     score = bootstrap_extension_probabilities(data, criteria_text, exclusion_text)
 
     rec = np.where(no_abs, MANUAL_REVIEW_TIER,
-                   np.where(pass_mask if usable else True, "사람 검토", "안전 제외 후보"))
+                   np.where((pass_mask | locked) if usable else True, "사람 검토", "안전 제외 후보"))
     out = data.copy()
     out["_Corpus_Row"] = np.arange(len(out), dtype=int)
     out["Gate_Pass"] = pass_mask
     out["Gate_Fail_Reason"] = reasons
     out["No_Abstract"] = no_abs
+    # 이번 실행에서 사람 검토로 분류된 문헌은 다음 실행에서도 그대로 유지되도록 표시한다.
+    out[HUMAN_REVIEW_LOCK_COL] = (rec != "안전 제외 후보")
     out["PICO_Similarity"] = np.round(score, 4)
     out["AI_Probability"] = score            # 순서 표시용. 확률 해석을 하지 않는다.
     out["AI_Probability_%"] = np.round(score * 100, 1)
@@ -3030,3 +3054,278 @@ def rule_only_screen(
         metrics["weighted_excluded_share"] = float(
             w_all.to_numpy()[labeled_pos][~lab_pass].sum() / max(w_all.to_numpy()[labeled_pos].sum(), 1e-9))
     return ScreeningResult(predictions=out, metrics=metrics, threshold=float("nan"), confusion={})
+
+
+# ---------------------------------------------------------------------------
+# 사람 검토 고정(lock) — 한 번 사람 검토로 간 문헌은 다시 자동 제외하지 않는다
+# ---------------------------------------------------------------------------
+# 초록이 없어 "정보 부족 → 사람 검토"로 분류된 문헌은, 나중에 PubMed나 출판사에서 초록을
+# 확보하더라도 규칙에 다시 넣지 않는다. 다시 넣으면 "기계가 초록 없는 문헌을 버리지 않는다"는
+# 보수성 주장이 깨지고, 같은 문헌의 운명이 초록 확보 시점에 따라 달라진다.
+HUMAN_REVIEW_LOCK_COL = "Human_Review_Locked"
+
+
+def _human_review_lock_mask(df: pd.DataFrame) -> np.ndarray:
+    """입력에 Human_Review_Locked 열이 있으면 그 문헌은 규칙과 무관하게 사람 검토로 보낸다."""
+    if HUMAN_REVIEW_LOCK_COL not in df.columns:
+        return np.zeros(len(df), dtype=bool)
+    truthy = {"1", "true", "t", "y", "yes", "o", "lock", "locked", "사람검토", "사람 검토"}
+    return df[HUMAN_REVIEW_LOCK_COL].fillna("").astype(str).str.strip().str.lower().isin(truthy).to_numpy()
+
+
+# ---------------------------------------------------------------------------
+# 논문용 성능 Figure (규칙 기반 safe-exclusion 전용)
+# ---------------------------------------------------------------------------
+# ROC/PR/AUC/F1은 확률 분류기의 지표이고 결정론적 규칙에는 정의되지 않는다. 대신
+#   A. 사람이 읽는 비율 대비 적격 문헌 보존율 (screening efficiency)
+#   B. 검증 집합별 적격 문헌 보존율과 95% CI (safety) — 표준 forest plot 형식
+#   C. 작업량 감소와 잘못된 자동 제외 건수 (utility)
+# 를 그린다. 3패널 합본과 패널별 개별 파일을 모두 만든다.
+# 주석은 전부 축 바깥(아래)에 두어 데이터와 겹치지 않게 한다.
+# ---------------------------------------------------------------------------
+
+RETENTION_KIND_DEV = "development"
+RETENTION_KIND_IND = "independent"
+
+_FIG_RC = {
+    "font.size": 9, "axes.titlesize": 10.5, "axes.labelsize": 9,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "xtick.labelsize": 8.5, "ytick.labelsize": 8.5, "legend.fontsize": 8,
+    "font.family": "DejaVu Sans", "axes.linewidth": 0.8,
+}
+_C_BLUE, _C_GREY, _C_DARK, _C_LIGHT = "#1A56DB", "#9AA0A6", "#111827", "#C9D2E4"
+
+
+def retention_ci(retained: int, total: int, confidence: float = 0.95):
+    """보존율과 Clopper-Pearson 양측 신뢰구간. total=0이면 (nan, 0, 1)."""
+    if total <= 0:
+        return (float("nan"), 0.0, 1.0)
+    p = retained / total
+    alpha = 1.0 - confidence
+    lo = 0.0 if retained == 0 else float(_beta_dist.ppf(alpha / 2, retained, total - retained + 1))
+    hi = 1.0 if retained == total else float(_beta_dist.ppf(1 - alpha / 2, retained + 1, total - retained))
+    return (p, lo, hi)
+
+
+def _fig_inputs(result: ScreeningResult, retention_sets):
+    m = result.metrics
+    pred = result.predictions
+    total_n = int(m.get("n_total", len(pred)))
+    auto_n = int(m.get("auto_excluded_n", int((pred["AI_Recommendation"] == "안전 제외 후보").sum())))
+    human_n = max(total_n - auto_n, 0)
+    if not retention_sets:
+        inc = int(m.get("include_n", 0))
+        retention_sets = [{"label": "Internal QC (rule development)",
+                           "retained": int(m.get("labeled_include_retained", inc)),
+                           "total": inc, "kind": RETENTION_KIND_DEV}]
+    rows = [r for r in retention_sets if int(r.get("total", 0)) > 0]
+    obs_ret = sum(int(r["retained"]) for r in rows)
+    obs_tot = sum(int(r["total"]) for r in rows)
+    if len(rows) > 1 and obs_tot:
+        rows = rows + [{"label": "All sets combined", "retained": obs_ret,
+                        "total": obs_tot, "kind": "overall"}]
+    return dict(total_n=total_n, auto_n=auto_n, human_n=human_n,
+                human_pct=100.0 * human_n / total_n if total_n else 0.0,
+                rows=rows, obs_ret=obs_ret, obs_tot=obs_tot)
+
+
+def _draw_panel_a(ax, d, title="A  Screening efficiency", note_ax=None):
+    """사람이 읽는 비율 대비 적격 보존율. 주석은 축 아래 바깥에 둔다."""
+    from matplotlib.lines import Line2D
+    hp = d["human_pct"]
+    obs = 100.0 * d["obs_ret"] / d["obs_tot"] if d["obs_tot"] else float("nan")
+    ax.plot([0, 100], [0, 100], ls="--", lw=1.0, color=_C_GREY)
+    ax.plot([hp], [obs], marker="o", ms=9, color=_C_BLUE, zorder=5)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 105)
+    ax.set_xticks([0, 20, 40, 60, 80, 100])
+    ax.set_yticks([0, 20, 40, 60, 80, 100])
+    ax.set_xlabel("Records requiring human screening (%)")
+    ax.set_ylabel("Eligible records retained (%)")
+    ax.set_title(title, loc="left", fontweight="bold")
+    ax.legend(handles=[
+        Line2D([], [], ls="--", color=_C_GREY, label="Random / unaided screening"),
+        Line2D([], [], marker="o", ls="none", color=_C_BLUE, ms=7,
+               label="Rule-based safe exclusion"),
+    ], loc="lower right", frameon=False, handlelength=1.8)
+    (note_ax or ax).text(
+        0, -0.235,
+        "Operating point: {:.1f}% of records screened by humans; "
+        "{:.0f}% of eligible records retained ({}/{}).".format(hp, obs, d["obs_ret"], d["obs_tot"]),
+        transform=ax.transAxes, ha="left", va="top", fontsize=8.2, color="#374151")
+
+
+def _draw_panel_b(fig, gs_cell, d, title="B  Safety of automated exclusion", audit=None):
+    """표준 forest plot: 왼쪽 라벨 열 · 가운데 CI · 오른쪽 수치 열 (서로 겹치지 않음)."""
+    from matplotlib.lines import Line2D
+    rows = d["rows"]
+    inner = gs_cell.subgridspec(1, 3, width_ratios=[1.30, 1.55, 0.95], wspace=0.0)
+    axL = fig.add_subplot(inner[0, 0])
+    axM = fig.add_subplot(inner[0, 1])
+    axR = fig.add_subplot(inner[0, 2])
+    for a in (axL, axR):
+        a.axis("off")
+        a.set_ylim(-1.0, len(rows) - 0.3)
+        a.set_xlim(0, 1)
+
+    ypos = np.arange(len(rows))[::-1]
+    style = {RETENTION_KIND_DEV: ("o", _C_GREY, "white"),
+             RETENTION_KIND_IND: ("o", _C_BLUE, _C_BLUE),
+             "overall": ("D", _C_DARK, _C_DARK)}
+    axL.text(1.0, len(rows) - 0.55, "Validation set", ha="right", va="center",
+             fontsize=8.6, fontweight="bold")
+    axR.text(0.02, len(rows) - 0.55, "Retention (95% CI)", ha="left", va="center",
+             fontsize=8.6, fontweight="bold")
+    for yv, r in zip(ypos, rows):
+        p, lo, hi = retention_ci(int(r["retained"]), int(r["total"]))
+        mk, ec, fc = style.get(str(r.get("kind", RETENTION_KIND_IND)), style[RETENTION_KIND_IND])
+        axL.text(1.0, yv + 0.13, str(r["label"]), ha="right", va="center", fontsize=8.4)
+        axL.text(1.0, yv - 0.24, "{}/{}".format(int(r["retained"]), int(r["total"])),
+                 ha="right", va="center", fontsize=7.8, color="#6B7280")
+        axM.hlines(yv, lo * 100, hi * 100, color=ec, lw=1.8)
+        for xe in (lo * 100, hi * 100):
+            axM.vlines(xe, yv - 0.13, yv + 0.13, color=ec, lw=1.2)
+        axM.plot([p * 100], [yv], marker=mk, ms=7.5, mec=ec, mfc=fc, zorder=5)
+        axR.text(0.02, yv, "{:.0f}%  ({:.0f}–{:.0f})".format(p * 100, lo * 100, hi * 100),
+                 ha="left", va="center", fontsize=8.3, color="#1F2937")
+
+    axM.axvline(100, color="#C9CDD4", lw=0.9, ls=":")
+    axM.set_xlim(0, 104)
+    axM.set_xticks([0, 25, 50, 75, 100])
+    axM.set_ylim(-1.0, len(rows) - 0.3)
+    axM.set_yticks([])
+    axM.spines["left"].set_visible(False)
+    axM.set_xlabel("Eligible-record retention (%)")
+    axM.set_title(title, loc="left", fontweight="bold")
+    axM.legend(handles=[
+        Line2D([], [], marker="o", ls="none", mec=_C_GREY, mfc="white", ms=6.5,
+               label="Development set (not independent)"),
+        Line2D([], [], marker="o", ls="none", mec=_C_BLUE, mfc=_C_BLUE, ms=6.5,
+               label="Independent set"),
+    ], loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=1,
+        frameon=False, handlelength=1.2, borderpad=0.1)
+    # 무작위 감사는 '보존율'이 아니라 '놓친 문헌 수의 상한'으로 말해야 한다.
+    # 적격 문헌을 한 편도 찾지 못했다면 분모가 0이라 비율 자체가 정의되지 않기 때문이다.
+    if audit and int(audit.get("n_read", 0)) > 0:
+        n_read = int(audit["n_read"]); n_found = int(audit.get("n_found", 0))
+        pool = int(audit.get("pool_n", 0))
+        ub = _cp_upper(n_read, n_found)
+        txt = ("Independent random audit of the automatically excluded set: "
+               "{} records re-screened, {} eligible found"
+               .format(n_read, n_found))
+        if pool:
+            txt += "; \u2264{:.0f} eligible records missed (95% upper bound)".format(ub * pool)
+        axM.text(0.0, -0.33, txt, transform=axM.transAxes, ha="left", va="top",
+                 fontsize=8.0, color="#374151")
+    return axM
+
+
+def _draw_panel_c(ax, d, title="C  Human workload"):
+    """작업량 막대. 요약 주석은 축 아래 바깥에 둔다."""
+    from matplotlib.lines import Line2D
+    hp, ap = d["human_pct"], 100.0 - d["human_pct"]
+    ax.barh([1], [100], color="#D5D9E0", height=0.4)
+    ax.barh([0], [hp], color=_C_BLUE, height=0.4)
+    ax.barh([0], [ap], left=hp, color=_C_LIGHT, height=0.4)
+    ax.text(hp + ap / 2, 0, "{:.1f}%".format(ap), va="center", ha="center",
+            fontsize=8.4, color="#1F2937")
+    ax.text(hp / 2, 0.33, "{:.1f}%".format(hp), va="bottom", ha="center",
+            fontsize=8.4, color=_C_BLUE, fontweight="bold")
+    ax.text(50, 1, "{:,} records".format(d["total_n"]), va="center", ha="center",
+            fontsize=8.4, color="#1F2937")
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["Rule-based", "Manual"], fontsize=8.8)
+    ax.set_xlim(0, 100)
+    ax.set_xticks([0, 25, 50, 75, 100])
+    ax.set_ylim(-0.55, 1.6)
+    ax.set_xlabel("Proportion of records (%)")
+    ax.set_title(title, loc="left", fontweight="bold")
+    ax.legend(handles=[
+        Line2D([], [], color=_C_BLUE, lw=7, label="Human screening"),
+        Line2D([], [], color=_C_LIGHT, lw=7, label="Automatically excluded"),
+    ], loc="upper center", bbox_to_anchor=(0.5, -0.30), ncol=2,
+        frameon=False, handlelength=1.1, borderpad=0.1)
+    ax.text(0, -0.52,
+            "Human screening {:,} · automatically excluded {:,} · "
+            "observed false exclusions {}".format(
+                d["human_n"], d["auto_n"], d["obs_tot"] - d["obs_ret"]),
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.2, color="#374151")
+
+
+def _save_fig(fig, formats, dpi):
+    out = {}
+    for fmt in formats:
+        buf = io.BytesIO()
+        kw = {"dpi": dpi} if fmt in ("png", "tiff") else {}
+        if fmt == "tiff":
+            kw["pil_kwargs"] = {"compression": "tiff_lzw"}
+        fig.savefig(buf, format=fmt, bbox_inches="tight", facecolor="white", **kw)
+        out[fmt] = buf.getvalue()
+    return out
+
+
+def build_rule_performance_figure(
+    result: ScreeningResult,
+    retention_sets: list | None = None,
+    formats: tuple = ("pdf", "svg", "png", "tiff"),
+    dpi: int = 600,
+    audit: dict | None = None,
+) -> dict:
+    """3패널 합본과 패널별 개별 파일을 만든다.
+
+    audit: {"n_read", "n_found", "pool_n"} — 무작위 감사 결과를 B 패널 각주로 적는다.
+
+    반환 키: 합본은 'pdf'/'svg'/'png'/'tiff', 개별은 'A_pdf', 'B_png' 같은 형식.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    d = _fig_inputs(result, retention_sets)
+    n_rows = len(d["rows"])
+    plt.rcParams.update(_FIG_RC)
+
+    # --- 합본 ---------------------------------------------------------------
+    fig = plt.figure(figsize=(14.0, max(4.2, 1.5 + 0.75 * n_rows)))
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.65, 1.0], wspace=0.30,
+                          left=0.05, right=0.99, top=0.84,
+                          bottom=0.34 if audit else 0.26)
+    _draw_panel_a(fig.add_subplot(gs[0, 0]), d)
+    # 합본에서는 감사 각주를 패널 안에 두면 C 패널 범례와 겹친다. 그림 맨 아래에 따로 적는다.
+    _draw_panel_b(fig, gs[0, 1], d)
+    _draw_panel_c(fig.add_subplot(gs[0, 2]), d)
+    if audit and int(audit.get("n_read", 0)) > 0:
+        n_read = int(audit["n_read"]); n_found = int(audit.get("n_found", 0))
+        pool = int(audit.get("pool_n", 0))
+        note = ("Independent random audit of the automatically excluded set: "
+                "{} records re-screened, {} eligible found".format(n_read, n_found))
+        if pool:
+            note += "; \u2264{:.0f} eligible records missed (95% upper bound)".format(
+                _cp_upper(n_read, n_found) * pool)
+        fig.text(0.05, 0.035, note, ha="left", va="bottom", fontsize=8.2, color="#374151")
+    out = _save_fig(fig, formats, dpi)
+    plt.close(fig)
+
+    # --- 개별 패널 ----------------------------------------------------------
+    figA = plt.figure(figsize=(5.0, 4.4))
+    gsA = figA.add_gridspec(1, 1, left=0.15, right=0.97, top=0.88, bottom=0.26)
+    _draw_panel_a(figA.add_subplot(gsA[0, 0]), d, title="Screening efficiency")
+    for k, v in _save_fig(figA, formats, dpi).items():
+        out["A_" + k] = v
+    plt.close(figA)
+
+    figB = plt.figure(figsize=(7.6, max(3.0, 1.4 + 0.78 * n_rows)))
+    gsB = figB.add_gridspec(1, 1, left=0.02, right=0.99, top=0.86,
+                            bottom=(0.26 if audit else 0.20) + 0.03 * max(0, 3 - n_rows))
+    _draw_panel_b(figB, gsB[0, 0], d, title="Safety of automated exclusion", audit=audit)
+    for k, v in _save_fig(figB, formats, dpi).items():
+        out["B_" + k] = v
+    plt.close(figB)
+
+    figC = plt.figure(figsize=(5.4, 3.5))
+    gsC = figC.add_gridspec(1, 1, left=0.17, right=0.97, top=0.86, bottom=0.34)
+    _draw_panel_c(figC.add_subplot(gsC[0, 0]), d, title="Human workload")
+    for k, v in _save_fig(figC, formats, dpi).items():
+        out["C_" + k] = v
+    plt.close(figC)
+    return out

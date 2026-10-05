@@ -53,6 +53,9 @@ from screening import (
     label_consistency_check,
     bootstrap_extension_probabilities,
     rule_only_screen,
+    build_rule_performance_figure,
+    RETENTION_KIND_DEV,
+    RETENTION_KIND_IND,
 )
 from styles import (apply_styles, empty_state, hero, kpi, stepper, activity_feed, topbar,
                     landing_nav, landing_hero, summary_strip)
@@ -1222,6 +1225,74 @@ elif nav == "screen":
                 "읽는 순서는 PICO 유사도로만 정합니다. 순위의 정밀도는 지도학습 모드보다 낮으므로 "
                 "'사람 검토'로 분류된 문헌은 순서와 무관하게 전부 읽으셔야 합니다."
             )
+
+        if is_rule_only:
+            st.markdown('<div class="section-title" style="margin-top:18px;">논문용 성능 Figure</div>',
+                        unsafe_allow_html=True)
+            st.caption(
+                "규칙 기반 선별에는 ROC/PR/AUC/F1이 정의되지 않습니다. 대신 "
+                "A 선별 효율 · B 적격 문헌 보존율(95% CI) · C 작업량 감소 3패널을 만듭니다. "
+                "B의 internal QC는 규칙 개발에 쓰인 집합이므로 흰 점으로 구분 표시되며, "
+                "독립 집합(known-item, 무작위 감사)을 입력하면 파란 점으로 함께 그려집니다."
+            )
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                ki_tot = st.number_input("Known-item: PECO 적격 문헌 수", min_value=0, value=0, step=1,
+                                         key="fig_ki_total")
+                ki_keep = st.number_input("그중 자동 제외되지 않은 수", min_value=0, value=0, step=1,
+                                          key="fig_ki_keep")
+            with fc2:
+                au_tot = st.number_input("독립 감사: 읽은 편수", min_value=0, value=0, step=1,
+                                         key="fig_au_total")
+                au_found = st.number_input("그중 적격으로 판정된 수", min_value=0, value=0, step=1,
+                                           key="fig_au_found")
+            rsets = [{
+                "label": "Internal QC (rule development)",
+                "retained": int(gm.get("labeled_include_retained", gm.get("include_n", 0))),
+                "total": int(gm.get("include_n", 0)),
+                "kind": RETENTION_KIND_DEV,
+            }]
+            if int(ki_tot) > 0:
+                rsets.append({"label": "Known-item recovery (eligible only)",
+                              "retained": int(ki_keep), "total": int(ki_tot),
+                              "kind": RETENTION_KIND_IND})
+            if int(au_found) > 0:
+                # 감사에서 적격으로 판정된 문헌은 전부 자동 제외된 것이므로 보존 0편이다.
+                rsets.append({"label": "Independent random audit",
+                              "retained": 0, "total": int(au_found),
+                              "kind": RETENTION_KIND_IND})
+            audit_arg = None
+            if int(au_tot) > 0:
+                # 적격을 한 편도 못 찾았으면 '보존율'이 아니라 '누락 상한'으로 적어야 한다.
+                audit_arg = {"n_read": int(au_tot), "n_found": int(au_found),
+                             "pool_n": int(gm.get("auto_excluded_n", 0))}
+            if st.button("Figure 생성", use_container_width=True, key="btn_rule_fig"):
+                try:
+                    st.session_state["rule_fig"] = build_rule_performance_figure(
+                        result, rsets, audit=audit_arg)
+                except Exception as exc:
+                    st.error(str(exc))
+            figs = st.session_state.get("rule_fig")
+            if figs:
+                mimes = {"pdf": "application/pdf", "svg": "image/svg+xml",
+                         "png": "image/png", "tiff": "image/tiff"}
+                tabs = st.tabs(["3패널 합본", "A 선별 효율", "B 안전성", "C 작업량"])
+                for tab, prefix, fname in zip(
+                        tabs, ["", "A_", "B_", "C_"],
+                        ["Figure_Screening_Performance",
+                         "Figure_A_Screening_Efficiency",
+                         "Figure_B_Safety",
+                         "Figure_C_Workload"]):
+                    with tab:
+                        st.image(figs[prefix + "png"], use_container_width=True)
+                        cols = st.columns(4)
+                        for col, fmt in zip(cols, ["pdf", "svg", "png", "tiff"]):
+                            col.download_button(fmt.upper(), figs[prefix + fmt],
+                                                f"{fname}.{fmt}", mimes[fmt],
+                                                use_container_width=True,
+                                                key=f"dl_{prefix}{fmt}")
+                st.caption("PDF/SVG는 벡터, PNG/TIFF는 600 dpi(TIFF는 LZW 압축)입니다. "
+                           "주석은 모두 축 바깥에 배치되어 데이터와 겹치지 않습니다.")
 
         st.download_button(
             "Human validation 품질관리 보고서 다운로드",
