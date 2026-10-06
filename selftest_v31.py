@@ -145,6 +145,17 @@ def check_pipeline() -> None:
     p_, lo_, hi_ = S.retention_ci(5, 5)
     assert p_ == 1.0 and lo_ > 0.4 and hi_ == 1.0
 
+    # 원본 순서 유지 + 행 색 표시 엑셀
+    orig = S.build_original_order_excel_bytes(ro1.predictions, df)
+    assert len(orig) > 5000
+    import io as _io2, openpyxl as _ox2
+    wb_o = _ox2.load_workbook(_io2.BytesIO(orig))
+    assert "색_범례" in wb_o.sheetnames
+    ws_o = wb_o["원본순서_색표시"]
+    assert [c.value for c in ws_o[1]][:4] == ["AI_판정", "검토_우선도", "제외_사유", "PICO_적합도"]
+    titles_out = [ws_o.cell(row=i + 2, column=5).value for i in range(len(df))]
+    assert titles_out == df["제목"].tolist(), "원본 행 순서가 유지되지 않음"
+
     rep = S.build_validation_report_excel_bytes(r)
     assert len(rep) > 5000
     import io as _io, openpyxl as _ox

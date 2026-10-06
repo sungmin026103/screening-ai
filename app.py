@@ -54,6 +54,7 @@ from screening import (
     bootstrap_extension_probabilities,
     rule_only_screen,
     build_rule_performance_figure,
+    build_original_order_excel_bytes,
     RETENTION_KIND_DEV,
     RETENTION_KIND_IND,
 )
@@ -1477,6 +1478,20 @@ elif nav == "screen":
         else:
             review_df = result.predictions.copy()
             safe_df = result.predictions[result.predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
+
+        st.download_button(
+            "원본 순서 그대로 (행 색 표시)",
+            build_original_order_excel_bytes(
+                result.predictions, st.session_state.get("screen_corpus_df")),
+            "AI_Screening_OriginalOrder.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.caption(
+            "업로드한 파일의 행 순서를 그대로 두고 판정 열과 행 색만 입힌 버전입니다. "
+            "회색 = 자동 제외, 초록/노랑/연회색 = 사람 검토(상/중/하), 노랑 = 초록 없음. "
+            "두 번째 시트에 색 범례가 있습니다."
+        )
 
         d1, d2 = st.columns(2)
         with d1:

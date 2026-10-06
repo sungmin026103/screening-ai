@@ -59,7 +59,7 @@ TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
 VALIDATION_RECALL_TARGET = 0.95
 VALIDATION_CONFIDENCE = 0.95
-ALGORITHM_VERSION = "V35.1"
+ALGORITHM_VERSION = "V35.2"
 # 재현성: 같은 입력(코퍼스 + 라벨)이면 항상 같은 결과가 나와야 한다.
 # 난수를 쓰는 모든 지점(폴드 분할, 캘리브레이션, SVM 좌표하강, 표본추출)에 이 seed를 건다.
 RANDOM_SEED = 42
@@ -3329,3 +3329,99 @@ def build_rule_performance_figure(
         out["C_" + k] = v
     plt.close(figC)
     return out
+
+
+def build_original_order_excel_bytes(
+    predictions: pd.DataFrame,
+    original_df: pd.DataFrame | None = None,
+) -> bytes:
+    """업로드한 원본 파일의 행 순서를 그대로 유지한 채 행 색만 입혀 돌려준다.
+
+    PICO 적합도 순으로 정렬된 파일과 달리, 원본에서 몇 번째 문헌인지 그대로 보면서
+    색으로 분류만 확인하고 싶을 때 쓴다. 판정 열은 맨 앞에 붙인다.
+      회색  = 자동 제외(사람이 읽지 않음)
+      초록/노랑/연회색 = 사람 검토 대상의 읽는 순서 밴드(상/중/하)
+      노랑  = 초록 없음(무조건 사람 검토)
+    """
+    df = predictions.copy()
+    if "_Corpus_Row" in df.columns:
+        df = df.sort_values("_Corpus_Row").reset_index(drop=True)
+
+    if original_df is not None and len(original_df) == len(df):
+        base = original_df.reset_index(drop=True).copy()
+    else:
+        drop = {"Text", "StructuredText", "_export_group"}
+        base = df[[c for c in df.columns if c not in drop
+                   and not str(c).startswith(("Prob_", "CV_Prob_"))]].copy()
+
+    tier = df.get("AI_Recommendation", pd.Series([""] * len(df))).astype(str)
+    band = df.get("검토_우선도", pd.Series([""] * len(df))).astype(str)
+    reason = df.get("Gate_Fail_Reason", pd.Series([""] * len(df))).astype(str)
+    score = df.get("AI_Probability_%", df.get("PICO_Similarity", pd.Series([np.nan] * len(df))))
+
+    front = pd.DataFrame({
+        "AI_판정": tier.to_numpy(),
+        "검토_우선도": band.to_numpy(),
+        "제외_사유": reason.to_numpy(),
+        "PICO_적합도": pd.to_numeric(score, errors="coerce").to_numpy(),
+    })
+    out = pd.concat([front, base.drop(columns=[c for c in front.columns if c in base.columns],
+                                      errors="ignore")], axis=1)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "원본순서_색표시"
+    for row in dataframe_to_rows(out, index=False, header=True):
+        ws.append(row)
+    header_fill = PatternFill("solid", fgColor="1A56DB")
+    header_font = Font(bold=True, color="FFFFFF")
+    for c in ws[1]:
+        c.fill = header_fill
+        c.font = header_font
+    ws.freeze_panes = "A2"
+
+    for i in range(len(out)):
+        b = str(band.iloc[i])
+        t = str(tier.iloc[i])
+        color = REVIEW_BAND_COLORS.get(b)
+        if color is None:
+            color = "B8BDC6" if t == "안전 제외 후보" else ("FFF2CC" if b == "초록없음" else "FFFFFF")
+        fill = PatternFill("solid", fgColor=color)
+        for j in range(1, ws.max_column + 1):
+            ws.cell(row=i + 2, column=j).fill = fill
+
+    widths = {"AI_판정": 20, "검토_우선도": 12, "제외_사유": 34, "PICO_적합도": 13}
+    for j, name in enumerate(out.columns, start=1):
+        letter = get_column_letter(j)
+        if name in widths:
+            ws.column_dimensions[letter].width = widths[name]
+        elif str(name) in ("제목", "Title"):
+            ws.column_dimensions[letter].width = 60
+        elif str(name) in ("초록", "Abstract"):
+            ws.column_dimensions[letter].width = 80
+        else:
+            ws.column_dimensions[letter].width = 18
+
+    legend = wb.create_sheet("색_범례")
+    legend.append(["색", "의미"])
+    for c in legend[1]:
+        c.fill = header_fill
+        c.font = header_font
+    rows = [("상", "사람 검토 — PICO와 가장 가까움"),
+            ("중", "사람 검토 — 중간"),
+            ("하", "사람 검토 — 먼 쪽"),
+            ("초록없음", "초록 없음 — 무조건 사람 검토"),
+            ("", "자동 제외(규칙) — 사람이 읽지 않음")]
+    for band_name, desc in rows:
+        legend.append(["", desc])
+        fill_color = REVIEW_BAND_COLORS.get(band_name, "B8BDC6")
+        legend.cell(row=legend.max_row, column=1).fill = PatternFill("solid", fgColor=fill_color)
+    legend.append([])
+    legend.append(["", "색은 읽는 순서를 돕는 표시이며 제외 결정과 무관합니다."])
+    legend.append(["", "'사람 검토'로 분류된 문헌은 색과 상관없이 전부 읽어야 합니다."])
+    legend.column_dimensions["A"].width = 8
+    legend.column_dimensions["B"].width = 70
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
