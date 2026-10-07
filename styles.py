@@ -133,6 +133,82 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 /* Legacy funnel components */
 .funnel-wrap{display:flex;align-items:center;gap:26px;flex-wrap:wrap}.funnel-svg{width:340px;max-width:100%;height:auto}.funnel-num{font:700 20px 'JetBrains Mono',monospace}.funnel-label{font-weight:600;font-size:12.5px}.funnel-legend{display:flex;flex-direction:column;gap:10px;min-width:220px}.funnel-legend .row{display:flex;align-items:center;gap:10px;font-size:.88rem}.funnel-legend .dot{width:11px;height:11px;border-radius:4px}.funnel-legend .n{font:700 .88rem 'JetBrains Mono',monospace;margin-left:auto}
 
+
+/* ===================== V36 · motion & premium layer ===================== */
+:root{--gold:#c9a45c;--ink2:#0F1F3D;--glass:rgba(255,255,255,.72);--ease:cubic-bezier(.2,.8,.2,1)}
+@property --num{syntax:'<integer>';initial-value:0;inherits:false}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes countUp{from{--num:0}to{--num:var(--to)}}
+@keyframes fadeOut{to{opacity:0}}
+@keyframes aurora{0%{transform:translate3d(-8%,-6%,0) rotate(0deg) scale(1)}50%{transform:translate3d(6%,4%,0) rotate(160deg) scale(1.15)}100%{transform:translate3d(-8%,-6%,0) rotate(360deg) scale(1)}}
+@keyframes sheen{0%{transform:translateX(-120%)}100%{transform:translateX(220%)}}
+@keyframes livePulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.55)}70%{box-shadow:0 0 0 9px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+@keyframes barGrow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@keyframes shimmerBg{0%{background-position:-400px 0}100%{background-position:400px 0}}
+
+.hero{background:linear-gradient(120deg,#07142c,#0F1F3D 55%,#13306b)!important}
+.hero:before{content:"";position:absolute;inset:-40%;background:
+  radial-gradient(closest-side,rgba(91,124,255,.30),transparent 70%) 20% 30%/45% 45% no-repeat,
+  radial-gradient(closest-side,rgba(201,164,92,.18),transparent 70%) 80% 70%/40% 40% no-repeat,
+  radial-gradient(closest-side,rgba(56,189,248,.16),transparent 70%) 60% 10%/35% 35% no-repeat;
+  animation:aurora 26s linear infinite;z-index:1;pointer-events:none}
+.hero .eyebrow{color:#e7cf9b!important}
+.hero h1,.hero p{animation:fadeUp .7s var(--ease) both}.hero p{animation-delay:.08s}
+
+.mcards{display:grid;grid-template-columns:repeat(var(--cols,4),minmax(0,1fr));gap:14px;margin:6px 0 18px}
+.mcard{position:relative;overflow:hidden;background:var(--glass);backdrop-filter:blur(10px);border:1px solid rgba(214,222,236,.9);
+  border-radius:16px;padding:16px 18px 15px;box-shadow:0 10px 28px rgba(15,31,61,.06);animation:fadeUp .6s var(--ease) both;
+  transition:transform .25s var(--ease),box-shadow .25s var(--ease)}
+.mcard:hover{transform:translateY(-3px);box-shadow:0 16px 36px rgba(15,31,61,.11)}
+.mcard:after{content:"";position:absolute;top:0;left:0;width:40%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.55),transparent);transform:translateX(-120%);pointer-events:none}
+.mcard:hover:after{animation:sheen 1.1s var(--ease)}
+.mcard .accent{position:absolute;left:0;top:0;bottom:0;width:4px;background:linear-gradient(180deg,#0B4FA8,#6B9BD8)}
+.mcard.good .accent{background:linear-gradient(180deg,#16a34a,#86efac)}.mcard.warn .accent{background:linear-gradient(180deg,#d97706,#fcd34d)}
+.mcard.bad .accent{background:linear-gradient(180deg,#dc2626,#fca5a5)}.mcard.gold .accent{background:linear-gradient(180deg,#a8843e,#e7cf9b)}
+.mcard .lab{font-size:.84rem;color:var(--muted);font-weight:600;letter-spacing:.01em}
+.mcard .val{position:relative;font:700 1.75rem 'JetBrains Mono',monospace;color:var(--ink2);margin-top:6px;min-height:2.2rem}
+.mcard .hint{font-size:.8rem;color:#8b94a8;margin-top:4px}
+.mcard .delta{display:inline-block;margin-left:8px;font:600 .8rem 'JetBrains Mono',monospace;padding:2px 7px;border-radius:999px;vertical-align:middle}
+.mcard .delta.up{background:#e8f6ee;color:#15803d}.mcard .delta.down{background:#fdecec;color:#b91c1c}.mcard .delta.flat{background:#eef1f6;color:#5b6477}
+.count{position:absolute;left:0;top:0;animation:countUp 1.25s var(--ease) both,fadeOut .2s linear 1.25s forwards;counter-reset:num var(--num)}
+.count:after{content:counter(num)}
+.count-final{opacity:0;animation:fadeIn .25s linear 1.2s forwards}
+.meter{height:6px;border-radius:999px;background:#e9edf5;overflow:hidden;margin-top:9px}
+.meter>span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#0B4FA8,#6B9BD8);transform-origin:left;animation:barGrow 1s var(--ease) both}
+
+.sec-head{display:flex;align-items:center;gap:12px;margin:14px 0 8px;animation:fadeUp .5s var(--ease) both}
+.sec-head .ico{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(145deg,#0F1F3D,#1e3f86);color:#e7cf9b;font-size:1rem;box-shadow:0 6px 16px rgba(15,31,61,.22)}
+.sec-head .t{font-size:1.2rem;font-weight:780;color:var(--ink2);letter-spacing:-.01em}.sec-head .s{font-size:.88rem;color:var(--muted)}
+.live{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:999px;background:#ecfdf3;color:#166534;font-size:.78rem;font-weight:700;border:1px solid #bbf7d0}
+.live i{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:livePulse 1.8s infinite}
+
+/* Tabs → premium segmented look (role 기반 선택자: Streamlit 버전과 무관) */
+.stTabs [role="tablist"]{gap:6px;background:#eef2f9;padding:6px;border-radius:14px;border:1px solid #e1e7f1;overflow-x:auto}
+.stTabs button[role="tab"]{height:auto;padding:.5rem .95rem;border-radius:10px;font-weight:650;color:#43506a;border:0!important;transition:all .2s var(--ease);white-space:nowrap}
+.stTabs button[role="tab"]:hover{background:rgba(255,255,255,.75);color:#0F1F3D}
+.stTabs button[role="tab"][aria-selected="true"]{background:#fff!important;color:#0B4FA8!important;box-shadow:0 4px 14px rgba(15,31,61,.10)}
+.stTabs button[role="tab"] p{font-size:.95rem!important}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none!important}
+.stTabs [role="tabpanel"]{animation:fadeUp .4s var(--ease) both;padding-top:12px}
+/* Sidebar 메뉴 왼쪽 정렬 */
+[data-testid="stSidebar"] .stButton>button>div{justify-content:flex-start;width:100%}
+[data-testid="stSidebar"] .stButton>button p{text-align:left}
+
+/* Buttons: sheen sweep */
+.stButton>button,.stDownloadButton>button{position:relative;overflow:hidden;transition:transform .15s var(--ease),box-shadow .2s var(--ease)}
+.stButton>button:hover,.stDownloadButton>button:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(15,31,61,.12)}
+.stButton>button[kind="primary"],.stDownloadButton>button[kind="primary"]{background:linear-gradient(135deg,#0B4FA8,#2563eb)!important;border:0!important}
+.stButton>button[kind="primary"]:after,.stDownloadButton>button[kind="primary"]:after{content:"";position:absolute;top:0;left:0;width:35%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.35),transparent);transform:translateX(-120%)}
+.stButton>button[kind="primary"]:hover:after,.stDownloadButton>button[kind="primary"]:hover:after{animation:sheen .9s var(--ease)}
+[data-testid="stProgress"] div[role="progressbar"]>div>div{background:linear-gradient(90deg,#0B4FA8,#6B9BD8,#0B4FA8)!important;background-size:400px 100%!important;animation:shimmerBg 1.4s linear infinite}
+.fig-frame{background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:0 10px 30px rgba(15,31,61,.06);animation:fadeUp .45s var(--ease) both}
+.kpi{animation:fadeUp .6s var(--ease) both;transition:transform .25s var(--ease),box-shadow .25s var(--ease)}
+.kpi:hover{transform:translateY(-3px);box-shadow:0 14px 30px rgba(15,31,61,.09)}
+.project-card{animation:fadeUp .6s var(--ease) both}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}.count{display:none}.count-final{opacity:1}}
+@media(max-width:900px){.mcards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
 @media(max-width:900px){.landing-links{display:none}.landing-hero-content{grid-template-columns:1fr;padding:48px 34px 54px}.hero-art{display:none}.landing-actions{grid-template-columns:1fr 1fr}.summary-strip{grid-template-columns:repeat(2,1fr)}.summary-item:nth-child(2){border-right:0}.project-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:620px){.block-container{padding-top:4.65rem;padding-left:1rem;padding-right:1rem}.landing-tag{display:none}.landing-hero h1{font-size:2rem}.landing-hero-content{padding:42px 24px 48px}.landing-actions{grid-template-columns:1fr;margin-bottom:14px}.summary-strip{margin:0 0 24px}.summary-item{padding:18px 16px}.project-grid{grid-template-columns:1fr}.hero{padding:26px 23px}.hero-visual{display:none}.step-label{font-size:.68rem}}
 </style>
@@ -171,7 +247,7 @@ def landing_hero() -> None:
 def summary_strip(items: list[tuple[str, str, str]]) -> None:
     cells = ''.join(
         f'<div class="summary-item"><div class="summary-label">{html.escape(label)}</div>'
-        f'<div class="summary-value">{html.escape(value)}</div>'
+        f'<div class="summary-value" style="position:relative">{animated_value(value)}</div>'
         f'<div class="summary-hint">{html.escape(hint)}</div></div>'
         for label, value, hint in items
     )
@@ -204,11 +280,54 @@ def hero_visual() -> str:
     </div>'''
 
 
+def animated_value(value) -> str:
+    """정수 값이면 0부터 올라가는 카운트업(CSS @property, JS 없음) 후 천 단위 구분 표기로 바뀐다.
+    정수가 아니면 페이드인만 한다."""
+    text = str(value)
+    raw = text.replace(",", "").strip()
+    if raw.lstrip("-").isdigit() and len(raw) <= 9:
+        n = int(raw)
+        return (f'<span class="count" style="--to:{n}"></span>'
+                f'<span class="count-final">{html.escape(text)}</span>')
+    return f'<span class="count-final" style="animation-delay:.15s">{html.escape(text)}</span>'
+
+
 def kpi(label: str, value: str, hint: str = "") -> None:
     st.markdown(
         f'<div class="kpi"><div class="label">{html.escape(label)}</div>'
-        f'<div class="value">{html.escape(str(value))}</div><div class="hint">{html.escape(hint)}</div></div>',
+        f'<div class="value" style="position:relative">{animated_value(value)}</div>'
+        f'<div class="hint">{html.escape(hint)}</div></div>',
         unsafe_allow_html=True,
+    )
+
+
+def metric_cards(items: list[dict], cols: int | None = None) -> None:
+    """items: {label, value, hint?, tone? (good|warn|bad|gold), delta? (문자열), delta_dir? (up|down|flat), meter? (0–1)}"""
+    cells = []
+    for i, it in enumerate(items):
+        tone = it.get("tone", "")
+        delta = ""
+        if it.get("delta"):
+            delta = f'<span class="delta {it.get("delta_dir", "flat")}">{html.escape(str(it["delta"]))}</span>'
+        meter = ""
+        if it.get("meter") is not None:
+            pct = max(0.0, min(1.0, float(it["meter"]))) * 100
+            meter = f'<div class="meter"><span style="width:{pct:.1f}%"></span></div>'
+        cells.append(
+            f'<div class="mcard {tone}" style="animation-delay:{i * 0.07:.2f}s"><div class="accent"></div>'
+            f'<div class="lab">{html.escape(str(it.get("label", "")))}</div>'
+            f'<div class="val">{animated_value(it.get("value", ""))}{delta}</div>'
+            f'<div class="hint">{html.escape(str(it.get("hint", "")))}</div>{meter}</div>'
+        )
+    n = cols or min(max(len(items), 1), 4)
+    st.markdown(f'<div class="mcards" style="--cols:{n}">{"".join(cells)}</div>', unsafe_allow_html=True)
+
+
+def section_header(title: str, sub: str = "", icon: str = "◆", live: bool = False) -> None:
+    badge = '<span class="live"><i></i>LIVE</span>' if live else ""
+    st.markdown(
+        f'<div class="sec-head"><div class="ico">{html.escape(icon)}</div><div><div class="t">{html.escape(title)} {badge}</div>'
+        f'<div class="s">{html.escape(sub)}</div></div></div>', unsafe_allow_html=True,
     )
 
 

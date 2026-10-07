@@ -1,4 +1,6 @@
-# SR Studio VER 30
+# SR Studio VER 36
+
+> **V36:** 메타분석 Figure 화면을 Forest / Sensitivity / Trim-and-fill / Supplementary 탭으로 재구성하고, 논문용 V1/V2 forest 디자인과 S1–S9 Supplementary 표 생성을 추가했습니다. 스크리닝의 주제 특이적 기본 규칙을 제거하고 재현성을 강화했습니다. 자세한 내용은 `README_V36.txt`.
 
 Streamlit application for systematic-review literature management, AI-assisted title/abstract screening, human-validation quality control, and meta-analysis result visualization.
 

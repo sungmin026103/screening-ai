@@ -9,18 +9,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from dedup import deduplicate_records, screening_export
 from importers import combine_uploads
-from metaanalysis import (
-    ForestSummary, compute_effect_sizes, eggers_test, fig_to_png_bytes,
-    forest_plot_from_R, forest_plot_pro, funnel_plot_from_R, funnel_plot_pro,
-    guess_columns, pool_random_effects, run_meta_analysis, subgroup_analysis,
-    _normalize_colname,
-    leave_one_out_plot, baujat_plot, gosh_plot, trim_and_fill, trim_fill_plot, influence_plot,
-)
 from projects import (
     create_project, delete_project, list_projects, load_pico, load_records,
     rename_project, save_pico, save_records, project_progress,
@@ -30,17 +22,19 @@ from screening import (
     train_and_predict,
     build_grouped_excel_bytes,
     DEFAULT_RECALL_TARGET,
-    zero_shot_screen,
     detect_label_count,
     build_training_sample,
     merge_training_labels,
     build_validation_report_excel_bytes,
     validation_methods_text,
     TRAINING_SAMPLE_SIZE,
-    MIN_LABELS_FOR_SUPERVISED,
     MIN_INCLUDE_FOR_SUPERVISED,
     MANUAL_REVIEW_TIER,
-    GATE_RULES_DEFAULT,
+    LEGACY_NITROSAMINE_CVD_GATE_RULES,
+    parse_gate_rules_text,
+    derive_auto_gate,
+    gate_rules_to_text,
+    build_run_manifest,
     plan_validation_extension,
     build_validation_extension,
     merge_validation_extension,
@@ -160,9 +154,99 @@ def reset_project_session() -> None:
     """프로젝트 간 결과가 섞이지 않도록 프로젝트 종속 세션 상태를 초기화한다."""
     for key in PROJECT_SCOPED_STATE_KEYS:
         st.session_state.pop(key, None)
+    for key in ("gate_rules_edit", "gate_mode_sel", "gate_preset", "_auto_gate_cache", "fig_settings", "_v36_figcache", "_v36_adv", "supp_tables", "supp_xlsx",
+                "supp_docx", "wb_zip", "wb_adv", "_meta_logged"):
+        st.session_state.pop(key, None)
     st.session_state.records = pd.DataFrame()
     st.session_state.pico = {}
     st.session_state.activity_log = []
+
+
+GATE_MODES = ["자동 (PICO + Include 라벨)", "직접 입력·수정", "사용 안 함"]
+
+
+def concept_gate_panel(merged_df: pd.DataFrame, pico_sectioned: str, set_id: str) -> list[tuple[str, str]]:
+    """AI 스크리닝 ④ 단계의 개념 게이트 설정. 반환값이 train_and_predict / rule_only_screen의 gate_rules다.
+
+    기본은 '자동': PICO의 영어 핵심어 + 라벨된 Include에서 개념 블록을 만들고 jackknife로 검증한다.
+    주제별 정규식을 코드나 사람이 미리 쓸 필요가 없다. 설정은 프로젝트에 저장된다."""
+    pico_now = st.session_state.get("pico", {}) or {}
+    st.markdown('<div class="section-title" style="margin-top:14px;">개념 게이트 · 자동 제외 사전 필터</div>',
+                unsafe_allow_html=True)
+    st.caption(
+        "적격 문헌이라면 제목·초록에 P · I(E) · O를 가리키는 말이 하나 이상 나옵니다. 그 '말 묶음'을 PICO와 "
+        "Include 라벨에서 자동으로 만들고, Include를 한 편씩 빼고 다시 만들어도(jackknife) 빠진 Include가 "
+        "통과하는 블록만 씁니다. 블록이 없거나 검증을 못 넘으면 규칙 없이 모델 순위만 사용합니다."
+    )
+    saved = pico_now.get("gate_mode", GATE_MODES[0])
+    st.session_state.setdefault("gate_mode_sel", saved if saved in GATE_MODES else GATE_MODES[0])
+    mode = st.segmented_control("개념 게이트 방식", GATE_MODES, key="gate_mode_sel") or GATE_MODES[0]
+    cache = st.session_state.setdefault("_auto_gate_cache", {})
+    ckey = (set_id, len(merged_df), int(pd.to_numeric(merged_df.get("Human_Label"), errors="coerce").eq(1).sum()),
+            hash(pico_sectioned))
+    if ckey not in cache:
+        with st.spinner("PICO와 Include 라벨로 개념 블록을 만드는 중..."):
+            cache.clear()
+            cache[ckey] = derive_auto_gate(merged_df, pico_sectioned)
+    auto = cache[ckey]
+    rules: list[tuple[str, str]] = []
+    text_now = pico_now.get("gate_rules_text", "")
+    if mode == GATE_MODES[0]:
+        if not auto["blocks"].empty:
+            st.dataframe(auto["blocks"], width="stretch", hide_index=True)
+        for r_ in auto["reasons"]:
+            st.info(r_)
+        rules = auto["rules"]
+        if auto["rules_text"]:
+            st.code(auto["rules_text"], language="text")
+
+            def _to_manual():
+                st.session_state.update({"gate_rules_edit": auto["rules_text"], "gate_mode_sel": GATE_MODES[1]})
+            st.button("이 블록을 복사해 직접 수정", on_click=_to_manual, key="gate_copy_auto")
+    elif mode == GATE_MODES[1]:
+        st.session_state.setdefault("gate_rules_edit", text_now or auto["rules_text"])
+        presets = {"자동 제안 블록": auto["rules_text"],
+                   "니트로사민/HCA–심혈관 SR 규칙 (V35)": gate_rules_to_text(LEGACY_NITROSAMINE_CVD_GATE_RULES)}
+        for pr in list_projects():
+            if pr["slug"] == st.session_state.get("active_project"):
+                continue
+            try:
+                txt = load_pico(pr["slug"]).get("gate_rules_text", "")
+            except Exception:
+                txt = ""
+            if txt.strip():
+                presets[f"프로젝트: {pr['name']}"] = txt
+
+        def _load_preset():
+            choice = st.session_state.get("gate_preset")
+            if choice in presets:
+                st.session_state.update({"gate_rules_edit": presets[choice]})
+        c1, c2 = st.columns([2, 1])
+        c1.selectbox("불러오기", list(presets), key="gate_preset")
+        c2.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
+        c2.button("불러오기", on_click=_load_preset, key="gate_preset_btn", width="stretch")
+        text_now = st.text_area(
+            "개념 블록 (한 줄 = 블록, '이름: 용어1, 용어2' · 같은 줄 OR · 줄끼리 AND · '*' 절단 · 're:' 정규식)",
+            key="gate_rules_edit", height=140)
+        try:
+            rules = parse_gate_rules_text(text_now)
+            st.caption(f"인식된 블록 {len(rules)}개: " + (", ".join(n for n, _ in rules) or "없음"))
+        except ValueError as exc:
+            st.error(str(exc))
+            rules = []
+    if (pico_now.get("gate_mode") != mode or (mode == GATE_MODES[1] and pico_now.get("gate_rules_text") != text_now)) \
+            and st.session_state.get("active_project"):
+        new_p = {**pico_now, "gate_mode": mode}
+        if mode == GATE_MODES[1]:
+            new_p["gate_rules_text"] = text_now
+        save_pico(st.session_state.active_project, new_p)
+        st.session_state.pico = new_p
+    if rules:
+        st.caption("적용할 블록: " + " AND ".join(n.replace(" 없음", "") for n, _ in rules)
+                   + " — 라벨 위에서 다시 검증되어(FN = 0, Include ≥ 4편) 통과할 때만 자동 제외에 쓰입니다.")
+    else:
+        st.caption("적용할 블록이 없습니다. 자동 제외는 모델의 안전 컷오프로만 정해집니다.")
+    return rules
 
 
 def activate_project(slug: str | None) -> None:
@@ -191,49 +275,6 @@ def log_activity(icon: str, title: str, detail: str = "") -> None:
         save_project_state(st.session_state.active_project, "activity_log", st.session_state.activity_log)
 
 
-def _detect_raw_meta_columns(cols: list[str]) -> dict:
-    """실험군/대조군 Mean·SD·N 열을 접두어(예: Grip_, CSA_, Dynamic_)에 상관없이
-    토큰 단위로 자동 인식한다. 예: 'Grip_treat' / 'Grip_SD_treat' / 'Grip_N_treat' /
-    'Grip_control' / 'Grip_SD_control' / 'Grip_N_control' 처럼 성민님이 실제로 쓰시는
-    엑셀 열 이름 스타일을 그대로 인식하도록 만든 보조 함수(metaanalysis.py는 건드리지 않음)."""
-    import re
-    TREAT_WORDS = {"treat", "treatment", "experimental", "exp", "exptl"}
-    CONTROL_WORDS = {"control", "con", "ctrl", "placebo", "sham", "vehicle"}
-    SD_WORDS = {"sd", "stdev", "std"}
-    STUDY_WORDS = {"study", "studies", "author", "reference", "ref"}
-
-    def toks(c: str) -> set[str]:
-        return set(t for t in re.split(r"[^a-z0-9]+", str(c).strip().lower()) if t)
-
-    role: dict[str, str | None] = {
-        "study": None, "mean_treat": None, "sd_treat": None, "n_treat": None,
-        "mean_control": None, "sd_control": None, "n_control": None,
-    }
-    for c in cols:
-        tk = toks(c)
-        if role["study"] is None and tk & STUDY_WORDS:
-            role["study"] = c
-            continue
-        is_t, is_c = bool(tk & TREAT_WORDS), bool(tk & CONTROL_WORDS)
-        if not (is_t or is_c):
-            continue
-        is_sd, is_n = bool(tk & SD_WORDS), "n" in tk
-        if is_t:
-            if is_sd and role["sd_treat"] is None:
-                role["sd_treat"] = c
-            elif is_n and role["n_treat"] is None:
-                role["n_treat"] = c
-            elif role["mean_treat"] is None:
-                role["mean_treat"] = c
-        else:
-            if is_sd and role["sd_control"] is None:
-                role["sd_control"] = c
-            elif is_n and role["n_control"] is None:
-                role["n_control"] = c
-            elif role["mean_control"] is None:
-                role["mean_control"] = c
-    return role
-
 # ---------------------------------------------------------------------------
 # 프로젝트 허브 / 프로젝트 내부 내비게이션
 # ---------------------------------------------------------------------------
@@ -252,67 +293,6 @@ if "nav" not in st.session_state:
     st.session_state.nav = "projects"
 
 # 프로젝트를 열기 전에는 간결한 랜딩 화면과 최근 프로젝트만 표시
-
-import rmeta as _rmeta
-import zipfile as _zipfile
-
-
-def _forest_summary(fit_or_row, ci_mode: str, i2: float | None = None) -> ForestSummary:
-    """3-level 결과(Python 적합 또는 R pooled_*.csv 한 행) → ForestSummary.
-    ci_mode가 CR2이면 clubSandwich CR2/Satterthwaite CI·p, 아니면 rma.mv(test='t') CI·p."""
-    g = lambda name: float(getattr(fit_or_row, name))
-    use_cr2 = ci_mode.startswith("CR2") and np.isfinite(g("cr2_ci_lb"))
-    if use_cr2:
-        lo, hi, p, note = g("cr2_ci_lb"), g("cr2_ci_ub"), g("cr2_p"), f"CR2 (Satterthwaite df = {g('cr2_df'):.1f})"
-    else:
-        lo, hi = g("ci_lb"), g("ci_ub")
-        p = g("pval")
-        note = f"model-based t (df = {int(g('k')) - 1})"
-    return ForestSummary(
-        g=g("mu"), ci_lb=lo, ci_ub=hi, tau2=g("tau2_L2") + g("tau2_L3"), k=int(g("k")), p_value=p,
-        pi_lb=g("pi_lb"), pi_ub=g("pi_ub"), i2=i2, tau2_L2=g("tau2_L2"), tau2_L3=g("tau2_L3"), ci_note=note,
-    )
-
-
-def _r_style_from_effects(eff: pd.DataFrame, ci_mode: str):
-    """01_stat_analysis.R와 같은 순서로 계산한다.
-    effect 단위 3-level REML(+CR2) → forest 요약 / study 단위 CS 집계(rho=0.6) → REML+knha 진단."""
-    fit = _rmeta.fit_three_level(eff["yi"], eff["vi"], eff["study"])
-    summary = _forest_summary(fit, ci_mode, i2=fit.i2)
-    study_df = _rmeta.aggregate_cs(eff[["study", "yi", "vi"]])
-    return summary, fit.weights, study_df
-
-
-def _read_r_outputs_zip(uploaded) -> dict[str, dict[str, pd.DataFrame]]:
-    """r_outputs 폴더(또는 프로젝트 전체)를 압축한 zip에서 outcome별 CSV를 읽는다."""
-    want = ("effects", "pooled", "vardecomp", "study_level", "egger", "trimfill")
-    out: dict[str, dict[str, pd.DataFrame]] = {}
-    with _zipfile.ZipFile(uploaded) as zf:
-        for name in zf.namelist():
-            base = Path(name).name
-            if not base.endswith(".csv"):
-                continue
-            stem = base[:-4]
-            for kind in want:
-                if stem.startswith(kind + "_"):
-                    outcome = stem[len(kind) + 1:]
-                    if kind == "study_level" and outcome.startswith("hksj_"):
-                        continue
-                    with zf.open(name) as fh:
-                        out.setdefault(outcome, {})[kind] = pd.read_csv(fh)
-                    break
-    return {o: d for o, d in out.items() if {"effects", "pooled"}.issubset(d)}
-
-
-@st.cache_data(show_spinner=False)
-def _analyze_workbook(file_bytes: bytes, ci_mode: str):
-    import extraction as _ex
-    import auto_figures as _af
-    outs, qc = _ex.read_extraction_workbook(io.BytesIO(file_bytes))
-    results = [_af.analyze_outcome(d, o, ci_mode) for o, d in outs.items() if d["Study"].nunique() >= 2]
-    return results, qc
-
-
 
 if not st.session_state.active_project:
     landing_nav()
@@ -339,9 +319,9 @@ if not st.session_state.active_project:
     st.markdown('<div class="landing-actions-anchor"></div>', unsafe_allow_html=True)
     b1, b2, spacer = st.columns([1.0, 1.0, 4.8], gap="small")
     with b1:
-        create_clicked = st.button("＋ 새 프로젝트", type="primary", use_container_width=True, key="landing_new")
+        create_clicked = st.button("＋ 새 프로젝트", type="primary", width="stretch", key="landing_new")
     with b2:
-        open_clicked = st.button("▣ 프로젝트 열기", use_container_width=True, key="landing_open")
+        open_clicked = st.button("▣ 프로젝트 열기", width="stretch", key="landing_open")
 
     if create_clicked:
         st.session_state["show_new_project"] = True
@@ -362,7 +342,7 @@ if not st.session_state.active_project:
             with n1:
                 new_name = st.text_input("프로젝트 이름", placeholder="예: Space Nutrition Review", key="hub_new_name", label_visibility="collapsed")
             with n2:
-                if st.button("만들기", type="primary", use_container_width=True, key="hub_create"):
+                if st.button("만들기", type="primary", width="stretch", key="hub_create"):
                     try:
                         created = create_project(new_name)
                         activate_project(created["slug"])
@@ -378,7 +358,7 @@ if not st.session_state.active_project:
                 with o1:
                     choice = st.selectbox("저장된 프로젝트", projects, format_func=lambda x: x["name"], key="hub_open_select", label_visibility="collapsed")
                 with o2:
-                    if st.button("열기", use_container_width=True, key="hub_open"):
+                    if st.button("열기", width="stretch", key="hub_open"):
                         activate_project(choice["slug"])
                         st.rerun()
             else:
@@ -403,7 +383,7 @@ if not st.session_state.active_project:
                     f'<div class="progress-shell"><div class="progress-fill" style="width:{prog["percent"]}%"></div></div></div>',
                     unsafe_allow_html=True,
                 )
-                if st.button("열기", key=f"recent_{project['slug']}", use_container_width=True):
+                if st.button("열기", key=f"recent_{project['slug']}", width="stretch"):
                     activate_project(project["slug"])
                     st.rerun()
     else:
@@ -418,13 +398,13 @@ with st.sidebar:
     projects = list_projects()
     active_meta = next((p for p in projects if p["slug"] == st.session_state.active_project), None)
     st.caption(active_meta["name"] if active_meta else "프로젝트")
-    if st.button("← 프로젝트 목록", use_container_width=True, key="back_projects"):
+    if st.button("← 프로젝트 목록", width="stretch", key="back_projects"):
         activate_project(None)
         st.rerun()
     st.divider()
     for key, label in NAV_ITEMS:
         is_active = st.session_state.nav == key
-        if st.button(label, key=f"nav_{key}", use_container_width=True,
+        if st.button(label, key=f"nav_{key}", width="stretch",
                      type="primary" if is_active else "secondary"):
             st.session_state.nav = key
             st.rerun()
@@ -433,7 +413,7 @@ with st.sidebar:
     if active_meta:
         with st.expander("프로젝트 관리"):
             renamed = st.text_input("프로젝트 이름", value=active_meta["name"], key=f"rename_{active_meta['slug']}")
-            if st.button("이름 변경", use_container_width=True, key=f"rename_btn_{active_meta['slug']}"):
+            if st.button("이름 변경", width="stretch", key=f"rename_btn_{active_meta['slug']}"):
                 try:
                     updated = rename_project(active_meta["slug"], renamed)
                     activate_project(updated["slug"])
@@ -441,7 +421,7 @@ with st.sidebar:
                 except Exception as exc:
                     st.error(str(exc))
             confirm_delete = st.checkbox("프로젝트와 저장 데이터를 삭제합니다.", key=f"delete_confirm_{active_meta['slug']}")
-            if st.button("프로젝트 삭제", use_container_width=True, disabled=not confirm_delete,
+            if st.button("프로젝트 삭제", width="stretch", disabled=not confirm_delete,
                          key=f"delete_btn_{active_meta['slug']}"):
                 try:
                     delete_project(active_meta["slug"])
@@ -544,7 +524,7 @@ if nav == "dashboard":
         st.markdown('<div class="section-title" style="margin-top:20px;">다음 작업</div>', unsafe_allow_html=True)
         actions = [("import", "문헌 가져오기"), ("pico", "PICO 설정"), ("screen", "AI 스크리닝"), ("meta", "메타분석 Figure")]
         for target, label in actions:
-            if st.button(label, key=f"dash_action_{target}", use_container_width=True):
+            if st.button(label, key=f"dash_action_{target}", width="stretch"):
                 st.session_state.nav = target
                 st.rerun()
 
@@ -565,7 +545,7 @@ elif nav == "import":
         '중복을 판정합니다. 같은 문헌이 여럿이면 초록이 더 풍부한 쪽을 남기고, 연도 오름차순(오래된 → 최신)으로 정렬합니다.</div>',
         unsafe_allow_html=True,
     )
-    if uploaded and st.button("업로드 및 중복 제거 실행", type="primary", use_container_width=True):
+    if uploaded and st.button("업로드 및 중복 제거 실행", type="primary", width="stretch"):
         # 처리 중 화면이 멈춘 것처럼 보이지 않도록 단계별 상태와 진행률을 표시한다.
         status_box = st.status("문헌 파일을 읽는 중입니다...", expanded=True)
         progress = st.progress(0, text="업로드 파일 확인 중")
@@ -649,14 +629,14 @@ elif nav == "import":
                 fig.update_layout(title=dict(text="중복 제거 구성", y=0.97), margin=dict(l=10, r=10, t=55, b=60), height=320,
                                    legend=dict(orientation="h", yanchor="bottom", y=-0.2))
                 fig.update_traces(textinfo="value+percent")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
         with row2:
             years = records[records["year"].astype(str).str.match(r"^\d{4}$")].groupby("year").size().reset_index(name="문헌 수")
             if not years.empty:
                 fig_y = px.bar(years, x="year", y="문헌 수", color_discrete_sequence=["#3A4E86"])
                 fig_y.update_layout(title=dict(text="최종 문헌 연도 분포", y=0.97), margin=dict(l=10, r=10, t=55, b=45), height=320,
                                     xaxis_title="연도")
-                st.plotly_chart(fig_y, use_container_width=True)
+                st.plotly_chart(fig_y, width="stretch")
 
         st.markdown('<div class="section-title">중복 제거된 문헌 다운로드 (연도 오름차순)</div>'
                     '<div class="section-sub">용도에 맞는 파일을 바로 받아 다음 단계에 쓰세요.</div>', unsafe_allow_html=True)
@@ -672,22 +652,22 @@ elif nav == "import":
             st.caption("순번, 연도, 제목")
             st.download_button("다운로드 (Title_Only.xlsx)", dataframe_to_excel_bytes(title_only),
                                "Title_Only.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
+                               width="stretch")
         with d2:
             st.markdown("**② 제목 + 초록**")
             st.caption("순번, 연도, 제목, 초록")
             st.download_button("다운로드 (Title_Abstract.xlsx)", dataframe_to_excel_bytes(with_abstract),
                                "Title_Abstract.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
+                               width="stretch")
         with d3:
             st.markdown("**③ AI 스크리닝용**")
             st.caption("+ Human_Label 열 (일부만 1/0 또는 O/X로 채워서 「🤖 AI 스크리닝」에 그대로 업로드)")
             st.download_button("다운로드 (AI_Screening_Template.xlsx)", dataframe_to_excel_bytes(ai_template),
                                "AI_Screening_Template.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               type="primary", use_container_width=True)
+                               type="primary", width="stretch")
 
         st.markdown('<div class="section-title" style="margin-top:18px;">문헌 목록 미리보기</div>', unsafe_allow_html=True)
-        st.dataframe(with_abstract.head(100), use_container_width=True, height=380)
+        st.dataframe(with_abstract.head(100), width="stretch", height=380)
 
 # ===========================================================================
 # 3. PICO 설정
@@ -708,8 +688,14 @@ elif nav == "pico":
             "배제기준 (한 줄에 하나씩)", value=pico.get("exclusion_criteria", ""), height=110,
             placeholder="세포 단독 연구\n동물 실험 없음\n리뷰·프로토콜\n원저가 아님",
         )
-        if st.button("PICO 저장", type="primary", use_container_width=True):
+        st.caption(
+            "AI 스크리닝의 자동 제외 필터(개념 블록)는 P·I(E)·O에 적힌 **영어 핵심어**로 자동으로 만들어집니다. "
+            "한국어와 함께 영어 용어도 적어 주세요(예: 'P: 비만 동물 모델 (obese rats, mice)'). "
+            "만들어진 블록은 「AI 스크리닝」 ④ 단계에서 확인·수정할 수 있습니다."
+        )
+        if st.button("PICO 저장", type="primary", width="stretch"):
             new_pico = {
+                **pico,
                 "population": population, "intervention": intervention,
                 "comparator": comparator, "outcome": outcome, "exclusion_criteria": exclusion_criteria,
             }
@@ -724,7 +710,7 @@ elif nav == "pico":
                 "내용": [pico.get("population", ""), pico.get("intervention", ""), pico.get("comparator", ""),
                          pico.get("outcome", ""), pico.get("exclusion_criteria", "")],
             })
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.dataframe(summary, width="stretch", hide_index=True)
 
 # ===========================================================================
 # 4. AI 스크리닝
@@ -765,7 +751,7 @@ elif nav == "screen":
                     pico.get("exclusion_criteria", ""),
                 ],
             })
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.dataframe(summary, width="stretch", hide_index=True)
     else:
         st.warning("PICO가 비어 있습니다. 먼저 「PICO 설정」에서 연구 기준을 입력해 주세요.")
 
@@ -790,7 +776,7 @@ elif nav == "screen":
         a3.metric("Validation 목표", f"{min(TRAINING_SAMPLE_SIZE, len(df)):,}편")
 
         with st.expander("업로드 파일 미리보기", expanded=False):
-            st.dataframe(df.head(20), use_container_width=True)
+            st.dataframe(df.head(20), width="stretch")
 
         if not criteria_text:
             st.warning("Human validation 200편을 선정하려면 PICO/PECO를 먼저 저장해 주세요.")
@@ -806,7 +792,7 @@ elif nav == "screen":
                 "표본 상단에 모여 같은 노동으로 Include를 더 확보합니다. "
                 "적격 기준(PECO)을 바꾸는 것이 아니라 '먼저 읽을 순서'만 바꾸며, 층별 가중치는 그대로 적용됩니다."
             )
-            if st.button("② AI가 Human validation 200편 선정", type="primary", use_container_width=True):
+            if st.button("② AI가 Human validation 200편 선정", type="primary", width="stretch"):
                 try:
                     with st.spinner("PICO/PECO 적합도를 이용해 High/Mid/Low 층화 validation 표본을 만드는 중입니다..."):
                         training_sample = build_training_sample(
@@ -843,7 +829,7 @@ elif nav == "screen":
                     "AI_Human_Validation_200.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
                 labeled_file = st.file_uploader(
@@ -882,21 +868,22 @@ elif nav == "screen":
                         if not enough_classes:
                             st.error("O와 X가 각각 최소 4편 이상 필요합니다. 현재 표본만으로는 교차검증 모델을 만들 수 없습니다.")
 
+                        _gate_rules = concept_gate_panel(
+                            merged_df, pico_sectioned_text, str(label_stats.get("validation_set_id", "")))
                         st.caption(
-                            "적격 문헌이 10편 미만이면 지도학습 모델은 만들 수 없거나 만들어도 불안정합니다. "
-                            "그럴 때는 아래 '규칙 기반 선별'을 쓰세요. 확률 모델 없이 규칙만으로 제외하므로 "
-                            "실행마다 결과가 완전히 동일하고, 200편 라벨은 '규칙이 적격 문헌을 떨어뜨리지 "
-                            "않는가'를 확인하는 데 쓰입니다."
+                            "적격 문헌이 10편 미만이면 지도학습 모델이 불안정합니다. 그럴 때는 ④-B 규칙 기반 선별을 쓰세요 — "
+                            "위 개념 블록만으로 제외하므로 실행마다 결과가 같고, 200편 라벨은 블록이 적격 문헌을 "
+                            "떨어뜨리지 않는지 확인하는 데 쓰입니다."
                         )
                         if st.button(
                             "④-B 규칙 기반으로 바로 선별 (모델 없음 · 결과 고정)",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             try:
                                 with st.spinner("규칙 게이트로 전체 문헌을 선별하는 중입니다..."):
                                     rres = rule_only_screen(
                                         merged_df, criteria_text,
-                                        pico.get("exclusion_criteria", ""), gate_rules=None)
+                                        pico.get("exclusion_criteria", ""), gate_rules=_gate_rules)
                                 st.session_state["screening_result"] = rres
                                 st.session_state.pop("zero_shot_result", None)
                                 save_project_state(active, "screening_result", rres)
@@ -913,7 +900,7 @@ elif nav == "screen":
                         if st.button(
                             "④ 200편으로 AI 학습·교차검증·전체 선별",
                             type="primary",
-                            use_container_width=True,
+                            width="stretch",
                             disabled=not enough_classes,
                         ):
                             with st.spinner("200편의 사람 판정을 이용해 OOF 교차검증과 전체 문헌 선별을 계산하는 중입니다..."):
@@ -921,7 +908,7 @@ elif nav == "screen":
                                     merged_df,
                                     recall_target=DEFAULT_RECALL_TARGET,
                                     criteria_text=criteria_text,
-                                    gate_rules=None,  # None이면 GATE_RULES_DEFAULT를 사용한다.
+                                    gate_rules=_gate_rules,  # V36: 개념 게이트(자동/직접/없음)
                                     validation_expected_n=len(training_sample),
                                 )
                             result.metrics["training_design"] = "fixed_200_pico_enriched_stratified_validation"
@@ -952,7 +939,7 @@ elif nav == "screen":
                             bn = st.selectbox("추가로 라벨링할 편수", [200, 300, 400, 600],
                                               index=1, key="boot_ext_n")
                             if st.button("추가 validation 표본 뽑기 (PICO 유사도 기준)",
-                                         use_container_width=True, key="btn_boot_ext"):
+                                         width="stretch", key="btn_boot_ext"):
                                 try:
                                     bp = bootstrap_extension_probabilities(
                                         df, criteria_text, pico.get("exclusion_criteria", ""))
@@ -971,7 +958,7 @@ elif nav == "screen":
                                     dataframe_to_excel_bytes(bext),
                                     "AI_Human_Validation_Extension.xlsx",
                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    type="primary", use_container_width=True,
+                                    type="primary", width="stretch",
                                 )
                                 st.caption(
                                     "판정을 끝낸 뒤, 기존 200편 라벨 파일과 이 파일을 합쳐 "
@@ -1005,6 +992,13 @@ elif nav == "screen":
                 f"AI 순위는 참고할 수 있지만 전체 문헌을 사람이 확인해야 합니다. {detail}"
             )
 
+        st.download_button(
+            "재현성 기록 다운로드 (run manifest · JSON)",
+            build_run_manifest(result, criteria_text, pico.get("exclusion_criteria", ""),
+                               gm.get("gate_rules_input"), st.session_state.get("screen_corpus_df")),
+            f"SR_Studio_run_manifest_{str(gm.get('run_fingerprint', ''))[:8]}.json", "application/json",
+            width="stretch", key="dl_manifest",
+        )
         r1, r2, r3, r4 = st.columns(4)
         r1.metric("사람이 확인할 문헌", f"{review_n:,}편")
         r2.metric("자동 제외 적용", f"{operational_safe_n:,}편")
@@ -1012,7 +1006,8 @@ elif nav == "screen":
         r4.metric("실제 검토 부담 감소", f"{reduction_rate:.1f}%")
         st.caption(
             "필수 human screening은 처음 선정된 validation 표본 200편입니다. 그 200편으로 학습·OOF 검증·품질판정을 수행하며, "
-            "PASS이면 안전 제외 후보를 자동 제외에 사용합니다. 별도의 추가 감사 표본은 필수가 아닙니다."
+            "PASS이면 안전 제외 후보를 자동 제외에 사용합니다. 단, 이 200편은 컷오프·규칙을 정한 개발 집합이므로 "
+            "논문에는 아래 「자동 제외 검증」의 독립 무작위 감사 상한을 함께 보고하세요."
         )
         st.caption(
             "주의: PASS는 해당 200편 내부 human-validation과 OOF 예측에 근거한 운영상 품질 기준이며, "
@@ -1052,7 +1047,7 @@ elif nav == "screen":
                     "세션이 새로 시작되면 코퍼스가 메모리에 없습니다."
                 )
 
-            if ext_ready and st.button("① 추가 표본 배분 계획 보기", use_container_width=True, key="btn_ext_plan"):
+            if ext_ready and st.button("① 추가 표본 배분 계획 보기", width="stretch", key="btn_ext_plan"):
                 try:
                     plan = plan_validation_extension(
                         corpus_df, labeled_val, probs_corpus, pico_sectioned_text,
@@ -1065,14 +1060,14 @@ elif nav == "screen":
             if isinstance(plan, pd.DataFrame) and not plan.empty:
                 show = plan[plan["allocate"] > 0][
                     ["Cell", "N_corpus", "n_labeled", "include_labeled", "prevalence_est", "allocate", "expected_new_includes"]]
-                st.dataframe(show, use_container_width=True, hide_index=True)
+                st.dataframe(show, width="stretch", hide_index=True)
                 exp_inc = float(plan["expected_new_includes"].sum())
                 st.caption(
                     f"{int(ext_n)}편을 추가로 읽으면 Include가 약 {exp_inc:.1f}편 늘어날 것으로 추정됩니다 "
                     f"(현재 {include_n_now}편 → 약 {include_n_now + exp_inc:.0f}편). "
                     "자동 제외를 열려면 Include 10편 이상이 필요합니다."
                 )
-                if st.button("② 추가 표본 뽑기", use_container_width=True, key="btn_ext_build"):
+                if st.button("② 추가 표본 뽑기", width="stretch", key="btn_ext_build"):
                     try:
                         ext = build_validation_extension(
                             corpus_df, labeled_val, probs_corpus, pico_sectioned_text,
@@ -1090,7 +1085,7 @@ elif nav == "screen":
                     dataframe_to_excel_bytes(ext_sample),
                     "AI_Human_Validation_Extension.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary", use_container_width=True,
+                    type="primary", width="stretch",
                 )
                 ext_file = st.file_uploader(
                     "④ 판정을 완료한 AI_Human_Validation_Extension.xlsx 업로드",
@@ -1120,7 +1115,10 @@ elif nav == "screen":
         if auto_enabled and safe_candidate_n > 0:
             st.markdown('<div class="section-title" style="margin-top:18px;">자동 제외 검증 (동료심사 대응)</div>', unsafe_allow_html=True)
             try:
-                strata = audit_risk_strata(result.predictions)
+                _rules_a = gm.get("gate_rules_input") or []
+                _expo_r = [r_ for r_ in _rules_a if "I/E" in r_[0] or "노출" in r_[0]] or _rules_a
+                _expo = _expo_r[0][1] if _expo_r else ""
+                strata = audit_risk_strata(result.predictions, exposure_pattern=_expo)
                 opts = audit_size_options(strata)
                 cur = float(strata["최대_누락_추정"].sum())
                 inc_est = float(pd.to_numeric(
@@ -1136,20 +1134,22 @@ elif nav == "screen":
                     "Recall 100%는 '라벨한 표본 안에서' 참일 뿐입니다. 심사자가 묻는 것은 읽지 않은 자동 제외 문헌이며, "
                     "그 답은 위 상한입니다. 상한이 추정 전체 적격 문헌 수에 비해 크면 아직 근거가 부족합니다."
                 )
-                st.dataframe(strata, use_container_width=True, hide_index=True)
+                st.dataframe(strata, width="stretch", hide_index=True)
                 st.caption(
+                    "V36: 읽은_편수에는 독립 감사 라벨만 들어갑니다(규칙·컷오프를 고르는 데 쓴 validation 라벨은 '개발라벨' 열에 참고로만). "
+                    "감사 전에는 상한이 셀 크기와 같게 나오는 것이 정상입니다. "
                     "노출어가 **없어서** 제외된 셀은 논리적 근거가 있습니다 — PECO상 노출이 필수이므로 제목·초록에 "
                     "노출어가 없으면 적격 판정 자체가 불가능합니다. 근거가 필요한 쪽은 **노출어는 있는데 결과어가 없어 "
                     "제외된 셀**이고, 여기가 감사 대상입니다."
                 )
                 st.markdown("**목표 상한별 추가 감사 분량**")
-                st.dataframe(opts, use_container_width=True, hide_index=True)
+                st.dataframe(opts, width="stretch", hide_index=True)
 
                 tgt = st.selectbox("목표 누락 상한(편)", [100, 50, 25, 10], index=2, key="audit_target")
-                if st.button("① 감사 표본 뽑기", use_container_width=True, key="btn_audit_build"):
+                if st.button("① 감사 표본 뽑기", width="stretch", key="btn_audit_build"):
                     try:
                         sizes = recommend_audit_sizes(strata, target_max_missed=float(tgt))
-                        sample = build_risk_audit_sample(result.predictions, sizes)
+                        sample = build_risk_audit_sample(result.predictions, sizes, exposure_pattern=_expo)
                         st.session_state["audit_sample_df"] = sample
                         save_project_state(active, "audit_sample_df", sample)
                         st.success(f"{len(sample)}편을 뽑았습니다. Audit_Label 열에 O 또는 X를 입력하세요.")
@@ -1163,7 +1163,7 @@ elif nav == "screen":
                         dataframe_to_excel_bytes(a_sample),
                         "AI_AutoExclude_Audit.xlsx",
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary", use_container_width=True,
+                        type="primary", width="stretch",
                     )
                     st.caption("적격 **가능성이 있으면 O**, 확실히 제외면 X. 애매하면 O로 두세요 — 누락을 찾는 것이 목적입니다.")
                     a_file = st.file_uploader("③ 판정 완료한 AI_AutoExclude_Audit.xlsx 업로드",
@@ -1171,9 +1171,9 @@ elif nav == "screen":
                     if a_file:
                         try:
                             a_df, _sh = _read_screening_upload(a_file)
-                            after = audit_risk_strata(result.predictions, audit_labels=a_df)
+                            after = audit_risk_strata(result.predictions, exposure_pattern=_expo, audit_labels=a_df)
                             summ = summarize_audit(after, total_include_est=inc_est)
-                            st.dataframe(after, use_container_width=True, hide_index=True)
+                            st.dataframe(after, width="stretch", hide_index=True)
                             if summ["found_include"] == 0:
                                 st.success(
                                     f"감사 {summ['audited_n']:,}편에서 적격 후보가 나오지 않았습니다. "
@@ -1196,13 +1196,13 @@ elif nav == "screen":
                     "한 줄에 하나씩 넣으세요. 통계적 상한보다 심사자 설득력이 큰 증거입니다."
                 )
                 known_text = st.text_area("알려진 적격 문헌 제목", height=140, key="known_items")
-                if st.button("복구 검사 실행", use_container_width=True, key="btn_known"):
+                if st.button("복구 검사 실행", width="stretch", key="btn_known"):
                     titles = [t.strip() for t in str(known_text).splitlines() if t.strip()]
                     if not titles:
                         st.warning("제목을 한 줄에 하나씩 입력해 주세요.")
                     else:
                         tbl, ks = known_item_recovery(result.predictions, titles)
-                        st.dataframe(tbl, use_container_width=True, hide_index=True)
+                        st.dataframe(tbl, width="stretch", hide_index=True)
                         if ks["passed"]:
                             st.success(
                                 f"{ks['n_known']}편 중 {ks['n_found_in_corpus']}편을 코퍼스에서 찾았고, "
@@ -1267,7 +1267,7 @@ elif nav == "screen":
                 # 적격을 한 편도 못 찾았으면 '보존율'이 아니라 '누락 상한'으로 적어야 한다.
                 audit_arg = {"n_read": int(au_tot), "n_found": int(au_found),
                              "pool_n": int(gm.get("auto_excluded_n", 0))}
-            if st.button("Figure 생성", use_container_width=True, key="btn_rule_fig"):
+            if st.button("Figure 생성", width="stretch", key="btn_rule_fig"):
                 try:
                     st.session_state["rule_fig"] = build_rule_performance_figure(
                         result, rsets, audit=audit_arg)
@@ -1285,12 +1285,12 @@ elif nav == "screen":
                          "Figure_B_Safety",
                          "Figure_C_Workload"]):
                     with tab:
-                        st.image(figs[prefix + "png"], use_container_width=True)
+                        st.image(figs[prefix + "png"], width="stretch")
                         cols = st.columns(4)
                         for col, fmt in zip(cols, ["pdf", "svg", "png", "tiff"]):
                             col.download_button(fmt.upper(), figs[prefix + fmt],
                                                 f"{fname}.{fmt}", mimes[fmt],
-                                                use_container_width=True,
+                                                width="stretch",
                                                 key=f"dl_{prefix}{fmt}")
                 st.caption("PDF/SVG는 벡터, PNG/TIFF는 600 dpi(TIFF는 LZW 압축)입니다. "
                            "주석은 모두 축 바깥에 배치되어 데이터와 겹치지 않습니다.")
@@ -1301,7 +1301,7 @@ elif nav == "screen":
             "AI_Human_Validation_QC_Report.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
         if gm.get("gate_active"):
@@ -1346,7 +1346,7 @@ elif nav == "screen":
                             "아래 표의 '재확인_권고' 문헌부터 기준을 다시 적용해 보세요. "
                             "모델 성능(ROC-AUC, F1)은 이 문제가 해결되기 전에는 의미가 없습니다."
                         )
-                    st.dataframe(lc_tbl, use_container_width=True, hide_index=True)
+                    st.dataframe(lc_tbl, width="stretch", hide_index=True)
             except Exception:
                 pass
 
@@ -1394,7 +1394,7 @@ elif nav == "screen":
             if len(safe_err_df):
                 st.markdown("**자동 제외 영역에서 발견된 human Include**")
                 cols = [c for c in ["Title", "Abstract", "Training_Stratum", "Sampling_Weight", "CV_Probability", "AI_Probability", "Gate_Fail_Reason"] if c in safe_err_df.columns]
-                st.dataframe(safe_err_df[cols], use_container_width=True, hide_index=True)
+                st.dataframe(safe_err_df[cols], width="stretch", hide_index=True)
                 st.error("이 문헌이 존재하므로 자동 제외 품질 게이트는 PASS가 될 수 없습니다.")
 
             st.markdown("**논문 Methods용 자동 생성 문구**")
@@ -1411,18 +1411,18 @@ elif nav == "screen":
             for fname, title in figure_order:
                 if fname in perf_figs:
                     st.markdown(f"**{title}**")
-                    st.image(perf_figs[fname], use_container_width=False, width=620)
+                    st.image(perf_figs[fname], width=620)
                     st.download_button(
                         f"{title} PNG 다운로드",
                         perf_figs[fname], fname, "image/png",
-                        key=f"download_{fname}", use_container_width=True,
+                        key=f"download_{fname}", width="stretch",
                     )
             if perf_figs:
                 st.download_button(
                     "성능 Figure 4개 ZIP 다운로드",
                     _zip_bytes(perf_figs),
                     "AI_Screening_Performance_Figures.zip", "application/zip",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         counts = result.predictions["AI_Recommendation"].value_counts()
@@ -1460,7 +1460,7 @@ elif nav == "screen":
             )
         st.dataframe(
             result.predictions.head(1000).style.apply(_shade_priority, axis=1),
-            use_container_width=True,
+            width="stretch",
             height=540,
         )
         st.download_button(
@@ -1469,7 +1469,7 @@ elif nav == "screen":
             "AI_Screening_Ranked.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
         if auto_enabled:
@@ -1485,7 +1485,7 @@ elif nav == "screen":
                 result.predictions, st.session_state.get("screen_corpus_df")),
             "AI_Screening_OriginalOrder.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
         st.caption(
             "업로드한 파일의 행 순서를 그대로 두고 판정 열과 행 색만 입힌 버전입니다. "
@@ -1501,7 +1501,7 @@ elif nav == "screen":
                 "AI_Human_Review_Required.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
         with d2:
             safe_label = "자동 제외 문헌 다운로드" if auto_enabled else "안전 제외 후보(참고용) 다운로드"
@@ -1512,12 +1512,13 @@ elif nav == "screen":
                 safe_name,
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 disabled=(len(safe_df) == 0),
-                use_container_width=True,
+                width="stretch",
             )
 
         if auto_enabled:
             st.info(
-                "필수 검증은 여기까지입니다. 추가 무작위 audit 없이 Human validation 200편의 품질 게이트 결과를 기준으로 진행하도록 설계했습니다."
+                "자동 제외를 논문에 쓰려면 「자동 제외 검증」에서 자동 제외 문헌 중 무작위 감사 표본을 읽고 "
+                "누락 상한(95%)을 보고하세요. 내부 validation만으로는 독립 성능을 주장할 수 없습니다."
             )
         else:
             st.warning(
@@ -1535,7 +1536,7 @@ elif nav == "pdf_analysis":
         "PDF 업로드", type=["pdf"], accept_multiple_files=True, key="pdf_stage1_upload"
     )
     run_pdf = st.button(
-        "PDF 기본정보 추출", type="primary", use_container_width=True,
+        "PDF 기본정보 추출", type="primary", width="stretch",
         disabled=not pdf_files, key="run_pdf_stage1"
     )
     if run_pdf and pdf_files:
@@ -1598,7 +1599,7 @@ elif nav == "pdf_analysis":
                                     with st.popover("원문 근거"):
                                         st.write(evidence)
                     st.markdown('<hr style="margin:10px 0;border-color:#eef0f6;">', unsafe_allow_html=True)
-                if st.button("수정 내용 저장", key=f"save_pdf_edit_{doc_idx}", use_container_width=True):
+                if st.button("수정 내용 저장", key=f"save_pdf_edit_{doc_idx}", width="stretch"):
                     for key, value in edited_values.items():
                         result_doc.setdefault("fields", {}).setdefault(key, {})["value"] = value
                     st.session_state["pdf_extractions"] = pdf_results
@@ -1613,9 +1614,9 @@ elif nav == "pdf_analysis":
                 dataframe_to_excel_bytes(combined_extract),
                 "PDF_Study_Characteristics.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary", use_container_width=True,
+                type="primary", width="stretch",
             )
-        if st.button("PDF 분석 결과 초기화", use_container_width=True):
+        if st.button("PDF 분석 결과 초기화", width="stretch"):
             st.session_state.pop("pdf_extractions", None)
             if active:
                 save_project_state(active, "pdf_extractions", [])
@@ -1653,284 +1654,20 @@ elif nav == "analytics":
         if not years.empty:
             fig = px.bar(years, x="year", y="문헌 수", color_discrete_sequence=["#3A4E86"])
             fig.update_layout(title=dict(text="발행 연도별 분포 (오래된 순)", y=0.96), height=380, margin=dict(l=10, r=10, t=55, b=45), xaxis_title="연도")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         sources = records.groupby("source").size().sort_values(ascending=False).head(20).reset_index(name="문헌 수")
         fig2 = px.bar(sources, x="문헌 수", y="source", orientation="h", color_discrete_sequence=["#FFCE45"])
         fig2.update_layout(title=dict(text="출처별 상위 20건", y=0.97), height=440, margin=dict(l=10, r=10, t=55, b=45),
                            yaxis={"categoryorder": "total ascending"}, yaxis_title="")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
 # ===========================================================================
-# 6. 메타분석 (R 결과 CSV 그대로 시각화 + 보조 미리보기 모드)
+# 6. 메타분석 Figure (V36: meta_page.py — Forest / Sensitivity / Trim-and-fill / Supplementary)
 # ===========================================================================
 elif nav == "meta":
-    hero(
-        "메타분석 시각화",
-        "R에서 계산한 연구별 효과크기와 통계 결과를 불러와 Forest/Funnel plot을 Python으로 정리합니다. "
-        "논문 최종 통계는 R 결과를 기준으로 하고, 이 탭은 Figure 확인과 시각적 다듬기에 사용하세요.",
-        eyebrow="메타분석",
-    )
-    meta_file = st.file_uploader("데이터 추출 엑셀 (outcome별 시트) / R r_outputs zip / CSV", type=["zip", "xlsx", "xls", "csv"], key="meta_upload_unified")
-    ci_mode = st.radio(
-        "Pooled 95% CI", ["CR2 (Satterthwaite)", "모델 기반 (rma.mv, t)"], horizontal=True, key="meta_ci_mode",
-        help="R 파이프라인의 주 추론은 CR2입니다. 02a_make_forest_only.py는 모델 기반 CI를 그리므로, 본문 수치와 같은 쪽을 고르세요.",
-    )
-
-    result_ready = False
-    if meta_file and Path(meta_file.name).suffix.lower() == ".zip":
-        # ---- R 결과 그대로: effects_/pooled_/vardecomp_/study_level_/egger_ CSV ----
-        r_sets = _read_r_outputs_zip(meta_file)
-        if not r_sets:
-            st.error("zip 안에서 effects_<outcome>.csv와 pooled_<outcome>.csv 쌍을 찾지 못했습니다.")
-            st.stop()
-        outcome = st.selectbox("Outcome", sorted(r_sets), key="meta_r_outcome")
-        rs = r_sets[outcome]
-        e = rs["effects"]
-        eff = pd.DataFrame({"study": e["Study"].astype(str), "yi": e["g"].astype(float), "vi": e["vi"].astype(float)})
-        prow = rs["pooled"].iloc[0]
-        i2_r = (100 * (1 - float(rs["vardecomp"].iloc[0]["prop_sampling"]))) if "vardecomp" in rs else None
-        summary = _forest_summary(prow, ci_mode, i2=i2_r)
-        fit_w = _rmeta.fit_three_level(eff["yi"], eff["vi"], eff["study"]).weights
-        sub = eff.copy()
-        sub["ci_lo"], sub["ci_hi"] = e["ci_lb"].astype(float), e["ci_ub"].astype(float)
-        sub["weight_pct"] = fit_w
-        for src, dst in [("Mean_treat", "mean_treat"), ("SD_treat", "sd_treat"), ("N_treat", "n_treat"),
-                         ("Mean_control", "mean_control"), ("SD_control", "sd_control"), ("N_control", "n_control")]:
-            if src in e.columns:
-                sub[dst] = e[src]
-        if "study_level" in rs:
-            study_df = rs["study_level"].rename(columns={"Study": "study"})[["study", "yi", "vi"]].copy()
-        else:
-            study_df = _rmeta.aggregate_cs(eff)
-        study_df["se"] = np.sqrt(study_df["vi"])
-        egger = eggers_test(study_df)
-        pooled = pool_random_effects(study_df, cluster_col="study")
-        title = outcome
-        st.caption(f"R 결과 사용: pooled_{outcome}.csv의 μ·CI·PI·τ²를 그대로 그립니다. 진단 그림은 R과 같은 study-level 점(study_level_{outcome}.csv)과 같은 모형(REML + knha)으로 계산합니다.")
-        meta_df = None
-        result_ready = True
-
-    workbook_mode = False
-    if meta_file and Path(meta_file.name).suffix.lower() in {".xlsx", ".xls"}:
-        import auto_figures as _af
-        with st.spinner("데이터 추출 시트를 읽고 outcome별로 분석하는 중입니다..."):
-            wb_results, wb_qc = _analyze_workbook(meta_file.getvalue(), ci_mode)
-        if wb_results:
-            workbook_mode = True
-            st.success(f"outcome 시트 {len(wb_results)}개를 인식했습니다: " + ", ".join(r["outcome"] for r in wb_results))
-            st.caption("효과크기 Hedges' g · 3-level random-effects (REML, Study/effect) · CR2 cluster-robust · 95% PI. "
-                       "출판편향·민감도 진단은 연구 단위 집계(CS, ρ = 0.6) + REML/knha. R 파이프라인(01_stat_analysis.R)과 수치 일치 검증.")
-            with st.expander("데이터 QC (제외·중복 처리 내역)", expanded=False):
-                st.dataframe(wb_qc, use_container_width=True, hide_index=True)
-            summ = pd.DataFrame([_af.summary_row(r) for r in wb_results])
-            st.dataframe(summ.round(3), use_container_width=True, hide_index=True)
-
-            wb_dpi = st.select_slider("Figure 해상도 (DPI)", options=[150, 300, 600], value=300, key="wb_dpi")
-            if st.button("전체 figure 만들기 (zip)", type="primary", use_container_width=True, key="wb_make"):
-                bar = st.progress(0.0, text="figure 생성 중...")
-                zbytes, adv_tbl = _af.build_figure_zip(wb_results, wb_qc, dpi=wb_dpi,
-                                                       progress=lambda f, o: bar.progress(f, text=f"{o} 완료"))
-                st.session_state["wb_zip"] = zbytes
-                st.session_state["wb_adv"] = adv_tbl
-                bar.empty()
-                log_activity("📈", "메타분석 figure 일괄 생성", f"{len(wb_results)}개 outcome")
-                save_project_state(active, "meta_done", True)
-            if st.session_state.get("wb_adv") is not None:
-                st.caption("고급 분석: p < .05는 09_Advanced_significant_p05, 나머지는 10_Advanced_not_significant 폴더에 모두 저장됩니다. "
-                           "메타회귀·dose-response는 CR2 기준으로 분류합니다. SKIPPED는 데이터가 부족해 실행하지 않은 분석입니다.")
-                st.dataframe(st.session_state["wb_adv"].round(4), use_container_width=True, hide_index=True)
-            if st.session_state.get("wb_zip"):
-                st.download_button("figure + 결과표 zip 다운로드", st.session_state["wb_zip"], "meta_analysis_figures.zip",
-                                   "application/zip", use_container_width=True, key="wb_dl")
-
-            st.markdown('<div class="section-title" style="margin-top:22px;">미리보기</div>', unsafe_allow_html=True)
-            pick = st.selectbox("Outcome", [r["outcome"] for r in wb_results], key="wb_pick")
-            res = next(r for r in wb_results if r["outcome"] == pick)
-            figs = _af.make_figures(res, which=("forest", "funnel"))
-            for f in figs.values():
-                st.pyplot(f, use_container_width=True)
-            if st.checkbox("민감도 진단 그림도 보기 (Trim-and-fill · LOO · Influence · Baujat · GOSH)", key="wb_diag"):
-                for f in _af.make_figures(res, which=("trimfill", "leave1out", "influence", "baujat", "gosh")).values():
-                    st.pyplot(f, use_container_width=True)
-
-    if not meta_file:
-        empty_state("📈", "데이터 추출 엑셀을 올리세요", "outcome별 시트에 Study, Mean_treat, SD_treat, N_treat, Mean_control, SD_control, N_control 열이 있으면 시트를 자동 인식해 모든 figure를 만듭니다. R 결과(r_outputs zip)도 받습니다.")
-    elif Path(meta_file.name).suffix.lower() != ".zip" and not workbook_mode:
-        meta_df = pd.read_excel(meta_file) if Path(meta_file.name).suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(meta_file)
-        cols = list(meta_df.columns)
-        guess = guess_columns(cols)
-        local_guess = _detect_raw_meta_columns(cols)
-        for _k in ["study", "mean_treat", "sd_treat", "n_treat", "mean_control", "sd_control", "n_control"]:
-            if local_guess.get(_k):
-                guess[_k] = local_guess[_k]
-
-        raw_ok = all(guess.get(k) for k in
-            ["study", "mean_treat", "sd_treat", "n_treat", "mean_control", "sd_control", "n_control"])
-        effect_ok = (not raw_ok) and guess.get("study") and guess.get("yi") and (guess.get("vi") or (guess.get("ci_lo") and guess.get("ci_hi")))
-
-        result_ready = False
-
-        if raw_ok:
-            # ---- 원자료(평균·SD·N) → Python에서 직접 계산 ----
-            try:
-                eff = compute_effect_sizes(meta_df, guess["study"], guess["mean_treat"], guess["sd_treat"], guess["n_treat"],
-                                           guess["mean_control"], guess["sd_control"], guess["n_control"], None)
-                summary, fit_w, study_df = _r_style_from_effects(eff, ci_mode)
-                pooled = pool_random_effects(study_df, cluster_col="study")
-                egger = eggers_test(study_df)
-                title = guess["mean_treat"].split("_")[0] if guess.get("mean_treat") else "Effects of intervention"
-                sub = eff.rename(columns={
-                    "mean_t": "mean_treat", "sd_t": "sd_treat",
-                    "mean_c": "mean_control", "sd_c": "sd_control",
-                    "ci_low": "ci_lo", "ci_high": "ci_hi",
-                })
-                sub["weight_pct"] = fit_w
-                result_ready = True
-            except Exception as exc:
-                st.error(f"자동 계산 중 문제가 발생했습니다: {exc}")
-
-        elif effect_ok:
-            # ---- 이미 계산된 효과크기(yi) + 분산(vi) 또는 95% CI ----
-            try:
-                work = meta_df[[guess["study"], guess["yi"]]].copy()
-                work.columns = ["study", "yi"]
-                if guess.get("vi"):
-                    work["vi"] = pd.to_numeric(meta_df[guess["vi"]], errors="coerce")
-                else:
-                    ci_lo = pd.to_numeric(meta_df[guess["ci_lo"]], errors="coerce")
-                    ci_hi = pd.to_numeric(meta_df[guess["ci_hi"]], errors="coerce")
-                    work["vi"] = ((ci_hi - ci_lo) / (2 * 1.96)) ** 2
-                work["yi"] = pd.to_numeric(work["yi"], errors="coerce")
-                eff = work.dropna(subset=["yi", "vi"]).reset_index(drop=True)
-                if eff.empty:
-                    raise ValueError("유효한 효과크기/분산 값이 없습니다.")
-                eff["se"] = np.sqrt(eff["vi"])
-                summary, fit_w, study_df = _r_style_from_effects(eff, ci_mode)
-                pooled = pool_random_effects(study_df, cluster_col="study")
-                egger = eggers_test(study_df)
-                title = "Effects of intervention"
-                sub = eff.copy()
-                sub["ci_lo"] = sub["yi"] - 1.96 * np.sqrt(sub["vi"])
-                sub["ci_hi"] = sub["yi"] + 1.96 * np.sqrt(sub["vi"])
-                sub["weight_pct"] = fit_w
-                result_ready = True
-            except Exception as exc:
-                st.error(f"자동 계산 중 문제가 발생했습니다: {exc}")
-
-        else:
-            st.error("열 이름을 자동으로 인식하지 못했습니다. 아래에서 직접 확인해 주세요.")
-            with st.expander("열 매핑 직접 지정", expanded=True):
-                r1c1, r1c2 = st.columns(2)
-                with r1c1:
-                    study_col = st.selectbox("연구명 열", cols, index=0, key="fb_study")
-                with r1c2:
-                    yi_col = st.selectbox("효과크기 열 (yi)", cols, index=min(1, len(cols) - 1), key="fb_yi")
-                vi_mode_fb = st.radio("분산 정보", ["분산(vi) 열 사용", "CI 하한/상한 열 사용"], horizontal=True, key="fb_vimode")
-                if vi_mode_fb == "분산(vi) 열 사용":
-                    vi_col = st.selectbox("분산 열 (vi)", cols, index=min(2, len(cols) - 1), key="fb_vi")
-                    ci_lo_col = ci_hi_col = None
-                else:
-                    vi_col = None
-                    fc1, fc2 = st.columns(2)
-                    with fc1:
-                        ci_lo_col = st.selectbox("CI 하한 열", cols, index=min(2, len(cols) - 1), key="fb_cilo")
-                    with fc2:
-                        ci_hi_col = st.selectbox("CI 상한 열", cols, index=min(3, len(cols) - 1), key="fb_cihi")
-            try:
-                work = meta_df[[study_col, yi_col]].copy()
-                work.columns = ["study", "yi"]
-                work["yi"] = pd.to_numeric(work["yi"], errors="coerce")
-                if vi_mode_fb == "분산(vi) 열 사용":
-                    work["vi"] = pd.to_numeric(meta_df[vi_col], errors="coerce")
-                else:
-                    ci_lo = pd.to_numeric(meta_df[ci_lo_col], errors="coerce")
-                    ci_hi = pd.to_numeric(meta_df[ci_hi_col], errors="coerce")
-                    work["vi"] = ((ci_hi - ci_lo) / (2 * 1.96)) ** 2
-                eff = work.dropna(subset=["yi", "vi"]).reset_index(drop=True)
-                if eff.empty:
-                    raise ValueError("유효한 효과크기/분산 값이 없습니다. 열 선택을 확인하세요.")
-                eff["se"] = np.sqrt(eff["vi"])
-                summary, fit_w, study_df = _r_style_from_effects(eff, ci_mode)
-                pooled = pool_random_effects(study_df, cluster_col="study")
-                egger = eggers_test(study_df)
-                title = "Effects of intervention"
-                sub = eff.copy()
-                sub["ci_lo"] = sub["yi"] - 1.96 * np.sqrt(sub["vi"])
-                sub["ci_hi"] = sub["yi"] + 1.96 * np.sqrt(sub["vi"])
-                sub["weight_pct"] = fit_w
-                result_ready = True
-            except Exception as exc:
-                st.error(str(exc))
-
-    if result_ready:
-        fig_f = forest_plot_from_R(sub, summary, title=title)
-        st.pyplot(fig_f, use_container_width=True)
-        dpi_pick = st.select_slider("다운로드 해상도 (DPI)", options=[150, 300, 600, 1200], value=300, key="unified_forest_dpi")
-        st.download_button(
-            f"Forest plot PNG 다운로드 ({dpi_pick}dpi)", fig_to_png_bytes(fig_f, dpi=dpi_pick),
-            f"forest_{title.replace(' ', '_')}.png", "image/png", type="primary", use_container_width=True, key="unified_forest_dl",
-        )
-        # R 02_make_figures.py와 같이: study-level 집계 점, 중심 = study-level REML+knha 추정치
-        funnel_center = ForestSummary(g=pooled.beta, ci_lb=pooled.ci[0], ci_ub=pooled.ci[1])
-        fig_fn = funnel_plot_from_R(study_df, funnel_center, egger, title=title)
-        st.pyplot(fig_fn, use_container_width=True)
-        st.download_button(
-            "Funnel plot PNG 다운로드", fig_to_png_bytes(fig_fn, dpi=300),
-            f"funnel_{title.replace(' ', '_')}.png", "image/png", use_container_width=True, key="unified_funnel_dl",
-        )
-        if not pd.isna(egger.p_value):
-            egger_p_txt = "< .001" if egger.p_value < 0.001 else f"{egger.p_value:.3f}"
-            st.caption(f"k={summary.k} effects / {len(study_df)} studies · Hedges' g={summary.g:.3f} [{summary.ci_lb:.3f}, {summary.ci_ub:.3f}] ({summary.ci_note}) · "
-                       f"Egger(regtest, sei, study-level) p={egger_p_txt}" + (" — 연구 10편 미만: 탐색적 해석" if len(study_df) < 10 else ""))
-        st.session_state["meta_raw"] = {"done": True}
-        save_project_state(active, "meta_raw", st.session_state["meta_raw"])
-        save_project_state(active, "meta_done", True)
-        log_activity("📈", "메타분석 그림 생성", f"{title} — g={summary.g:.2f}")
-
-        st.markdown('<div class="section-title" style="margin-top:22px;">고급 진단 그림</div>', unsafe_allow_html=True)
-        st.caption("Leave-one-out · Baujat · GOSH · Trim-and-fill · Influence — R 파이프라인과 같이 연구 단위 집계 점(CS, ρ = 0.6)에 "
-                   "REML + knha 모형으로 계산합니다(leave1out·trimfill·regtest는 R 출력과 소수점 이하까지 일치 확인). GOSH만 무작위 부분집합 근사입니다.")
-        adv_dpi = st.select_slider("진단 그림 다운로드 해상도 (DPI)", options=[150, 300, 600, 1200], value=300, key="adv_dpi")
-
-        def _adv_show(fig, name, key):
-            st.pyplot(fig, use_container_width=True)
-            st.download_button(
-                f"{name} PNG 다운로드", fig_to_png_bytes(fig, dpi=adv_dpi),
-                f"{name.lower().replace(' ', '_').replace('-', '')}_{title.replace(' ', '_')}.png",
-                "image/png", use_container_width=True, key=f"{key}_dl",
-            )
-
-        if pooled.k >= 3:
-            try:
-                _adv_show(leave_one_out_plot(study_df, pooled, title=f"Leave-one-out — {title}"), "Leave-one-out", "loo")
-            except Exception as exc:
-                st.caption(f"Leave-one-out 그림을 생성하지 못했습니다: {exc}")
-        try:
-            _adv_show(baujat_plot(study_df, pooled, title=f"Baujat plot — {title}"), "Baujat", "baujat")
-        except Exception as exc:
-            st.caption(f"Baujat plot을 생성하지 못했습니다: {exc}")
-        if pooled.k >= 4:
-            try:
-                _adv_show(gosh_plot(study_df, n_iter=1200, title=f"GOSH plot — {title}"), "GOSH", "gosh")
-            except Exception as exc:
-                st.caption(f"GOSH plot을 생성하지 못했습니다: {exc}")
-        else:
-            st.caption("GOSH plot에는 최소 4개 이상의 연구가 필요합니다.")
-        if pooled.k >= 3:
-            try:
-                tf_result = trim_and_fill(study_df)
-                _adv_show(trim_fill_plot(tf_result, title=title), "Trim-and-fill", "trimfill")
-            except Exception as exc:
-                st.caption(f"Trim-and-fill 그림을 생성하지 못했습니다: {exc}")
-            try:
-                _adv_show(influence_plot(study_df, pooled, title=title), "Influence", "influence")
-            except Exception as exc:
-                st.caption(f"Influence 그림을 생성하지 못했습니다: {exc}")
-        else:
-            st.caption("Trim-and-fill / Influence 그림에는 최소 3개 이상의 연구가 필요합니다.")
-
-
+    import meta_page
+    meta_page.render(active, log_activity)
 
 
 # ===========================================================================
@@ -1942,15 +1679,15 @@ elif nav == "export":
         empty_state("◈", "내보낼 문헌이 없습니다", "먼저 「📥 가져오기 · 중복 제거」 탭을 진행하세요.")
     else:
         final = screening_export(records)
-        st.dataframe(final.head(100), use_container_width=True, height=440)
+        st.dataframe(final.head(100), width="stretch", height=440)
         c1, c2 = st.columns(2)
         with c1:
             st.download_button(
                 "Excel (.xlsx) 다운로드", dataframe_to_excel_bytes(final), "Final_Screening.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", width="stretch",
             )
         with c2:
             st.download_button(
                 "CSV (.csv) 다운로드", final.to_csv(index=False).encode("utf-8-sig"), "Final_Screening.csv",
-                "text/csv", use_container_width=True,
+                "text/csv", width="stretch",
             )

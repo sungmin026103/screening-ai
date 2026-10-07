@@ -59,7 +59,7 @@ TRAINING_SAMPLE_SIZE = 200
 MIN_INCLUDE_FOR_SUPERVISED = 10
 VALIDATION_RECALL_TARGET = 0.95
 VALIDATION_CONFIDENCE = 0.95
-ALGORITHM_VERSION = "V35.2"
+ALGORITHM_VERSION = "V36.0"
 # 재현성: 같은 입력(코퍼스 + 라벨)이면 항상 같은 결과가 나와야 한다.
 # 난수를 쓰는 모든 지점(폴드 분할, 캘리브레이션, SVM 좌표하강, 표본추출)에 이 seed를 건다.
 RANDOM_SEED = 42
@@ -580,13 +580,15 @@ class TextPartExtractor(BaseEstimator, TransformerMixin):
 class RuleSignalFeatures(BaseEstimator, TransformerMixin):
     """초록에서 명백한 연구설계/비대상 신호를 숫자 feature로 변환한다.
     단일 키워드만으로 자동 배제하지 않고 최종 분류기의 보조 feature로만 사용한다."""
+    # V36: 주제 특이적 토큰(c2c12, myoblast, arabidopsis, observational 등)을 제거하고
+    # 어떤 SR에도 공통인 '연구 형태' 신호만 남긴다. 값은 분류기의 보조 feature일 뿐이며
+    # 가중치는 매 리뷰의 라벨로 학습된다(제외 규칙이 아님).
     PATTERNS = [
-        r"\bin\s*vitro\b|cell\s+culture|cultured\s+cells?|cell\s+line|c2c12|myoblast|osteoblast",
-        r"\breview\b|systematic\s+review|meta[- ]analysis|narrative\s+review",
-        r"protocol|study\s+protocol",
+        r"\bin\s*vitro\b|cell\s+culture|cultured\s+cells?|cell\s+lines?\b",
+        r"systematic\s+review|meta[- ]analysis|narrative\s+review|scoping\s+review|literature\s+review",
+        r"study\s+protocol|trial\s+protocol|protocol\s+for\s+a",
         r"case\s+report|case\s+series",
-        r"plant\s+growth|seedling|arabidopsis|crop\s+plant",
-        r"no\s+(?:treatment|intervention)|observational\s+study|cross[- ]sectional",
+        r"editorial|commentary|letter\s+to\s+the\s+editor|erratum|corrigendum",
     ]
 
     def fit(self, X, y=None):
@@ -853,8 +855,8 @@ def build_sentence_pico_lookup(keys: np.ndarray, abstracts: np.ndarray, criteria
 def _obvious_exclusion_reason(title: str, abstract: str) -> str:
     t = f"{title} {abstract}".lower()
     checks = [
-        (r"\bin\s*vitro\b|cell\s+culture|cultured\s+cells?|cell\s+line|c2c12|myoblast|osteoblast", "In vitro / cell study signal"),
-        (r"systematic\s+review|meta[- ]analysis|narrative\s+review|\breview\b", "Review article signal"),
+        (r"\bin\s*vitro\b|cell\s+culture|cultured\s+cells?|cell\s+lines?\b", "In vitro / cell study signal"),
+        (r"systematic\s+review|meta[- ]analysis|narrative\s+review|scoping\s+review|literature\s+review", "Review article signal"),
         (r"study\s+protocol|\bprotocol\b", "Protocol signal"),
         (r"case\s+report|case\s+series", "Case report/series signal"),
     ]
@@ -883,15 +885,21 @@ def _obvious_exclusion_reason(title: str, abstract: str) -> str:
 GATE_MIN_INCLUDE_AFTER = 4     # 게이트 통과 라벨 Include가 이보다 적으면 게이트 사용 안 함
 GATE_MIN_LABELED_AFTER = 20    # 게이트 통과 라벨이 이보다 적으면 게이트 사용 안 함
 
-# 각 항목은 (표시 이름, 정규식). 프로젝트 PECO가 바뀌면 이 상수만 교체하면 된다.
-# 상용/범용 배포 기본값: 프로젝트 특이적 정규식은 자동 적용하지 않는다.
-# 규칙 게이트를 쓰려면 프로젝트별로 명시적으로 gate_rules를 전달해야 한다.
-# 기본 규칙 게이트.
-# 적격 문헌이라면 제목·초록에 반드시 나타나는 세 용어군을 AND로 적용한다.
-# 각 규칙은 human Include를 한 편이라도 떨어뜨리면 build_gate에서 자동 비활성화되므로,
-# 다른 주제의 리뷰에 적용해도 안전 쪽(=게이트 미적용)으로 작동한다.
-# 프로젝트 주제가 다르면 이 상수만 교체하거나 train_and_predict(gate_rules=...)로 주입한다.
-GATE_RULES_DEFAULT: list[tuple[str, str]] = [
+# V36: 기본 규칙은 비어 있다. 주제 특이적 정규식은 소스 코드가 아니라 '입력'이다.
+# 프로젝트별로 PICO 화면의 「자동 제외 규칙」 칸에 검색식 개념 블록을 적으면
+# parse_gate_rules_text()가 (이름, 정규식) 목록으로 바꿔 train_and_predict / rule_only_screen에 넘긴다.
+# 입력 문자열은 run_fingerprint와 실행 manifest에 그대로 기록된다.
+GATE_RULES_DEFAULT: list[tuple[str, str]] = []
+
+
+def _missing_abstract_mask(abstracts) -> np.ndarray:
+    """초록이 없거나 지나치게 짧은 레코드(제목만 있는 레코드)를 표시한다."""
+    ser = pd.Series(abstracts).fillna("").astype(str).str.strip()
+    return (ser.str.len() < ABSTRACT_MIN_CHARS).to_numpy()
+
+# 니트로사민/HCA–심혈관–동물실험 SR에서 쓰던 규칙. 기본 적용되지 않으며, PICO 화면에서
+# 「이전 니트로사민 SR 규칙 불러오기」를 눌러 해당 프로젝트의 입력으로만 사용할 수 있다.
+LEGACY_NITROSAMINE_CVD_GATE_RULES: list[tuple[str, str]] = [
     (
         "노출어 없음",
         r"nitrosamin|nitrosodi|nitroso|\bndma\b|\bndea\b|\bnpyr\b|\bnpip\b|\bndba\b|\bnmor\b|\bndela\b|"
@@ -900,9 +908,6 @@ GATE_RULES_DEFAULT: list[tuple[str, str]] = [
         r"imidazo\[|pyrido\[|dipyrido|quinoxaline|quinoline",
     ),
     (
-        # 'lipid'/'cholesterol'을 그냥 OR로 넣으면 lipid peroxidation(간 산화스트레스)만 보고한
-        # 발암 연구가 전부 통과한다. 그래서 (1) 그 자체로 심혈관 지표인 용어군과
-        # (2) '혈중'이 명시된 지질 표현/혈중 지질 약어만 인정한다.
         "심혈관 결과어 없음",
         r"atheroscler|\baort|vascul|endotheli|\bcardi|\bheart\b|myocard|troponin|ck-?mb|vcam|icam|"
         r"\benos\b|plaque|vasodil|vasorelax|blood\s+pressure|lipoprotein|\bldl\b|\bhdl\b|\bvldl\b|"
@@ -920,42 +925,309 @@ GATE_RULES_DEFAULT: list[tuple[str, str]] = [
     ),
 ]
 
+GATE_RULE_REGEX_PREFIX = "re:"
 
-def _missing_abstract_mask(abstracts) -> np.ndarray:
-    """초록이 없거나 지나치게 짧은 레코드(제목만 있는 레코드)를 표시한다."""
-    ser = pd.Series(abstracts).fillna("").astype(str).str.strip()
-    return (ser.str.len() < ABSTRACT_MIN_CHARS).to_numpy()
 
-# V29에 포함됐던 특정 니트로사민-심혈관-동물실험용 규칙은 하위 참고용으로만 보존한다.
-# 절대로 기본 적용되지 않는다.
-LEGACY_NITROSAMINE_CVD_GATE_RULES: list[tuple[str, str]] = [
-    (
-        "노출어 없음",
-        r"nitrosamin|nitrosodi|nitroso|\bndma\b|\bndea\b|\bnpyr\b|\bnpip\b|\bndba\b|\bnmor\b|\bndela\b|"
-        r"\bdena\b|\bden\b|diethylnitro|dimethylnitro|heterocyclic\s+amine|heterocyclic\s+aromatic\s+amine|"
-        r"\bhcas?\b|\bphip\b|\bmeiqx\b|\bdimeiqx\b|\bmeiq\b|trp-p|glu-p|a-?alpha-?c|aminoimidazo|"
-        r"imidazo\[|pyrido\[|dipyrido|quinoxaline|quinoline",
-    ),
-    (
-        # 'lipid'/'cholesterol'을 그냥 OR로 넣으면 lipid peroxidation(간 산화스트레스)만 보고한
-        # 발암 연구가 전부 통과한다. 그래서 (1) 그 자체로 심혈관 지표인 용어군과
-        # (2) '혈중'이 명시된 지질 표현/혈중 지질 약어만 인정한다.
-        "심혈관 결과어 없음",
-        r"atheroscler|\baort|vascul|endotheli|\bcardi|\bheart\b|myocard|troponin|ck-?mb|vcam|icam|"
-        r"\benos\b|plaque|vasodil|vasorelax|blood\s+pressure|lipoprotein|\bldl\b|\bhdl\b|\bvldl\b|"
-        r"dyslipid|hyperlipid|foam\s+cell"
-        r"|(serum|plasma|blood|circulating)[^.]{0,60}(lipid|cholesterol|triglycerid)"
-        r"|(lipid|cholesterol|triglycerid)[^.]{0,60}(serum|plasma|blood\s+level)"
-        r"|lipid\s+profile|lipid\s+panel|total\s+cholesterol|\btc\b|\btg\b|"
-        r"free\s+fatty\s+acid|\bnefa\b",
-    ),
-    (
-        "동물실험어 없음",
-        r"\brats?\b|\bmice\b|\bmouse\b|\brabbits?\b|hamster|guinea\s+pig|\bpigs?\b|\bswine\b|\bin\s*vivo\b|"
-        r"c57|balb|wistar|f344|fischer|sprague|ldlr|apoe|\bgavage\b|\bintraperitoneal\b|\bchow\b|"
-        r"\bdiet\b|animal\s+model|\bmurine\b|\brodent",
-    ),
-]
+def _term_to_regex(term: str) -> str:
+    """검색어 한 개를 정규식으로. '*'는 절단(truncation), 공백은 공백 정규식, 앞쪽은 단어 경계.
+    're:'로 시작하면 사용자가 쓴 정규식을 그대로 쓴다."""
+    term = str(term).strip()
+    if not term:
+        return ""
+    if term.lower().startswith(GATE_RULE_REGEX_PREFIX):
+        return term[len(GATE_RULE_REGEX_PREFIX):].strip()
+    trunc = term.endswith("*")
+    core = term.rstrip("*").strip().lower()
+    parts = [re.escape(p) for p in core.split()]
+    body = r"\s+".join(parts)
+    lead = r"\b" if core[:1].isalnum() else ""
+    tail = "" if trunc else (r"\b" if core[-1:].isalnum() else "")
+    return f"{lead}{body}{tail}"
+
+
+def parse_gate_rules_text(text: str) -> list[tuple[str, str]]:
+    """「자동 제외 규칙」 입력을 (이름, 정규식) 목록으로 바꾼다.
+
+    한 줄 = 규칙 하나 = '이름: 용어1, 용어2, ...' (이름이 없으면 '규칙 N').
+    같은 줄의 용어는 OR, 줄끼리는 AND(적격이면 모든 줄의 용어가 하나 이상 등장해야 함).
+    '*' = 절단 검색어(nitrosamin* → nitrosamine, nitrosamines …). 're:패턴' = 정규식 직접 입력.
+    '#'으로 시작하는 줄과 빈 줄은 무시한다. 잘못된 정규식이 있으면 ValueError.
+    """
+    rules: list[tuple[str, str]] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line and not line.lower().startswith(GATE_RULE_REGEX_PREFIX):
+            name, terms = line.split(":", 1)
+            name = name.strip() or f"규칙 {len(rules) + 1}"
+        else:
+            name, terms = f"규칙 {len(rules) + 1}", line
+        if terms.strip().lower().startswith(GATE_RULE_REGEX_PREFIX):
+            pats = [_term_to_regex(terms.strip())]
+        else:
+            pats = [_term_to_regex(t) for t in re.split(r"[,;|]", terms)]
+        pats = [p for p in pats if p]
+        if not pats:
+            continue
+        pattern = "|".join(f"(?:{p})" for p in pats)
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"'{name}' 규칙의 정규식 오류: {exc}") from exc
+        label = name if name.endswith("없음") else f"{name} 없음"
+        rules.append((label, pattern))
+    return rules
+
+
+def gate_rules_to_text(rules: list[tuple[str, str]]) -> str:
+    """(이름, 정규식) 목록을 입력 칸 형식('이름: re:패턴')으로 되돌린다."""
+    out = []
+    for name, pattern in rules:
+        base = name[:-2].strip() if name.endswith("없음") else name
+        out.append(f"{base}: {GATE_RULE_REGEX_PREFIX}{pattern}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 자동 개념 게이트 (V36) — 주제별 정규식을 사람이 쓰지 않아도 되게 한다.
+#
+# 적격 문헌이라면 제목·초록에 PICO의 각 요소(P, I/E, O)를 가리키는 말이 하나 이상 나온다.
+# 그 '말 묶음(개념 블록)'을 코드나 사람이 아니라 (1) PICO 문장의 영어 핵심어와
+# (2) 그 핵심어가 나오는 문헌에서 함께 많이 나오고(lift) 실제 Include 라벨에도 나오는 단어로 만든다.
+#   * 블록은 라벨된 Include를 모두 포함할 때만 쓴다(coverage 100%).
+#   * 블록을 만드는 '절차 전체'를 Include 한 편씩 빼고 다시 수행해(jackknife) 빠진 Include가
+#     새 블록을 통과하는지 확인한다. 한 편이라도 떨어지면 그 블록은 쓰지 않는다.
+#   * 남은 블록은 일반 규칙과 똑같이 build_gate(FN=0, 최소 Include 수, nested 평가)를 다시 거친다.
+# PICO가 한국어뿐이면 영어 핵심어가 없으므로 블록이 만들어지지 않는다(= 규칙 없이 모델만 사용).
+# ---------------------------------------------------------------------------
+CONCEPT_ELEMENTS = [("P", "대상(P)"), ("I", "중재·노출(I/E)"), ("O", "결과(O)")]
+CONCEPT_MAX_TERMS = 24
+CONCEPT_MIN_LIFT = 2.0
+_GENERIC_WORDS = {
+    "study", "studies", "effect", "effects", "group", "groups", "result", "results", "method", "methods",
+    "significant", "significantly", "increase", "increased", "decrease", "decreased", "level", "levels",
+    "using", "used", "use", "based", "compared", "control", "controls", "treatment", "treated", "model",
+    "models", "analysis", "data", "showed", "shown", "show", "found", "observed", "associated", "association",
+    "high", "low", "higher", "lower", "induced", "including", "include", "included", "however", "also",
+    "may", "well", "new", "different", "total", "change", "changes", "related", "role", "potential",
+    "response", "responses", "test", "tested", "week", "weeks", "day", "days", "year", "years", "time",
+    "outcome", "outcomes", "intervention", "interventions", "population", "comparison", "comparator",
+    "exposure", "exposed", "patients", "subjects", "participants", "human", "humans", "factor", "factors",
+}
+
+
+def _concept_vectorizer():
+    from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+    stop = sorted(set(ENGLISH_STOP_WORDS) | _GENERIC_WORDS)
+    return CountVectorizer(binary=True, lowercase=True, ngram_range=(1, 2), min_df=2,
+                           token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9\-]{2,}\b", stop_words=stop)
+
+
+_IRREGULAR = {"mice": "mouse", "mouse": "mice", "feet": "foot", "teeth": "tooth", "children": "child", "child": "children",
+              "men": "man", "women": "woman"}
+
+
+def _concept_term(t: str, abbrs: set | frozenset = frozenset(), vocab=None) -> str:
+    """블록 용어 → 규칙 입력 형식. 긴 단어는 절단(*), 짧은 단어는 단수·복수(불규칙 포함)를 적는다.
+    약어(NDEA 등)는 그대로 둔다. 복수형/단수형은 코퍼스에 실제로 있을 때만 덧붙인다."""
+    if " " in t or t in abbrs:
+        return t
+    if len(t) >= 6:
+        stem = t[:-1] if (t.endswith("s") and not t.endswith("ss") and (vocab is None or t[:-1] in vocab)) else t
+        return f"{stem}*"
+    forms = [t]
+    alt = _IRREGULAR.get(t) or (t[:-1] if t.endswith("s") and not t.endswith("ss") else t + "s")
+    if alt and (vocab is None or alt in vocab or t in _IRREGULAR):
+        forms.append(alt)
+    return ", ".join(dict.fromkeys(forms))
+
+
+def _seed_terms(text: str, vocab: dict) -> list[str]:
+    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", str(text).lower())
+    toks = []
+    for tk in raw:
+        toks.append(tk)
+        if "-" in tk:
+            toks += [p_ for p_ in tk.split("-") if len(p_) >= 3]
+    seeds = []
+    for i, tk in enumerate(toks):
+        variants = [tk, tk[:-1] if tk.endswith("s") else tk + "s", _IRREGULAR.get(tk)]
+        for cand in variants:
+            if cand and cand in vocab and cand not in _GENERIC_WORDS and cand not in seeds:
+                seeds.append(cand)
+        if i + 1 < len(toks):
+            bg = f"{tk} {toks[i + 1]}"
+            if bg in vocab and bg not in seeds:
+                seeds.append(bg)
+    return seeds
+
+
+_ABBR_RE = re.compile(r"([A-Za-z][\w\-]+(?:\s+[\w\-]+){0,5})\s*\(\s*([A-Za-z][A-Za-z0-9\-]{1,9})\s*\)")
+
+
+def harvest_abbreviations(texts) -> list[tuple[str, str]]:
+    """'long form (ABBR)' 쌍을 코퍼스에서 모은다(예: N-nitrosodiethylamine (NDEA)). 소문자로 반환."""
+    pairs = {}
+    for t in texts:
+        for lf, ab in _ABBR_RE.findall(str(t)):
+            ab_l = ab.lower()
+            if len(ab_l) < 2 or ab_l.isdigit():
+                continue
+            pairs.setdefault(ab_l, set()).add(lf.lower())
+    return [(lf, ab) for ab, lfs in pairs.items() for lf in lfs]
+
+
+def _definitional_terms(seeds, terms, vocab, abbr_pairs):
+    """씨앗어의 형태 가족(앞 6글자 공유: nitrosamine → nitrosodiethylamine)과 약어(NDEA)."""
+    out = []
+    uni = [t for t in terms if " " not in t]
+    for sd in seeds:
+        if " " in sd or len(sd) < 7:
+            continue
+        pre = sd[:6]
+        fam = [t for t in uni if t.startswith(pre) or ("-" + pre) in t]
+        out += fam[:12]
+    stems = [sd[:6] if len(sd) >= 7 else sd for sd in seeds + out if " " not in sd]
+    for lf, ab in abbr_pairs:
+        tail = " ".join(lf.split()[-2:])             # 약어 바로 앞 두 단어(긴 형태의 끝)만 본다
+        if ab in vocab and any(st_ in tail for st_ in stems):
+            out.append(ab)
+    return list(dict.fromkeys(out))
+
+
+def _build_blocks(X, terms, vocab, inc_rows, sections, max_terms=CONCEPT_MAX_TERMS, abbr_pairs=()):
+    """X: 코퍼스 binary 문서-용어 행렬(csr), inc_rows: 라벨 Include의 코퍼스 행 번호."""
+    n_docs = X.shape[0]
+    p_all = np.asarray(X.mean(axis=0)).ravel()
+    X_inc = X[inc_rows] if len(inc_rows) else None
+    inc_has = (np.asarray(X_inc.sum(axis=0)).ravel() if X_inc is not None else np.zeros(X.shape[1]))
+    blocks = []
+    for key, label in CONCEPT_ELEMENTS:
+        text = sections.get(key, "")
+        seeds = _seed_terms(text, vocab)
+        if not seeds:
+            continue
+        defin = _definitional_terms(seeds, terms, vocab, abbr_pairs)
+        sidx = list(dict.fromkeys([vocab[t] for t in seeds] + [vocab[t] for t in defin if t in vocab]))
+        seed_doc = np.asarray(X[:, sidx].sum(axis=1)).ravel() > 0
+        if seed_doc.sum() == 0:
+            continue
+        p_seed = np.asarray(X[seed_doc].mean(axis=0)).ravel()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            lift = np.where(p_all > 0, p_seed / p_all, 0.0)
+        cand = np.flatnonzero((inc_has > 0) & (lift >= CONCEPT_MIN_LIFT) & (p_seed >= 0.01))
+        score = lift[cand] * (inc_has[cand] / max(len(inc_rows), 1))
+        order = cand[np.argsort(-score, kind="stable")]
+        chosen = list(sidx)
+        covered = (np.asarray(X_inc[:, chosen].sum(axis=1)).ravel() > 0) if X_inc is not None else np.array([], bool)
+        for j in order:                                   # 1) Include를 모두 덮을 때까지
+            if X_inc is None or covered.all() or len(chosen) >= max_terms:
+                break
+            if j in chosen:
+                continue
+            col = np.asarray(X_inc[:, j].todense()).ravel() > 0
+            if (col & ~covered).any():
+                chosen.append(int(j))
+                covered |= col
+        if X_inc is not None and not covered.all():       # 1b) 아직 안 덮인 Include: 그 문헌에 특이적인 단어(보완어)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                lift_inc = np.where(p_all > 0, (inc_has / max(len(inc_rows), 1)) / p_all, 0.0)
+            unigram = np.array([" " not in t for t in terms])
+            for r_i in np.flatnonzero(~covered):
+                if len(chosen) >= max_terms:
+                    break
+                row_terms = X_inc[r_i].indices
+                ok = row_terms[(p_all[row_terms] < 0.20) & unigram[row_terms]]
+                if ok.size == 0:
+                    continue
+                j = int(ok[np.argmax(lift_inc[ok])])
+                if j not in chosen:
+                    chosen.append(j)
+                covered |= np.asarray(X_inc[:, j].todense()).ravel() > 0
+        unigram_mask = [" " not in terms[j] for j in order]
+        order = order[np.asarray(unigram_mask, dtype=bool)] if len(order) else order
+        for j in order:                                   # 2) 남는 자리는 동의어 폭을 넓히는 데(단일어만)
+            if len(chosen) >= max_terms:
+                break
+            if j not in chosen:
+                chosen.append(int(j))
+        cov = float(covered.mean()) if covered.size else 0.0
+        pass_rate = float((np.asarray(X[:, chosen].sum(axis=1)).ravel() > 0).mean()) if n_docs else 1.0
+        blocks.append({"key": key, "label": label, "terms": [terms[j] for j in chosen], "idx": chosen,
+                       "seeds": seeds, "include_coverage": cov, "corpus_pass_rate": pass_rate})
+    return blocks
+
+
+def derive_auto_gate(df: pd.DataFrame, criteria_text: str) -> dict:
+    """PICO + 라벨된 Include로 개념 블록을 만들고 jackknife로 검증한다.
+    반환: {"rules", "rules_text", "blocks"(표), "usable", "reasons", "n_include"}"""
+    data, _ = prepare_screening_data(df)
+    sections = _parse_pico_sections(criteria_text)
+    texts = (data["Title"].fillna("") + " " + data["Abstract"].fillna("")).tolist()
+    no_abs = _missing_abstract_mask(data["Abstract"].to_numpy())
+    lab = data["Human_Label"]
+    inc_rows = np.flatnonzero((lab == 1).to_numpy() & ~no_abs)
+    out = {"rules": [], "rules_text": "", "blocks": pd.DataFrame(), "usable": False, "reasons": [],
+           "n_include": int(len(inc_rows))}
+    if not any(re.search(r"[a-zA-Z]{3,}", sections.get(k, "")) for k, _ in CONCEPT_ELEMENTS):
+        out["reasons"].append("PICO(P·I/E·O)에 영어 핵심어가 없어 블록을 만들 수 없습니다. 영어로 적으면 자동 제안됩니다.")
+        return out
+    if len(inc_rows) < GATE_MIN_INCLUDE_AFTER:
+        out["reasons"].append(f"초록 있는 Include가 {len(inc_rows)}편 — 최소 {GATE_MIN_INCLUDE_AFTER}편이 있어야 블록을 검증할 수 있습니다.")
+        return out
+    vec = _concept_vectorizer()
+    try:
+        X = vec.fit_transform(texts).tocsr()
+    except ValueError:
+        out["reasons"].append("코퍼스에서 용어를 추출하지 못했습니다.")
+        return out
+    terms = vec.get_feature_names_out().tolist()
+    vocab = {t: i for i, t in enumerate(terms)}
+    abbr_pairs = harvest_abbreviations(texts)
+    blocks = _build_blocks(X, terms, vocab, inc_rows, sections, abbr_pairs=abbr_pairs)
+    if not blocks:
+        out["reasons"].append("PICO 핵심어가 코퍼스에 나오지 않아 블록을 만들 수 없습니다.")
+        return out
+    # 절차 전체 jackknife: Include i를 빼고 블록을 다시 만든 뒤, i가 그 블록을 통과하는가
+    jk_fail = {b["key"]: 0 for b in blocks}
+    for i in inc_rows:
+        others = inc_rows[inc_rows != i]
+        for b2 in _build_blocks(X, terms, vocab, others, sections, abbr_pairs=abbr_pairs):
+            if b2["key"] in jk_fail and X[i, b2["idx"]].sum() == 0:
+                jk_fail[b2["key"]] += 1
+    rows, kept = [], []
+    for b in blocks:
+        ok = b["include_coverage"] >= 1.0 and jk_fail[b["key"]] == 0 and b["corpus_pass_rate"] < 0.98
+        why = []
+        if b["include_coverage"] < 1.0:
+            why.append(f"Include 포함률 {b['include_coverage']*100:.0f}%")
+        if jk_fail[b["key"]]:
+            why.append(f"jackknife 탈락 {jk_fail[b['key']]}편")
+        if b["corpus_pass_rate"] >= 0.98:
+            why.append("거의 모든 문헌이 통과(거르는 효과 없음)")
+        rows.append({"개념": b["label"], "PICO 핵심어": ", ".join(b["seeds"]), "용어 수": len(b["terms"]),
+                     "용어": ", ".join(b["terms"]), "Include 포함률": f"{b['include_coverage']*100:.0f}%",
+                     "코퍼스 통과율": f"{b['corpus_pass_rate']*100:.1f}%",
+                     "Jackknife 탈락": jk_fail[b["key"]], "사용": "사용" if ok else "제외 — " + "; ".join(why)})
+        if ok:
+            kept.append(b)
+    abbr_set = frozenset(ab for _lf, ab in abbr_pairs)
+    lines = []
+    for b in kept:
+        forms = []
+        for t in b["terms"]:
+            for f_ in _concept_term(t, abbr_set).split(", "):   # 안전 쪽: 단수·복수 모두
+                if f_ not in forms:
+                    forms.append(f_)
+        lines.append(f"{b['label']}: " + ", ".join(forms))
+    out["rules_text"] = "\n".join(lines)
+    out["rules"] = parse_gate_rules_text(out["rules_text"]) if lines else []
+    out["blocks"] = pd.DataFrame(rows)
+    out["usable"] = bool(kept)
+    if not kept:
+        out["reasons"].append("검증을 통과한 블록이 없습니다. 규칙 없이 모델 순위만 사용합니다.")
+    return out
 
 
 def _gate_rule_masks(texts: np.ndarray, rules: list[tuple[str, str]]) -> dict[str, np.ndarray]:
@@ -987,6 +1259,10 @@ def build_gate(
     """
     rules = list(rules if rules is not None else GATE_RULES_DEFAULT)
     n_all = len(all_texts)
+    if not rules:
+        return {"active": False, "pass_mask": np.ones(n_all, dtype=bool),
+                "reasons": np.array([""] * n_all, dtype=object), "kept_rules": [],
+                "dropped_rules": {}, "stats": {}, "masks": {}}
     masks = _gate_rule_masks(all_texts, rules)
     # 초록이 없는 레코드는 용어 기반 규칙으로 판정할 수 없다. 규칙을 면제해 통과시키고,
     # 규칙 검증(FN 집계)에서도 제외한다. 이 레코드들은 별도 수기 확인 더미로 간다.
@@ -1016,6 +1292,7 @@ def build_gate(
         "kept_rules": [n for n, _ in kept],
         "dropped_rules": dropped,
         "stats": {},
+        "masks": masks,
     }
     if not kept:
         return info
@@ -1078,6 +1355,7 @@ def _crossfold_policy_evaluation(
     weights=None,
     gate_pass: np.ndarray | None = None,
     manual_review: np.ndarray | None = None,
+    gate_rule_masks: dict | None = None,
 ) -> dict:
     """Threshold/cutoff를 평가 행 자체의 라벨로 정하지 않도록 fold별 정책 검증을 수행한다.
 
@@ -1095,9 +1373,24 @@ def _crossfold_policy_evaluation(
     safe_excluded = np.zeros(len(y), dtype=bool)
     details = []
 
+    inc_all = y == 1
     for fold_no in sorted(int(x) for x in np.unique(folds) if int(x) > 0):
         va = folds == fold_no
         cal = ~va
+        # V36: 규칙 게이트도 calibration fold 라벨만으로 고른다(nested). 전체 라벨로 고른
+        # 규칙을 같은 라벨로 평가하면 게이트 FN이 정의상 0이 되는 누수를 막는다.
+        fold_rules: list[str] = []
+        if gate_rule_masks:
+            fold_gate = np.ones(len(y), dtype=bool)
+            for name, m in gate_rule_masks.items():
+                m = np.asarray(m, dtype=bool)
+                if int((inc_all & cal & ~m).sum()) == 0:
+                    fold_rules.append(name)
+                    fold_gate &= m
+            if fold_rules and (int((inc_all & cal & fold_gate).sum()) < GATE_MIN_INCLUDE_AFTER
+                               or int((cal & fold_gate).sum()) < GATE_MIN_LABELED_AFTER):
+                fold_rules, fold_gate = [], np.ones(len(y), dtype=bool)
+            gate = fold_gate
         cal_gate = cal & gate & ~manual
         # calibration fold에 두 클래스가 없으면 가장 보수적으로 전부 human review.
         if cal_gate.sum() < 4 or np.unique(y[cal_gate]).size < 2:
@@ -1125,6 +1418,7 @@ def _crossfold_policy_evaluation(
             "safe_recall": fold_safe_recall,
             "safe_fn": int((pos & safe_excluded).sum()),
             "safe_excluded_n": int((va & safe_excluded).sum()),
+            "gate_rules_in_fold": ", ".join(fold_rules),
         })
 
     priority_metrics = _weighted_screening_metrics(y, priority_pred, weights)
@@ -1693,7 +1987,9 @@ def apply_recall_target(result: ScreeningResult, recall_target: float, confidenc
     updated = _retier(result, threshold, "Recall-constrained WSS optimization")
     updated.metrics["recall_target"] = float(recall_target)
     updated.metrics["allowed_fn"] = int(allowed_fn)
-    updated.metrics["recall_lower_ci"] = recall_lower_confidence_bound(n_include, allowed_fn, confidence)
+    # V36: 하한은 계획값(allowed_fn)이 아니라 실제 관측 FN으로 계산한다.
+    updated.metrics["recall_lower_ci"] = recall_lower_confidence_bound(
+        n_include, int(updated.metrics.get("measured_fn", allowed_fn)), confidence)
     return updated
 
 
@@ -1711,6 +2007,10 @@ def train_and_predict(
     """
     data, _ = prepare_screening_data(df)
     labeled = data[data["Human_Label"].isin([0, 1])].copy()
+    # V36 재현성: 폴드 분할·학습 순서를 입력 행 순서가 아니라 레코드 내용 해시 순서로 고정한다.
+    # (같은 코퍼스를 다른 순서로 export해도 결과가 같아야 한다.)
+    labeled = labeled.assign(_order_key=_content_keys(labeled["Title"], labeled["Abstract"]))
+    labeled = labeled.sort_values(["_order_key", "Human_Label"], kind="stable").drop(columns="_order_key")
     if len(labeled) < MIN_LABELS_FOR_SUPERVISED or labeled["Human_Label"].nunique() < 2:
         raise ValueError(f"학습을 위해 Include와 Exclude가 모두 포함된 최소 {MIN_LABELS_FOR_SUPERVISED}개 라벨이 필요합니다.")
 
@@ -1785,9 +2085,11 @@ def train_and_predict(
 
     # 품질 게이트용 cross-fold policy evaluation:
     # 각 fold는 나머지 fold가 정한 threshold/cutoff만 적용받는다.
+    gate_masks_lab = ({name: np.asarray(m)[labeled_pos] for name, m in gate.get("masks", {}).items()}
+                      if gate.get("masks") else None)
     policy_eval = _crossfold_policy_evaluation(
         probs, y, cv_fold_id, recall_target, weights=weights, gate_pass=gate_pass_lab,
-        manual_review=no_abstract_lab,
+        manual_review=no_abstract_lab, gate_rule_masks=gate_masks_lab,
     )
 
     # 우선 검토 임계값: (가중) Recall ≥ 목표를 만족하면서 WSS가 최대인 값.
@@ -1971,8 +2273,15 @@ def train_and_predict(
     # 예측 테이블은 우선순위대로 정렬되므로, 입력 코퍼스의 행 순서를 복원할 키를 남긴다.
     # (validation 확장에서 '코퍼스 행 ↔ 확률'을 정렬하는 데 필요하다.)
     result_df["_Corpus_Row"] = np.arange(len(result_df), dtype=int)
-    metrics["run_fingerprint"] = run_fingerprint(data)
+    rules_used = list(gate_rules if gate_rules is not None else GATE_RULES_DEFAULT)
+    metrics["gate_rules_input"] = [list(r) for r in rules_used]
+    metrics["run_fingerprint"] = run_fingerprint(
+        data, extra=_fingerprint_extra("supervised", criteria_text, "", rules_used, recall_target))
     metrics["random_seed"] = int(RANDOM_SEED)
+    metrics["software"] = software_versions()
+    metrics["safe_metrics_in_sample_note"] = (
+        "safe_recall / safe_exclude_cv_false_negatives는 컷오프를 정한 같은 라벨에서 계산되므로 "
+        "정의상 FN이 거의 0이다. 성능 근거는 policy_* (fold-held-out, nested gate) 값을 쓴다.")
     result_df["Safety_Score"] = 1.0 - all_probs
     metrics["safety_signal_count"] = len(signals)
     result_df["Unanimous_Exclude"] = safe_all
@@ -2172,9 +2481,9 @@ def build_validation_report_excel_bytes(result: ScreeningResult) -> bytes:
         ("Fold-held-out priority Recall (unweighted)", _mv("policy_priority_recall_unweighted")),
         ("OOF Recall one-sided 95% lower bound", _mv("recall_lower_ci")),
         ("OOF min-fold Recall", _mv("min_fold_recall")),
-        ("Safe-exclude Recall (globally tuned, unweighted)", _mv("safe_recall")),
-        ("Safe-exclude Recall (globally tuned, sampling-weighted)", _mv("safe_recall_weighted")),
-        ("Safe-exclude Recall one-sided 95% lower bound (globally tuned)", _mv("safe_recall_lower_ci")),
+        ("Safe-exclude Recall (in-sample: cutoff set on these labels — not evidence)", _mv("safe_recall")),
+        ("Safe-exclude Recall (in-sample, sampling-weighted — not evidence)", _mv("safe_recall_weighted")),
+        ("Safe-exclude Recall lower bound (in-sample — not evidence)", _mv("safe_recall_lower_ci")),
         ("Fold-held-out safe Recall one-sided 95% lower bound", _mv("policy_safe_recall_lower_ci")),
         ("Fold-held-out safe Recall (sampling-weighted)", _mv("policy_safe_recall_weighted")),
         ("Fold-held-out safe Recall (unweighted)", _mv("policy_safe_recall_unweighted")),
@@ -2569,7 +2878,8 @@ def merge_validation_extension(
 # ---------------------------------------------------------------------------
 
 AUDIT_CONFIDENCE = 0.95
-AUDIT_EXPOSURE_PATTERN = GATE_RULES_DEFAULT[0][1] if GATE_RULES_DEFAULT else r"$^"
+# V36: 감사 층화에 쓰는 '노출어' 패턴은 프로젝트 규칙의 첫 줄에서 가져온다(없으면 층화 안 함).
+AUDIT_EXPOSURE_PATTERN = ""
 
 
 def _cp_upper(n: int, k: int = 0, confidence: float = AUDIT_CONFIDENCE) -> float:
@@ -2581,9 +2891,20 @@ def _cp_upper(n: int, k: int = 0, confidence: float = AUDIT_CONFIDENCE) -> float
     return float(_beta_dist.ppf(confidence, k + 1, n - k))
 
 
+def _audit_cells(pool: pd.DataFrame, exposure_pattern: str | None) -> list[str]:
+    reason = pool.get("Gate_Fail_Reason", pd.Series([""] * len(pool), index=pool.index)).fillna("")
+    reason = reason.where(reason.astype(str).str.len() > 0, "확률 기준 제외")
+    if not exposure_pattern:
+        return [str(r) for r in reason]
+    text = (pool.get("Title", pool.get("제목", pd.Series([""] * len(pool), index=pool.index))).fillna("").astype(str) + " "
+            + pool.get("Abstract", pool.get("초록", pd.Series([""] * len(pool), index=pool.index))).fillna("").astype(str)).str.lower()
+    has_exp = text.str.contains(exposure_pattern, regex=True, na=False)
+    return [f"{r} | 노출어 {'있음' if e else '없음'}" for r, e in zip(reason, has_exp)]
+
+
 def audit_risk_strata(
     predictions: pd.DataFrame,
-    exposure_pattern: str = AUDIT_EXPOSURE_PATTERN,
+    exposure_pattern: str | None = AUDIT_EXPOSURE_PATTERN,
     audit_labels: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """자동 제외 집합을 위험 셀로 나누고 셀별 누락 상한을 계산한다.
@@ -2595,12 +2916,7 @@ def audit_risk_strata(
     if pool.empty:
         raise ValueError("자동 제외 후보가 없어 감사 설계를 만들 수 없습니다.")
 
-    text = (pool.get("Title", pool.get("제목", pd.Series([""] * len(pool)))).fillna("").astype(str) + " "
-            + pool.get("Abstract", pool.get("초록", pd.Series([""] * len(pool)))).fillna("").astype(str)).str.lower()
-    has_exp = text.str.contains(exposure_pattern, regex=True, na=False)
-    reason = pool.get("Gate_Fail_Reason", pd.Series([""] * len(pool))).fillna("")
-    reason = reason.where(reason.astype(str).str.len() > 0, "확률 기준 제외")
-    pool["_audit_cell"] = [f"{r} | 노출어 {'있음' if e else '없음'}" for r, e in zip(reason, has_exp)]
+    pool["_audit_cell"] = _audit_cells(pool, exposure_pattern)
 
     # 셀 크기는 '실제 문헌 수'다. 표본가중치는 라벨 표본을 코퍼스로 환산할 때만 쓰는 값이라,
     # 이미 코퍼스 전체 행을 들고 있는 예측 테이블에 다시 곱하면 셀 합이 코퍼스를 초과한다.
@@ -2627,14 +2943,18 @@ def audit_risk_strata(
     for cell, grp in pool.groupby("_audit_cell"):
         idx = grp.index
         N = float(len(idx))
-        n_lab = int(lab.loc[idx].isin([0, 1]).sum()) + extra_n.get(str(cell), 0)
-        k = int((lab.loc[idx] == 1).sum()) + extra_k.get(str(cell), 0)
+        # V36: 개발용(validation) 라벨은 규칙·컷오프를 고르는 데 쓰였고 무작위 표본도 아니므로
+        # 감사 근거에서 뺀다. 참고용으로만 별도 열에 남긴다.
+        dev_n = int(lab.loc[idx].isin([0, 1]).sum())
+        n_lab = extra_n.get(str(cell), 0)
+        k = extra_k.get(str(cell), 0)
         ub = _cp_upper(n_lab, k)
         rows.append({
             "감사_셀": cell,
             "N_corpus": int(round(N)),
             "읽은_편수": n_lab,
             "발견_Include": k,
+            "개발라벨_편수(참고·제외)": dev_n,
             "누락률_95%상한": ub,
             "최대_누락_추정": ub * N,
         })
@@ -2670,17 +2990,12 @@ def recommend_audit_sizes(strata: pd.DataFrame, target_max_missed: float = 10.0)
 def build_risk_audit_sample(
     predictions: pd.DataFrame,
     sizes: pd.DataFrame,
-    exposure_pattern: str = AUDIT_EXPOSURE_PATTERN,
+    exposure_pattern: str | None = AUDIT_EXPOSURE_PATTERN,
     seed: int = 20260101,
 ) -> pd.DataFrame:
-    """셀별 '추가_필요_편수'만큼 자동 제외 집합에서 무작위로 뽑는다."""
+    """셀별 '추가_필요_편수'만큼 자동 제외 집합에서 무작위로 뽑는다(개발 라벨 문헌은 제외)."""
     pool = predictions[predictions["AI_Recommendation"] == "안전 제외 후보"].copy()
-    text = (pool.get("Title", pool.get("제목", pd.Series([""] * len(pool)))).fillna("").astype(str) + " "
-            + pool.get("Abstract", pool.get("초록", pd.Series([""] * len(pool)))).fillna("").astype(str)).str.lower()
-    has_exp = text.str.contains(exposure_pattern, regex=True, na=False)
-    reason = pool.get("Gate_Fail_Reason", pd.Series([""] * len(pool))).fillna("")
-    reason = reason.where(reason.astype(str).str.len() > 0, "확률 기준 제외")
-    pool["감사_셀"] = [f"{r} | 노출어 {'있음' if e else '없음'}" for r, e in zip(reason, has_exp)]
+    pool["감사_셀"] = _audit_cells(pool, exposure_pattern)
     already = pd.to_numeric(pool.get("Human_Label_Normalized", pd.Series([np.nan] * len(pool))),
                             errors="coerce").isin([0, 1])
 
@@ -2696,7 +3011,7 @@ def build_risk_audit_sample(
         take = int(min(take, len(grp)))
         picks.append(grp.iloc[np.sort(rng.choice(len(grp), size=take, replace=False))])
     if not picks:
-        raise ValueError("추가로 읽어야 할 문헌이 없습니다(이미 목표 상한을 만족).")
+        raise ValueError("추가로 읽어야 할 문헌이 없습니다(이미 목표 상한을 만족했거나, 남은 자동 제외 문헌이 모두 validation 라벨 문헌입니다).")
 
     out = pd.concat(picks).sample(frac=1.0, random_state=seed).reset_index(drop=True)
     out.insert(0, "Audit_No", np.arange(1, len(out) + 1))
@@ -2848,17 +3163,91 @@ def label_consistency_check(predictions: pd.DataFrame, flag_quantile: float = 0.
     return out, stats
 
 
+def _content_keys(titles, abstracts) -> np.ndarray:
+    """레코드 내용(정규화 제목+초록)의 SHA-256. 행 순서와 무관한 정렬 키로 쓴다."""
+    t = pd.Series(titles).fillna("").astype(str).str.strip().str.casefold()
+    a = pd.Series(abstracts).fillna("").astype(str).str.strip().str.casefold()
+    joined = (t + "\u001f" + a).tolist()
+    return np.array([hashlib.sha256(x.encode("utf-8", errors="ignore")).hexdigest() for x in joined], dtype=object)
+
+
+def _fingerprint_extra(mode: str, criteria_text: str = "", exclusion_text: str = "",
+                       gate_rules=None, recall_target=None) -> str:
+    rules_txt = "\u0003".join(f"{n}\u0004{p}" for n, p in (gate_rules or []))
+    crit = hashlib.sha256(f"{criteria_text}\u0005{exclusion_text}".encode("utf-8")).hexdigest()[:16]
+    rt = "" if recall_target is None else f"{float(recall_target):.4f}"
+    emb = f"emb={EMBEDDING_MODEL_NAME if embeddings_available() else 'none'}"
+    return f"{mode}|pico={crit}|rules={hashlib.sha256(rules_txt.encode('utf-8')).hexdigest()[:16]}|rt={rt}|{emb}"
+
+
 def run_fingerprint(df: pd.DataFrame, extra: str = "") -> str:
-    """같은 입력이면 같은 결과임을 증명할 수 있도록, 입력의 해시를 남긴다."""
+    """입력(제목·초록·라벨) + 알고리즘 버전 + 실행 설정(extra)의 해시.
+
+    V36: 레코드별 해시를 정렬한 뒤 합치므로 행 순서가 달라도 같은 코퍼스면 같은 지문이 나온다.
+    extra에는 PICO 해시, 규칙 해시, 목표 재현율, 임베딩 사용 여부가 들어간다(_fingerprint_extra).
+    """
     title_col = _find_col(df, ["title", "제목"]) or ""
     abs_col = _find_col(df, ["abstract", "초록"]) or ""
     lab_col = _find_col(df, ["human_label", "human_label_normalized", "label"]) or ""
-    parts = []
+    n = len(df)
+    cols = []
     for col in (title_col, abs_col, lab_col):
-        if col and col in df.columns:
-            parts.append("\u0001".join(df[col].fillna("").astype(str).tolist()))
-    payload = ("\u0002".join(parts) + f"|{ALGORITHM_VERSION}|seed={RANDOM_SEED}|{extra}").encode("utf-8")
+        cols.append(df[col].fillna("").astype(str).tolist() if col and col in df.columns else [""] * n)
+    rows = sorted(hashlib.sha256("\u0001".join(v).encode("utf-8", errors="ignore")).hexdigest()
+                  for v in zip(*cols)) if n else []
+    payload = ("\u0002".join(rows) + f"|{ALGORITHM_VERSION}|seed={RANDOM_SEED}|{extra}").encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16].upper()
+
+
+def software_versions() -> dict:
+    """재현성 기록용 실행 환경 버전."""
+    import platform
+    import sys
+    import scipy
+    import sklearn
+    out = {
+        "python": sys.version.split()[0], "platform": platform.platform(),
+        "numpy": np.__version__, "pandas": pd.__version__, "scikit_learn": sklearn.__version__,
+        "scipy": scipy.__version__, "algorithm_version": ALGORITHM_VERSION, "random_seed": RANDOM_SEED,
+        "embedding_model": EMBEDDING_MODEL_NAME if embeddings_available() else "not installed (TF-IDF fallback)",
+    }
+    try:
+        import sentence_transformers as _st_mod
+        out["sentence_transformers"] = _st_mod.__version__
+    except Exception:
+        out["sentence_transformers"] = "not installed"
+    return out
+
+
+def build_run_manifest(result: "ScreeningResult", criteria_text: str = "", exclusion_text: str = "",
+                       gate_rules=None, corpus: pd.DataFrame | None = None) -> bytes:
+    """실행 1회의 재현성 기록(JSON). 입력 해시·PICO 원문·규칙·버전·출력 해시를 남긴다."""
+    import json
+    m = result.metrics or {}
+    pred = result.predictions
+    out_cols = [c for c in ("Title", "AI_Recommendation", "Operational_Action") if c in pred.columns]
+    out_rows = sorted(hashlib.sha256("\u0001".join(map(str, r)).encode("utf-8", errors="ignore")).hexdigest()
+                      for r in pred[out_cols].itertuples(index=False)) if out_cols else []
+    corpus_hash = ""
+    if corpus is not None and len(corpus):
+        corpus_hash = hashlib.sha256(corpus.to_csv(index=False).encode("utf-8", errors="ignore")).hexdigest()
+    manifest = {
+        "sr_studio_version": ALGORITHM_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": m.get("mode", "supervised"),
+        "run_fingerprint": m.get("run_fingerprint", ""),
+        "input_corpus_sha256": corpus_hash,
+        "pico_text": criteria_text,
+        "pico_sha256": hashlib.sha256(criteria_text.encode("utf-8")).hexdigest(),
+        "exclusion_text": exclusion_text,
+        "gate_rules": [list(r) for r in (gate_rules if gate_rules is not None else m.get("gate_rules_input", []))],
+        "policy": {k: m.get(k) for k in ("recall_target", "threshold", "safe_cutoff", "auto_exclusion_enabled",
+                                         "quality_gate_status") if k in m},
+        "software": m.get("software") or software_versions(),
+        "output_sha256": hashlib.sha256("|".join(out_rows).encode("utf-8")).hexdigest(),
+        "n_records": int(len(pred)),
+    }
+    return json.dumps(manifest, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
 
 def bootstrap_extension_probabilities(
@@ -2971,11 +3360,12 @@ def rule_only_screen(
 
     # 지도학습 모드와 달리 Include 수 하한을 두지 않는다. 게이트의 근거는 "적격이려면 반드시
     # 등장하는 용어"라는 논리이고, 라벨은 그 논리가 깨지지 않았는지(FN=0) 확인할 뿐이다.
+    rules_in = list(gate_rules if gate_rules is not None else GATE_RULES_DEFAULT)
     kept = gate["kept_rules"]
     pass_mask = gate["pass_mask"]
     reasons = gate["reasons"]
     if not gate["active"] and kept:
-        rules_kept = [(n, p) for n, p in (gate_rules or GATE_RULES_DEFAULT) if n in kept]
+        rules_kept = [(n, p) for n, p in rules_in if n in kept]
         masks = _gate_rule_masks(texts, rules_kept)
         pass_mask = np.ones(len(texts), dtype=bool)
         why = [[] for _ in range(len(texts))]
@@ -2987,7 +3377,28 @@ def rule_only_screen(
         reasons = np.array(["; ".join(r) for r in why], dtype=object)
     lab_pass = pass_mask[labeled_pos] if len(labeled_pos) else np.array([], dtype=bool)
     gate_fn = int(((y == 1) & ~lab_pass).sum()) if len(labeled_pos) else 0
-    usable = bool(kept) and gate_fn == 0 and int(lab_pass.sum()) >= min(RULE_ONLY_MIN_LABELED_PASS, len(labeled_pos))
+    inc_pass = int(((y == 1) & lab_pass).sum()) if len(labeled_pos) else 0
+    # V36: 라벨이 없거나 Include가 너무 적으면 'FN=0'은 아무것도 증명하지 못한다.
+    # (V35는 라벨 0개일 때 min(20, 0)=0이 되어 규칙이 무조건 적용되는 구멍이 있었다.)
+    usable = (bool(kept) and len(labeled_pos) > 0 and gate_fn == 0
+              and inc_pass >= GATE_MIN_INCLUDE_AFTER
+              and int(lab_pass.sum()) >= min(RULE_ONLY_MIN_LABELED_PASS, len(labeled_pos)))
+
+    # Jackknife 점검: Include 한 편을 빼고 규칙을 다시 고르면, 그 Include가 떨어지는가.
+    # 규칙 선택에 쓰지 않은 Include에 대한 정직한 누락 추정이다.
+    jk_fn = 0
+    if len(labeled_pos) and rules_in and gate.get("masks"):
+        masks_lab = {n: np.asarray(m)[labeled_pos] for n, m in gate["masks"].items()}
+        inc_idx = np.flatnonzero(y == 1)
+        for i in inc_idx:
+            others = np.ones(len(y), dtype=bool)
+            others[i] = False
+            sel = [n for n, m in masks_lab.items() if int(((y == 1) & others & ~m).sum()) == 0]
+            if sel and not all(masks_lab[n][i] for n in sel):
+                jk_fn += 1
+        if jk_fn > 0:
+            usable = False
+    n_inc_lab = int((y == 1).sum()) if len(labeled_pos) else 0
 
     # 읽는 순서: PICO 유사도(zero-shot). 제외 여부에는 쓰지 않는다.
     score = bootstrap_extension_probabilities(data, criteria_text, exclusion_text)
@@ -3032,7 +3443,12 @@ def rule_only_screen(
         "mode": "rule_only",
         "algorithm_version": ALGORITHM_VERSION,
         "random_seed": int(RANDOM_SEED),
-        "run_fingerprint": run_fingerprint(data, extra="rule_only"),
+        "run_fingerprint": run_fingerprint(
+            data, extra=_fingerprint_extra("rule_only", criteria_text, exclusion_text, rules_in)),
+        "gate_rules_input": [list(r) for r in rules_in],
+        "gate_jackknife_fn": int(jk_fn),
+        "rule_retention_lower_ci": (recall_lower_confidence_bound(n_inc_lab, gate_fn, 0.95) if n_inc_lab else 0.0),
+        "software": software_versions(),
         "n_total": int(len(data)),
         "labeled_n": int(len(labeled_pos)),
         "include_n": int((y == 1).sum()) if len(labeled_pos) else 0,
@@ -3045,8 +3461,17 @@ def rule_only_screen(
         "human_review_n": int((rec != "안전 제외 후보").sum()),
         "no_abstract_n": int(no_abs.sum()),
         "quality_gate_status": "PASS" if usable else "REVIEW",
-        "quality_gate_reasons": ([] if usable else
-                                 ["규칙이 human Include를 제외했거나 적용 가능한 규칙이 없음"]),
+        "quality_gate_reasons": ([] if usable else [r for r in [
+            "자동 제외 규칙이 입력되지 않음(PICO 화면의 「자동 제외 규칙」)" if not rules_in else "",
+            "라벨이 없음" if not len(labeled_pos) else "",
+            f"규칙이 human Include {gate_fn}편을 제외함" if gate_fn else "",
+            (f"규칙 통과 Include {inc_pass}편 < {GATE_MIN_INCLUDE_AFTER}편 — FN=0이 근거가 되지 못함"
+             if rules_in and len(labeled_pos) and inc_pass < GATE_MIN_INCLUDE_AFTER else ""),
+            f"Jackknife 점검에서 Include {jk_fn}편이 규칙에 의해 떨어짐" if jk_fn else "",
+            (f"규칙을 통과한 라벨 문헌 {int(lab_pass.sum())}편 < {min(RULE_ONLY_MIN_LABELED_PASS, len(labeled_pos))}편 — 검증 표본 부족"
+             if rules_in and len(labeled_pos) and int(lab_pass.sum()) < min(RULE_ONLY_MIN_LABELED_PASS, len(labeled_pos)) else ""),
+            "적용 가능한 규칙이 없음" if rules_in and not kept else "",
+        ] if r]),
         "deterministic": True,
     }
     if len(labeled_pos):

@@ -67,7 +67,9 @@ def check_pipeline() -> None:
     # 초록 없는 레코드는 절대 자동 제외되면 안 된다.
     na = r.predictions["No_Abstract"].astype(bool)
     assert not (r.predictions.loc[na, "AI_Recommendation"] == "안전 제외 후보").any()
-    assert S.GATE_RULES_DEFAULT, "기본 게이트 규칙이 비어 있음"
+    # V36: 주제 특이적 규칙은 코드 기본값이 아니라 프로젝트 입력이다.
+    assert S.GATE_RULES_DEFAULT == [], "기본 게이트 규칙은 비어 있어야 함(V36)"
+    LEG = S.LEGACY_NITROSAMINE_CVD_GATE_RULES
 
     # 감사 설계 / known-item / 보고서가 실제로 생성되는지
     st_tab = S.audit_risk_strata(r.predictions)
@@ -100,8 +102,8 @@ def check_pipeline() -> None:
     assert len(bp) == len(corpus) and float(np.nanmax(bp)) <= 1.0
 
     # 규칙 기반 단독 모드: 모델 없이도 돌고, 두 번 돌려 결과가 완전히 같아야 한다
-    ro1 = S.rule_only_screen(df, "Outcome: cardiovascular atherosclerosis serum lipid")
-    ro2 = S.rule_only_screen(df, "Outcome: cardiovascular atherosclerosis serum lipid")
+    ro1 = S.rule_only_screen(df, "Outcome: cardiovascular atherosclerosis serum lipid", gate_rules=LEG)
+    ro2 = S.rule_only_screen(df, "Outcome: cardiovascular atherosclerosis serum lipid", gate_rules=LEG)
     k1 = ro1.predictions.sort_values("_Corpus_Row")["AI_Recommendation"].tolist()
     k2 = ro2.predictions.sort_values("_Corpus_Row")["AI_Recommendation"].tolist()
     assert k1 == k2, "규칙 모드가 비결정적"
@@ -125,7 +127,7 @@ def check_pipeline() -> None:
     lock_idx = np.flatnonzero(tier != "안전 제외 후보")
     d_lock.loc[lock_idx, "Human_Review_Locked"] = 1
     d_lock.loc[lock_idx, "초록"] = "Unrelated spectroscopy method development text."
-    ro3 = S.rule_only_screen(d_lock, "Outcome: cardiovascular atherosclerosis serum lipid")
+    ro3 = S.rule_only_screen(d_lock, "Outcome: cardiovascular atherosclerosis serum lipid", gate_rules=LEG)
     after = ro3.predictions.set_index("_Corpus_Row").loc[lock_idx, "AI_Recommendation"]
     assert not (after == "안전 제외 후보").any(), "lock된 문헌이 자동 제외로 되돌아감"
 
@@ -177,5 +179,5 @@ if __name__ == "__main__":
     check_app_imports()
     check_widget_key_collisions()
     check_pipeline()
-    print("V31 self-test: PASS")
+    print("V31 self-test (V36 정책 반영): PASS")
     sys.exit(0)

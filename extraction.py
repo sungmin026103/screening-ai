@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import re
 
-import numpy as np
 import pandas as pd
 
 NUMERIC_REQ = ["Mean_treat", "SD_treat", "N_treat", "Mean_control", "SD_control", "N_control"]

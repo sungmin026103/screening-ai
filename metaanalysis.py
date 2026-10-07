@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import matplotlib
 matplotlib.use("Agg")  # headless/thread-safe backend for Streamlit

@@ -13,16 +13,16 @@ import pandas as pd
 
 import rmeta
 import advanced
-from metaanalysis import (
-    ForestSummary, baujat_plot, eggers_test, fig_to_png_bytes, forest_plot_from_R, funnel_plot_from_R,
-    gosh_plot, influence_plot, leave_one_out_plot, pool_random_effects, trim_and_fill, trim_fill_plot,
-)
+from metaanalysis import fig_to_png_bytes
 
+# V36: 인천대 파이프라인과 같은 폴더 구조. forest는 논문용 V1 디자인으로 통일.
 FIG_DIRS = {
-    "forest": "01_Forest_Plots", "funnel": "02_Funnel_Plots", "trimfill": "03_TrimFill_Plots",
+    "forest": "01_Forest_Plots",
+    "funnel": "02_Funnel_Plots", "trimfill": "03_TrimFill_Plots", "subgroup": "04_Subgroup_Plots",
     "leave1out": "05_LeaveOneOut_Plots", "influence": "06_Influence_Plots", "baujat": "07_Baujat_Plots",
-    "gosh": "08_GOSH_Plots",
+    "gosh": "08_GOSH_Plots", "robustness": "16_Robustness_Plots",
 }
+_FILE_NAME = {"forest": "forest_{o}"}
 
 
 def _year(study) -> float:
@@ -35,50 +35,13 @@ def _slug(name: str) -> str:
 
 
 def analyze_outcome(d: pd.DataFrame, outcome: str, ci_mode: str = "CR2") -> dict:
-    d = d.copy()
-    d["_yr"] = d["Study"].map(_year)
-    order = ["_yr", "Study"] + [c for c in ("Intervention", "dose") if c in d.columns]
-    d = d.sort_values(order, na_position="last", kind="stable").reset_index(drop=True)
-
+    """데이터 추출 시트 1개 → 결과 객체. 계산은 R 파이프라인(01_stat_analysis.R)과 같다.
+    V36: 결과 객체 생성은 meta_sections._finish_result로 일원화(Forest/Sensitivity/Trim-and-fill 공용)."""
+    import meta_sections as _ms
+    d = _ms._sort_effects(d)
     g, v = rmeta.escalc_smd(d.Mean_treat, d.SD_treat, d.N_treat, d.Mean_control, d.SD_control, d.N_control)
     fit = rmeta.fit_three_level(g, v, d["Study"])
-    use_cr2 = ci_mode.upper().startswith("CR2") and np.isfinite(fit.cr2_ci_lb)
-    summary = ForestSummary(
-        g=fit.mu,
-        ci_lb=fit.cr2_ci_lb if use_cr2 else fit.ci_lb, ci_ub=fit.cr2_ci_ub if use_cr2 else fit.ci_ub,
-        p_value=fit.cr2_p if use_cr2 else fit.pval, k=fit.k, i2=fit.i2,
-        tau2=fit.tau2_L2 + fit.tau2_L3, tau2_L2=fit.tau2_L2, tau2_L3=fit.tau2_L3,
-        pi_lb=fit.pi_lb, pi_ub=fit.pi_ub,
-        ci_note=f"CR2 (Satterthwaite df = {fit.cr2_df:.1f})" if use_cr2 else f"model-based t (df = {fit.k - 1})",
-    )
-
-    multi = d["Study"].map(d["Study"].value_counts()) > 1
-    label = d["Study"].astype(str)
-    if "dose" in d.columns:
-        label = np.where(multi & d["dose"].notna(), label + " · " + d["dose"].astype(str), label)
-    label = pd.Series(label, index=d.index)
-    extra_cols = [c for c in d.columns if str(c).startswith("Extra_")]
-    if extra_cols:
-        dup = label.duplicated(keep=False)
-        tag = d[extra_cols].map(lambda x: "" if pd.isna(x) else str(x)).agg(" ".join, axis=1).str.strip()
-        label = label.where(~dup | (tag == ""), label + " · " + tag)
-    se = np.sqrt(v)
-    sub = pd.DataFrame({
-        "study": label, "yi": g, "vi": v, "ci_lo": g - 1.96 * se, "ci_hi": g + 1.96 * se, "weight_pct": fit.weights,
-        "mean_treat": d.Mean_treat, "sd_treat": d.SD_treat, "n_treat": d.N_treat,
-        "mean_control": d.Mean_control, "sd_control": d.SD_control, "n_control": d.N_control,
-    })
-
-    eff = pd.DataFrame({"study": d["Study"].astype(str), "yi": g, "vi": v})
-    study_df = rmeta.aggregate_cs(eff)
-    n_st = len(study_df)
-    out = {"outcome": outcome, "data": d.drop(columns="_yr"), "g": g, "vi": v, "fit": fit, "summary": summary,
-           "sub": sub, "study_df": study_df, "pooled": None, "egger": None, "trimfill": None}
-    if n_st >= 3:
-        out["pooled"] = pool_random_effects(study_df)
-        out["egger"] = eggers_test(study_df)
-        out["trimfill"] = trim_and_fill(study_df)
-    return out
+    return _ms._finish_result(outcome, d, g, v, fit, _ms._summary_from_fit(fit, ci_mode))
 
 
 def summary_row(res: dict) -> dict:
@@ -105,27 +68,22 @@ def summary_row(res: dict) -> dict:
     return row
 
 
-def make_figures(res: dict, which: tuple[str, ...] = tuple(FIG_DIRS)) -> dict[str, "plt.Figure"]:
+def make_figures(res: dict, which: tuple[str, ...] = tuple(FIG_DIRS), settings: dict | None = None,
+                 ci_mode: str = "CR2") -> dict[str, "plt.Figure"]:
+    import meta_sections as _ms
     o = res["outcome"]
+    st = settings or _ms.default_settings(o)
     figs = {}
-    if "forest" in which:
-        figs["forest"] = forest_plot_from_R(res["sub"], res["summary"], title=o)
-    pooled, sd = res["pooled"], res["study_df"]
-    if pooled is None:
-        return figs
-    if "funnel" in which:
-        center = ForestSummary(g=pooled.beta, ci_lb=pooled.ci[0], ci_ub=pooled.ci[1])
-        figs["funnel"] = funnel_plot_from_R(sd, center, res["egger"], title=o)
-    if "trimfill" in which:
-        figs["trimfill"] = trim_fill_plot(res["trimfill"], title=o)
-    if "leave1out" in which:
-        figs["leave1out"] = leave_one_out_plot(sd, pooled, title=f"Leave-one-out — {o}")
-    if "influence" in which:
-        figs["influence"] = influence_plot(sd, pooled, title=o)
-    if "baujat" in which:
-        figs["baujat"] = baujat_plot(sd, pooled, title=f"Baujat plot — {o}")
-    if "gosh" in which and len(sd) >= 4:
-        figs["gosh"] = gosh_plot(sd, n_iter=1200, title=f"GOSH plot — {o}")
+    for kind in which:
+        try:
+            if kind == "forest":
+                fig = _ms.forest_fig(res, {**st, "style": 1})
+            else:
+                fig = _ms.make_figure(kind, res, st, ci_mode)
+        except Exception:
+            fig = None
+        if fig is not None:
+            figs[kind] = fig
     return figs
 
 
@@ -159,7 +117,8 @@ def build_figure_zip(results: list[dict], qc: pd.DataFrame | None = None, dpi: i
         for i, r in enumerate(results):
             figs = make_figures(r)
             for kind, fig in figs.items():
-                zf.writestr(f"{FIG_DIRS[kind]}/{kind}_{_slug(r['outcome'])}.png", fig_to_png_bytes(fig, dpi=dpi))
+                name = _FILE_NAME.get(kind, kind + "_{o}").format(o=_slug(r["outcome"]))
+                zf.writestr(f"{FIG_DIRS[kind]}/{name}.png", fig_to_png_bytes(fig, dpi=dpi))
                 plt.close(fig)
             for row, fig in advanced.run_advanced(r):
                 sig = row["Status"] == "CREATED" and np.isfinite(row["p (분류 기준)"]) and row["p (분류 기준)"] < 0.05

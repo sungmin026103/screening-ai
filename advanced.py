@@ -216,13 +216,27 @@ def _pcurve(d, outcome):
 
 
 def run_advanced(res: dict) -> list[tuple[dict, "plt.Figure | None"]]:
+    """V36: 입력 형식(원자료/효과크기/R 출력)에 따라 필요한 열이 없을 수 있으므로,
+    분석별로 실행 조건을 확인하고 실패해도 다른 분석은 계속한다(SKIPPED/FAILED 행으로 기록)."""
     d, g, vi, o = res["data"], np.asarray(res["g"]), np.asarray(res["vi"]), res["outcome"]
-    out = [
-        _metareg_continuous(d, g, vi, "Intervention_day", "Duration (days)", o),
-        _metareg_continuous(d, g, vi, "Species_age_wk", "Age (weeks)", o),
-        _dose_response(d, g, vi, o),
-        _pet_peese(res["study_df"], o),
-        _selection(res["study_df"], o, res["fit"].mu),
-        _pcurve(d, o),
+    raw_cols = {"Mean_treat", "SD_treat", "N_treat", "Mean_control", "SD_control", "N_control"}
+    jobs = [
+        ("Meta-regression (Duration (days))", lambda: _metareg_continuous(d, g, vi, "Intervention_day", "Duration (days)", o),
+         "Intervention_day" in d.columns),
+        ("Meta-regression (Age (weeks))", lambda: _metareg_continuous(d, g, vi, "Species_age_wk", "Age (weeks)", o),
+         "Species_age_wk" in d.columns),
+        ("Dose-response (log2 dose, within-study centered)", lambda: _dose_response(d, g, vi, o), "dose" in d.columns),
+        ("PET-PEESE", lambda: _pet_peese(res["study_df"], o), True),
+        ("Selection model (Vevea-Hedges, p cut .025)", lambda: _selection(res["study_df"], o, res["fit"].mu), True),
+        ("p-curve (effect-level, binomial right-skew)", lambda: _pcurve(d, o), raw_cols.issubset(d.columns)),
     ]
+    out = []
+    for name, fn, ok in jobs:
+        if not ok:
+            out.append((_row(name, o, "SKIPPED", detail="필요한 열이 입력에 없음"), None))
+            continue
+        try:
+            out.append(fn())
+        except Exception as exc:  # 한 분석의 실패가 전체를 막지 않게
+            out.append((_row(name, o, "FAILED", detail=f"{type(exc).__name__}: {exc}"[:200]), None))
     return out
