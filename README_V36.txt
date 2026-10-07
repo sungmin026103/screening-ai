@@ -1,5 +1,7 @@
 SR studio VER 36 — 메타분석 Figure 섹션 재구성 · V1 forest 디자인 · Table S2 생성 · 범용 스크리닝(자동 개념 게이트) · UI 개편
 
+[V36.2] 메타분석 화면을 그림 + Table S2만 남기도록 정리, forest 라벨 겹침·범례 넘침 수정(아래 [1]).
+
 [V36.1 변경 요약]
  · Forest plot은 V1 디자인 하나로 통일(화면·섹션 zip·일괄 zip 모두). V2와 기존(legacy) forest는 내보내지 않는다.
  · 「Table S2」 탭: 올려주신 Supplementary_carotenoid.docx의 Table S2 형식 그대로
@@ -21,29 +23,18 @@ SR studio VER 36 — 메타분석 Figure 섹션 재구성 · V1 forest 디자인
   README_V36.txt        이 문서
 
 ──────────────────────────────────────────────────────────────────────────
-[1] 메타분석 Figure 화면 (meta_page.py)
+[1] 메타분석 Figure 화면 (meta_page.py) — V36.2에서 단순화
 ──────────────────────────────────────────────────────────────────────────
-입력: 데이터 추출 엑셀(outcome별 시트) · R r_outputs zip · CSV(원자료 Mean/SD/N 또는 Study+yi+vi,
-      'Outcome' 열이 있으면 outcome별로 나눔). Pooled 95% CI는 CR2 / 모델 기반 중 선택.
-
-탭
-  요약 · 실시간   evidence map(outcome별 g·CI), 요약표, ★실시간 민감도 탐색기
-                  — 연구를 빼거나 ρ(연구 내 상관)를 움직이면 3-level 모형이 즉시 재적합되고
-                    카드 수치와 forest가 애니메이션으로 바뀐다(화면 확인용, 저장물에는 반영 안 됨).
-  Forest plot     업로드한 V1 디자인. 제목·부제·효과 방향·라벨·CI 각주·x축 범위를 바꾸면
-                  미리보기가 바로 갱신(st.fragment). outcome별 설정은 세션에 저장되어 일괄 zip에도 적용.
-                  부분군 forest(독립 연구 ≥3인 범주 ≥2개, Q_M 검정 — R과 동일 규칙).
-  Sensitivity     Leave-one-out · Influence(studentized residual + Cook's D) · Baujat · GOSH(모든 부분집합)
-                  · Robustness 요약(Primary / study-level / Bonferroni outlier 제외 / influential 제외 /
-                  LOO 최저·최고 / trim-and-fill).
-  Trim-and-fill   trim-and-fill funnel(관측 ●, 채운 연구 ○) · contour-enhanced funnel + Egger 선 · 보정 전후 비교.
-  Table S2        실험군·대조군 원자료 표(사용자 Supplementary 형식) — Word 생성 또는 기존 워드에 교체.
-                  (참고용 추가 수치표 S1–S9는 같은 탭의 접힌 영역에)
-  일괄 다운로드   모든 figure(V1 forest, 민감도, trim-and-fill, 고급 분석) + 결과표 zip.
-
-각 그림: PNG · TIFF(LZW) · PDF · SVG, 300/600/1000 dpi. 섹션마다 '전체 outcome zip'(수치표 xlsx 포함).
-폴더 구조는 인천대 파이프라인과 같다(01_Forest_Plots · 02_Funnel · 03_TrimFill · 04_Subgroup ·
-05_LeaveOneOut · 06_Influence · 07_Baujat · 08_GOSH · 16_Robustness).
+입력: 데이터 추출 엑셀(outcome별 시트) · R r_outputs zip · CSV. Pooled 95% CI는 CR2(R 파이프라인 주 추론)로 고정.
+화면에는 그림과 다운로드만 둔다.
+  Forest plot     V1 forest + (조건이 되면) 부분군 forest. 「제목 · 효과 방향」만 접힌 칸에서 수정.
+  Sensitivity     Leave-one-out · Influence · Baujat · GOSH · Robustness
+  Trim-and-fill   Trim-and-fill funnel · Contour-enhanced funnel · 보정 전후 비교
+  Table S2        forest plot과 같은 outcome·행 순서로 Supplementary 형식 Table S2(Word) 바로 다운로드
+각 그림 아래 「고해상도 파일 만들기」 → PNG·TIFF(600 dpi)·PDF. 탭마다 모든 outcome zip(PNG 600 dpi + PDF).
+V36.2 forest 레이아웃: 셀 안 줄바꿈이 있는 연구명(예: "Huang⏎(2018)")을 한 줄로 정리해 행 겹침 제거,
+범례가 한 줄에 9.5 pt 미만이 되면 두 줄로 배치, 파일명에서 온 제목의 '_'를 공백으로.
+삭제: CI 방법 선택, 실시간 민감도 탐색기, evidence map·요약 카드, S1–S9 표, 기존 워드 교체, 일괄 다운로드 탭.
 
 수치 검증(selftest_v36.py, TG): 3-level pooled·CR2·PI, CS 집계, leave1out, influence(rstudent·Cook),
 baujat, Egger, trim-and-fill, subgroup Q_M, outlier/influential 제외 민감도가 R(metafor/clubSandwich)

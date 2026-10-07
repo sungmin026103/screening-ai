@@ -104,8 +104,14 @@ INCREASE_BENEFICIAL_HINTS = (
 
 
 def short_title(outcome: str) -> str:
-    key = str(outcome).strip()
-    return SHORT_TITLES.get(key.upper(), SHORT_TITLES.get(key.upper().replace(" ", "_"), key))
+    key = clean_label(outcome)
+    hit = SHORT_TITLES.get(key.upper(), SHORT_TITLES.get(key.upper().replace(" ", "_")))
+    return hit or clean_label(key.replace("_", " "))
+
+
+def clean_label(s) -> str:
+    """엑셀 셀 안 줄바꿈·연속 공백을 한 칸으로(라벨이 두 줄로 그려져 겹치는 것 방지)."""
+    return re.sub(r"\s+", " ", str(s)).strip()
 
 
 def default_favours(outcome: str) -> tuple[str, str]:
@@ -259,23 +265,47 @@ def _sym(ax, kind, cx, y, color_sq, color_dia):
         ax.plot([cx, cx], [y - 0.06, y + 0.06], color="#555555", lw=0.8, ls=(0, (2, 1.6)))
 
 
-def _legend_one_row(ax, x0, x1, y, items, color_sq, color_dia, face, edge):
-    symw, pad, mgap, margin = 0.20, 0.05, 0.10, 0.08
-    fs = PT_LEGEND_MAX
+LEGEND_MIN_ONE_ROW = 9.5   # 한 줄이면 이 크기보다 작아질 때 두 줄로 나눈다
+
+
+def _legend_fit(items, avail, symw, pad, mgap, margin, fs_max):
+    fs = fs_max
     while True:
-        widths = [symw + pad + tw(lab, fs) for _, lab in items]
-        if sum(widths) + mgap * (len(items) - 1) + 2 * margin <= (x1 - x0) or fs <= 4:
-            break
+        widths = [symw + pad + tw(lab, fs) * 1.04 for _, lab in items]
+        if sum(widths) + mgap * (len(items) - 1) + 2 * margin <= avail or fs <= 5:
+            return fs, widths
         fs = round(fs - 0.1, 1)
-    gap = ((x1 - x0) - 2 * margin - sum(widths)) / max(len(items) - 1, 1)
-    h = fs / 72 * 1.9
-    ax.add_patch(FancyBboxPatch((x0, y - h / 2), x1 - x0, h, boxstyle="round,pad=0,rounding_size=0.03",
+
+
+def _legend_one_row(ax, x0, x1, y, items, color_sq, color_dia, face, edge):
+    """범례 상자(y = 위 가장자리). 한 줄로 9.5 pt 이상이 안 되면 두 줄(위·아래 균형)로 나눈다. 반환: 상자 높이."""
+    symw, pad, mgap, margin = 0.20, 0.05, 0.14, 0.10
+    avail = x1 - x0
+    fs, widths = _legend_fit(items, avail, symw, pad, mgap, margin, PT_LEGEND_MAX)
+    rows = [list(zip(items, widths))]
+    if fs < LEGEND_MIN_ONE_ROW and len(items) >= 3:
+        cut = (len(items) + 1) // 2
+        groups = [items[:cut], items[cut:]]
+        fs = min(_legend_fit(g, avail, symw, pad, mgap, margin, PT_LEGEND_MAX - 1)[0] for g in groups)
+        rows = [list(zip(g, [symw + pad + tw(lab, fs) * 1.04 for _, lab in g])) for g in groups]
+    line_h = fs / 72 * 1.75
+    h = line_h * len(rows) + fs / 72 * 0.35
+    ax.add_patch(FancyBboxPatch((x0, y), avail, h, boxstyle="round,pad=0,rounding_size=0.03",
                                 facecolor=face, edgecolor=edge, lw=0.7, zorder=0))
-    x = x0 + margin
-    for (kind, lab), w in zip(items, widths):
-        _sym(ax, kind, x + symw / 2, y, color_sq, color_dia)
-        ax.text(x + symw + pad, y, lab, fontsize=fs, va="center", ha="left", color="#222222")
-        x += w + gap
+    top = y + fs / 72 * 0.175 + line_h / 2
+    for ri, row in enumerate(rows):
+        yy = top + ri * line_h
+        total = sum(w for _, w in row)
+        if len(rows) == 1:
+            gap = (avail - 2 * margin - total) / max(len(row) - 1, 1)
+            x = x0 + margin
+        else:                                   # 두 줄: 같은 간격으로 가운데 정렬
+            gap = mgap * 1.6
+            x = x0 + (avail - total - gap * (len(row) - 1)) / 2
+        for (kind, lab), w in row:
+            _sym(ax, kind, x + symw / 2, yy, color_sq, color_dia)
+            ax.text(x + symw + pad, yy, lab, fontsize=fs, va="center", ha="left", color="#222222")
+            x += w + gap
     return h
 
 
@@ -327,6 +357,7 @@ def render(rows, pooled: Pooled | None, opts: ForestOptions, marker: str = "sq")
     """rows: (kind, label, est, lb, ub, extra) 목록. kind = study | header | subtotal | gap.
     pooled=None이면 pooled 행 없이 그린다. 좌표는 inch(캔버스 = 인쇄 크기)."""
     style = 1 if int(opts.style) != 2 else 2
+    rows = [(r[0], clean_label(r[1]) if r[1] is not None else r[1]) + tuple(r[2:]) for r in rows]
     pal = V1_PAL if style == 1 else V2_PAL
     mk = pal["ink"] if style == 1 else pal["teal"]
     dia_col = pal["blue"] if style == 1 else pal["teal"]
@@ -420,7 +451,7 @@ def render(rows, pooled: Pooled | None, opts: ForestOptions, marker: str = "sq")
     y_ax = y_bottom_data + 0.20
     y_tick = y_ax + 0.06
     y_fav = y_tick + 0.34
-    y_leg = (y_fav + 0.30) if opts.favours else (y_tick + 0.42)
+    y_leg = (y_fav + 0.20) if opts.favours else (y_tick + 0.32)
     H = y_leg + 1.6
 
     with mpl.rc_context(RC):
@@ -525,14 +556,14 @@ def render(rows, pooled: Pooled | None, opts: ForestOptions, marker: str = "sq")
 
         items = opts.legend_items or default_legend(opts.effect_label, show_pi)
         lh = _legend_one_row(ax, 0.0, W, y_leg, items, mk, dia_col, pal["leg_face"], pal["leg_edge"])
-        yf = y_leg + lh / 2 + 0.17
+        yf = y_leg + lh + 0.17
         lines = []
         for ln in [ln for ln in opts.footer_lines if ln]:
             lines += _wrap(ln, W - 2 * cs)
         for line in lines:
             ax.text(cs, yf, line, fontsize=PT, va="center", color="#222222")
             yf += 0.21
-        H2 = (yf - 0.21 + 0.14) if lines else (y_leg + lh / 2 + 0.08)
+        H2 = (yf - 0.21 + 0.14) if lines else (y_leg + lh + 0.08)
         ax.set_ylim(H2, 0)
         fig.set_size_inches(W, H2)
     return fig

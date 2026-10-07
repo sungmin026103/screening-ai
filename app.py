@@ -1663,7 +1663,7 @@ elif nav == "analytics":
         st.plotly_chart(fig2, width="stretch")
 
 # ===========================================================================
-# 6. 메타분석 Figure (V36: meta_page.py — Forest / Sensitivity / Trim-and-fill / Supplementary)
+# 6. 메타분석 Figure (V36: meta_page.py — Forest / Sensitivity / Trim-and-fill / Table S2)
 # ===========================================================================
 elif nav == "meta":
     import meta_page
