@@ -659,8 +659,8 @@ def _upper_error(xc_lo, xc_hi, t_top, ink, dark, bar_w):
     for g in _group([r[0] for r in capish]):              # 위에서부터
         rr = [r for r in capish if r[0] in g]
         widths = [r[1] for r in rr]
-        left = float(np.min([xl - r[2] for r in rr]))
-        right = float(np.min([r[3] - xl for r in rr]))
+        left = float(np.median([xl - r[2] for r in rr]))
+        right = float(np.median([r[3] - xl for r in rr]))
         sym = abs(left - right) <= max(2.0, 0.3 * max(left, right))
         thin = len(g) <= 0.5 * np.median(widths)
         cands.append({"row": (g[0] + g[-1]) / 2.0, "left": left, "right": right, "sym": sym, "thin": thin})
@@ -726,32 +726,146 @@ def _find_points(ink, dark, ax: Axis):
     return items
 
 
+def _clean_label(t: str) -> str:
+    """OCR 그룹 이름 다듬기: 앞뒤 잡기호·중복 공백 제거."""
+    t = re.sub(r"^[^\w(+\-]+|[^\w)%+\-]+$", "", t.strip())
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _rot_lines(crop: Image.Image, ang: float, f: float, words: bool = False):
+    """crop을 시계 방향으로 ang도 돌려(기울어진 글자를 수평으로) OCR → 줄 목록.
+    각 줄: (글자, 평균 신뢰도, 줄 끝(오른쪽) 점의 crop 좌표, 줄 중심의 crop 좌표)."""
+    w0, h0 = crop.size
+    rot = crop.rotate(-ang, expand=True, fillcolor=255, resample=Image.BICUBIC) if ang else crop
+    big = rot.resize((max(1, int(rot.width * f)), max(1, int(rot.height * f))), Image.LANCZOS)
+    try:
+        d = pytesseract.image_to_data(big, config=f"--psm {6 if words else 11}", output_type=pytesseract.Output.DICT)
+    except Exception:  # pragma: no cover
+        return []
+    th = math.radians(ang)
+    cx1, cy1 = rot.width / 2.0, rot.height / 2.0
+    cx0, cy0 = w0 / 2.0, h0 / 2.0
+
+    def back(u, v):                       # 돌린 그림 좌표 → crop 좌표(시계 방향 ang 회전의 역)
+        du, dv = u - cx1, v - cy1
+        return (cx0 + math.cos(th) * du + math.sin(th) * dv, cy0 - math.sin(th) * du + math.cos(th) * dv)
+
+    groups: dict = {}
+    for i, t in enumerate(d["text"]):
+        t = (t or "").strip()
+        conf = float(d["conf"][i])
+        if not t or conf < 10:
+            continue
+        k = (d["block_num"][i], d["par_num"][i], d["line_num"][i], i if words else 0)
+        groups.setdefault(k, []).append((d["left"][i] / f, d["top"][i] / f, d["width"][i] / f, d["height"][i] / f, t, conf))
+    out = []
+    for ws in groups.values():
+        ws = [w for w in ws if any(ch.isalnum() for ch in w[4])]
+        if not ws:
+            continue
+        ws.sort(key=lambda w: w[0])
+        text = _clean_label(" ".join(w[4] for w in ws))
+        conf = float(np.mean([w[5] for w in ws]))
+        l_, r_ = ws[0][0], ws[-1][0] + ws[-1][2]
+        vm = float(np.mean([w[1] + w[3] / 2 for w in ws]))
+        out.append((text, conf, back(r_, vm), back((l_ + r_) / 2, vm), back(l_, vm)))
+    return out
+
+
 def _x_labels(im, ax: Axis, items):
+    """x축 아래 그룹 이름. 가로·45°·90° 기울어진 글자를 모두 시도해 가장 잘 읽히는 각도를 쓴다."""
     if not HAS_OCR or not items:
         return
     W, H = im.size
-    y0 = ax.base_bottom + 3
-    y1 = min(H, y0 + max(30, int(0.18 * (ax.base - ax.top))))
-    box = (max(0, ax.x0 - 10), y0, W, y1)
+    plot_h = ax.base - ax.top
+    y0 = ax.base_bottom + 2
+    y1 = min(H, y0 + max(40, int(0.8 * plot_h)))
+    x0 = max(0, int(ax.x0 - 0.35 * (ax.right - ax.x0)))
+    box = (x0, y0, W, y1)
     crop = im.convert("L").crop(box)
-    f = float(min(4.0, 6000.0 / max(1, crop.width)))
-    big = crop.resize((int(crop.width * f), int(crop.height * f)), Image.LANCZOS)
-    try:
-        d = pytesseract.image_to_data(big, config="--psm 6", output_type=pytesseract.Output.DICT)
-    except Exception:  # pragma: no cover
+    if crop.height < 8 or crop.width < 8:
         return
-    words = []
-    for i, t in enumerate(d["text"]):
-        t = (t or "").strip()
-        if not t or float(d["conf"][i]) < 20:
+    spacing = float(np.median(np.diff([it.xc for it in items]))) if len(items) > 1 else (items[0].x1 - items[0].x0) * 2
+    f = float(np.clip(1800.0 / max(crop.width, crop.height), 1.0, 3.0))
+    best = None
+    for ang in (0, 45, 90, -45):
+        lines = _rot_lines(crop, ang, f, words=(ang == 0))
+        good = [ln for ln in lines if sum(ch.isalnum() for ch in ln[0]) >= (1 if ang == 0 else 2)]
+        score = sum(ln[1] * sum(ch.isalnum() for ch in ln[0]) for ln in good)
+        if best is None or score > best[0]:
+            best = (score, ang, good)
+    if not best or not best[2]:
+        return
+    ang = best[1]
+    # 같은 각도에서 배율을 바꿔 여러 번 읽고 막대마다 다수결(OCR이 배율에 따라 '+'·'l' 등을 달리 읽음)
+    votes: dict = {}
+    scales = sorted({round(f, 2), round(min(5.0, f * 1.5), 2), round(min(5.0, f * 2.0), 2)})
+    for fs in scales:
+        if max(crop.width, crop.height) * fs > 6000:
             continue
-        xc = box[0] + (d["left"][i] + d["width"][i] / 2) / f
-        yc = box[1] + (d["top"][i] + d["height"][i] / 2) / f
-        words.append((yc, xc, t))
+        lines = best[2] if fs == round(f, 2) else [ln for ln in _rot_lines(crop, ang, fs, words=(ang == 0))
+                                                   if sum(ch.isalnum() for ch in ln[0]) >= (1 if ang == 0 else 2)]
+        assigned: dict = {}
+        if ang == 0:                           # 붙어서 읽힌 이웃 막대 이름(HFD+LHFD+H)은 막대 경계에서 비례로 자른다
+            xs_c = sorted(it_.xc for it_ in items)
+            mids = [(a_ + b_) / 2 for a_, b_ in zip(xs_c[:-1], xs_c[1:])]
+            split = []
+            for text, conf, end_pt, mid_pt, start_pt in lines:
+                l_, r_ = box[0] + start_pt[0], box[0] + end_pt[0]
+                cuts = [m for m in mids if l_ + 3 < m < r_ - 3]
+                if not cuts or len(text) < 2 * (len(cuts) + 1):
+                    split.append((text, conf, end_pt, mid_pt, start_pt))
+                    continue
+                edges = [l_] + cuts + [r_]
+                idx = [0] + [round(len(text) * (c - l_) / (r_ - l_)) for c in cuts] + [len(text)]
+                for (e0, e1), (i0, i1) in zip(zip(edges[:-1], edges[1:]), zip(idx[:-1], idx[1:])):
+                    seg = text[i0:i1].strip()
+                    if seg:
+                        xm = (e0 + e1) / 2 - box[0]
+                        split.append((seg, conf, (e1 - box[0], mid_pt[1]), (xm, mid_pt[1]), (e0 - box[0], mid_pt[1])))
+            lines = split
+        for text, conf, end_pt, mid_pt, start_pt in lines:
+            if ang == 0:
+                ax_x, key_y = box[0] + mid_pt[0], (round(mid_pt[1] / 8), mid_pt[0])
+            elif ang > 0:                      # 오른쪽 위로 올라가는 글자: 끝(오른쪽 위)이 눈금 쪽
+                ax_x, key_y = box[0] + end_pt[0], (-end_pt[1], 0)
+            else:                              # 오른쪽 아래로 내려가는 글자: 시작(왼쪽 위)이 눈금 쪽
+                ax_x, key_y = box[0] + start_pt[0], (-start_pt[1], 0)
+            it = min(items, key=lambda it_: abs(it_.xc - ax_x))
+            if abs(it.xc - ax_x) <= (0.5 if ang == 0 else 0.6) * spacing:
+                assigned.setdefault(id(it), []).append((key_y, text, conf))
+        for k, parts in assigned.items():
+            parts.sort(key=lambda p_: p_[0])
+            if len(parts) > 1:                 # 눈금 표시를 글자로 읽은 한 글자 잡음 제거
+                parts = [p_ for p_ in parts if len(p_[1]) > 1 or p_[2] >= 70] or parts
+            lab = " ".join(p_[1] for p_ in parts).strip()[:40]
+            v = votes.setdefault(k, {})
+            n_, c_ = v.get(lab, (0, 0.0))
+            v[lab] = (n_ + 1, c_ + float(np.mean([p_[2] for p_ in parts])))
+    labels = {}
     for it in items:
-        half = max((it.x1 - it.x0) / 2 + 6, 10)
-        ws = sorted([w for w in words if abs(w[1] - it.xc) <= half], key=lambda w: (round(w[0] / 6), w[1]))
-        it.label = " ".join(w[2] for w in ws)[:40]
+        v = votes.get(id(it))
+        if not v:
+            continue
+        # 굵은 글꼴에서 '+'를 't'로 읽는 일이 잦다 → '+'/'t'를 같은 것으로 묶어 투표하고, 한 번이라도 '+'로 읽혔으면 '+'
+        groups_: dict = {}
+        for lab, (n_, c_) in v.items():
+            g_ = groups_.setdefault(lab.replace("+", "t"), [0, 0.0, []])
+            g_[0] += n_
+            g_[1] += c_
+            g_[2].append(lab)
+        win = max(groups_.values(), key=lambda g_: (g_[0], g_[1]))
+        labels[id(it)] = max(win[2], key=lambda lab: (lab.count("+"), v[lab][0], v[lab][1]))
+    # 다른 막대 이름에서 확인된 접두어로 복원: 'Simva+' 가 있으면 'Simvat…' → 'Simva+…'
+    prefixes = {lab.split("+")[0] for lab in labels.values() if "+" in lab}
+    for k, lab in labels.items():
+        for pre in prefixes:
+            if pre and lab.startswith(pre + "t") and len(lab) > len(pre) + 1:
+                labels[k] = pre + "+" + lab[len(pre) + 1:]
+    for it in items:
+        if id(it) in labels:
+            it.label = labels[id(it)]
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +1031,7 @@ def _overlay(im, ax: Axis, items, up=1) -> bytes:
     fnt = _font(fs)
     d.line([(ax.x1, ax.top), (ax.x1, ax.bottom)], fill=(22, 163, 74), width=lw)
     d.line([(ax.x0, ax.base), (ax.right, ax.base)], fill=(22, 163, 74), width=lw)
-    sfnt = _font(max(10, round(fs * 0.75)))
+    sfnt = _font(max(11, round(fs * 0.9)))
     for r, v, _t in ax.labels:
         d.ellipse([ax.x0 - 4 - lw * 2, r - lw * 2, ax.x0 - 4 + lw * 2, r + lw * 2], outline=(22, 163, 74), width=lw)
         tag = f"{v:g}"
