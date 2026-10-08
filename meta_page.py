@@ -404,7 +404,7 @@ def render(active, log_activity) -> None:
         log_activity("📈", "메타분석 데이터 분석", f"{len(results)}개 outcome")
         st.session_state["_meta_logged"] = sig
 
-    t1, t2, t3, t4 = st.tabs(["Forest plot", "Sensitivity", "Trim-and-fill", "Table S2"])
+    t1, t2, t3, t4 = st.tabs(["🌲 Forest plot", "🎯 Sensitivity analysis", "🔻 Trim-and-fill", "📋 Table S2"])
     with t1:
         _forest_tab(results)
         _all_zip(results, "forest", "forest plot")

@@ -449,6 +449,8 @@ KNOWN_ABBR = {
     "MDA": "malondialdehyde", "GPx": "glutathione peroxidase", "IL-6": "interleukin 6", "TNF-α": "tumor necrosis factor alpha",
 }
 S2_CAPTION = "Numerical data for experimental and control groups included in the meta-analysis."
+S2_CELL_MAR = {"top": 0, "bottom": 0, "left": 40, "right": 40}   # dxa — 셀 여백(좁게). Word·Google 문서 모두 적용
+S2_FOOT_PT = 9
 S2_WIDTHS = (1423, 1449, 2197, 1423, 1423, 1423, 1423, 1423, 1424)   # dxa (사용자 원본과 동일)
 
 
@@ -584,6 +586,13 @@ def _s2_table_element(rows):
     sty = tblPr.find(qn("w:tblStyle"))
     if sty is not None:
         tblPr.remove(sty)
+    tmar = OxmlElement("w:tblCellMar")
+    for side in ("top", "left", "bottom", "right"):
+        e = OxmlElement(f"w:{side}")
+        e.set(qn("w:w"), str(S2_CELL_MAR[side]))
+        e.set(qn("w:type"), "dxa")
+        tmar.append(e)
+    tblPr.append(tmar)
     grid = t.tblGrid
     for gc, w in zip(grid.findall(qn("w:gridCol")), S2_WIDTHS):
         gc.set(qn("w:w"), str(w))
@@ -609,7 +618,7 @@ def _s2_table_element(rows):
         mar = OxmlElement("w:tcMar")
         for side in ("top", "left", "bottom", "right"):
             e = OxmlElement(f"w:{side}")
-            e.set(qn("w:w"), "25")
+            e.set(qn("w:w"), str(S2_CELL_MAR[side]))
             e.set(qn("w:type"), "dxa")
             mar.append(e)
         tcPr.append(mar)
@@ -683,22 +692,44 @@ def _s2_table_element(rows):
 
 
 def _s2_footnote_runs(p, notes):
+    """각주 문단: 모든 글자(위첨자 번호 포함)와 문단 기호까지 9 pt Times New Roman, 줄 간격 1.0."""
     from docx.shared import Pt
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
 
-    def r(text, sup=False):
-        x = p.add_run(text)
-        x.font.size = Pt(9)
-        x.font.name = "Times New Roman"
-        rPr = x._r.get_or_add_rPr()
+    def size(rPr):
+        for tag in ("w:sz", "w:szCs"):
+            el = rPr.find(qn(tag))
+            if el is None:
+                el = OxmlElement(tag)
+                rPr.append(el)
+            el.set(qn("w:val"), str(S2_FOOT_PT * 2))
+
+    def fonts(rPr):
         rf = rPr.find(qn("w:rFonts"))
         if rf is None:
             rf = OxmlElement("w:rFonts")
             rPr.insert(0, rf)
         for k in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
             rf.set(qn(k), "Times New Roman")
+
+    def r(text, sup=False):
+        x = p.add_run(text)
+        x.font.size = Pt(S2_FOOT_PT)
+        x.font.name = "Times New Roman"
+        rPr = x._r.get_or_add_rPr()
+        fonts(rPr)
+        size(rPr)
         x.font.superscript = sup
+    pf = p.paragraph_format
+    pf.line_spacing = 1.0
+    pPr = p._p.get_or_add_pPr()
+    mark = pPr.find(qn("w:rPr"))
+    if mark is None:
+        mark = OxmlElement("w:rPr")
+        pPr.append(mark)
+    fonts(mark)
+    size(mark)
     for i, (ab, de) in enumerate(notes, start=1):
         r(f"{i})", sup=True)
         r(f"{ab}: {de}")

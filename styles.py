@@ -184,12 +184,15 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 .live i{width:8px;height:8px;border-radius:50%;background:#22c55e;animation:livePulse 1.8s infinite}
 
 /* Tabs → premium segmented look (role 기반 선택자: Streamlit 버전과 무관) */
-.stTabs [role="tablist"]{gap:6px;background:#eef2f9;padding:6px;border-radius:14px;border:1px solid #e1e7f1;overflow-x:auto}
-.stTabs button[role="tab"]{height:auto;padding:.5rem .95rem;border-radius:10px;font-weight:650;color:#43506a;border:0!important;transition:all .2s var(--ease);white-space:nowrap}
-.stTabs button[role="tab"]:hover{background:rgba(255,255,255,.75);color:#0F1F3D}
-.stTabs button[role="tab"][aria-selected="true"]{background:#fff!important;color:#0B4FA8!important;box-shadow:0 4px 14px rgba(15,31,61,.10)}
-.stTabs button[role="tab"] p{font-size:.95rem!important}
-.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none!important}
+.stTabs [role="tablist"]{gap:10px;background:transparent;padding:4px 0 10px;border-radius:0;border:0;border-bottom:2px solid #d5deeb;overflow-x:auto;margin-bottom:6px}
+.stTabs [role="tab"]{height:auto;min-height:52px;padding:.7rem 1.35rem;border-radius:12px;font-weight:700;color:#34425c;background:#ffffff;border:1.5px solid #cdd7e6!important;box-shadow:0 1px 3px rgba(15,31,61,.06);transition:all .2s var(--ease);white-space:nowrap}
+.stTabs [role="tab"]:hover{border-color:#0B4FA8!important;color:#0B4FA8;transform:translateY(-1px)}
+.stTabs [role="tab"][aria-selected="true"]{background:linear-gradient(135deg,#0F1F3D,#0B4FA8)!important;color:#fff!important;border-color:#0B4FA8!important;box-shadow:0 6px 18px rgba(11,79,168,.28)}
+.stTabs [role="tab"][aria-selected="true"] p{color:#fff!important}
+.stTabs [role="tab"] p{font-size:1.05rem!important;font-weight:700!important;letter-spacing:.01em}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"],.stTabs .react-aria-SelectionIndicator{display:none!important}
+.stTabs [role="tablist"]{box-shadow:none!important}
+.stTabs [role="tab"]{cursor:pointer;display:flex;align-items:center}
 .stTabs [role="tabpanel"]{animation:fadeUp .4s var(--ease) both;padding-top:12px}
 /* Sidebar 메뉴 왼쪽 정렬 */
 [data-testid="stSidebar"] .stButton>button>div{justify-content:flex-start;width:100%}
