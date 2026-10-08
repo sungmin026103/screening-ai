@@ -174,7 +174,17 @@ def _results_from_table(df: pd.DataFrame, default_name: str, ci_mode: str):
 # 그림 표시 · 다운로드
 # ---------------------------------------------------------------------------
 def _settings(res: dict) -> dict:
-    return st.session_state.setdefault("fig_settings", {}).get(res["outcome"]) or M.default_settings(res["outcome"])
+    base = st.session_state.setdefault("fig_settings", {}).get(res["outcome"]) or M.default_settings(res["outcome"])
+    return {**base, "study_names": dict(st.session_state.get("study_names", {}))}
+
+
+def _all_settings(results) -> dict:
+    return {r["outcome"]: _settings(r) for r in results}
+
+
+def _edit_key(prefix: str, payload) -> str:
+    """편집표의 key — 내용이 바뀌면 새 key(바뀐 값이 표에 그대로 다시 보이도록)."""
+    return prefix + hashlib.sha1(repr(payload).encode()).hexdigest()[:10]
 
 
 def _sig(res, kind, st_, group_col=None):
@@ -224,7 +234,7 @@ def _all_zip(results, section: str, label: str):
     key = f"zip_{section}"
     if st.button(f"모든 outcome의 {label} 한 번에 받기 (zip · PNG 600 dpi + PDF)", key=key + "_b", width="stretch"):
         bar = st.progress(0.0, text="만드는 중...")
-        st.session_state[key] = M.build_section_zip(results, section, st.session_state.get("fig_settings", {}),
+        st.session_state[key] = M.build_section_zip(results, section, _all_settings(results),
                                                     ("png", "pdf"), DPI, CI_MODE,
                                                     progress=lambda f, t: bar.progress(min(f, 1.0), text=t))
         bar.empty()
@@ -242,11 +252,11 @@ def _pick(results, key: str) -> dict:
 # ---------------------------------------------------------------------------
 # 탭
 # ---------------------------------------------------------------------------
-@st.fragment
 def _forest_tab(results):
     res = _pick(results, "forest_outcome")
-    st_ = dict(_settings(res))
-    with st.expander("제목 · 효과 방향", expanded=False):
+    o = res["outcome"]
+    st_ = _settings(res)
+    with st.expander("✏️ 그림 안 이름 바꾸기 · 효과 방향", expanded=False):
         k = f"fs_{res['_key'][:8]}"
         st_["title"] = st.text_input("제목", st_["title"], key=f"{k}_t").strip() or st_["title"]
         st_["subtitle"] = st.text_input("부제", st_.get("subtitle") or "", key=f"{k}_s").strip() or None
@@ -254,12 +264,26 @@ def _forest_tab(results):
                        index=0 if tuple(st_["favours"])[0] == "Favours Intervention" else 1)
         st_["favours"] = (("Favours Intervention", "Favours Control") if inc == "감소가 유익"
                           else ("Favours Control", "Favours Intervention"))
-    st.session_state.setdefault("fig_settings", {})[res["outcome"]] = st_
-    _figure(res, "forest", st_, f"forest_{M._slug(res['outcome'])}")
+        names = st.session_state.setdefault("study_names", {})
+        studies = list(dict.fromkeys(F.clean_label(x) for x in res["data"]["Study"].astype(str)))
+        cur = [names.get(x, x) for x in studies]
+        st.caption("연구 이름 — 오른쪽 칸을 고치면 forest·부분군·leave-one-out·influence·Baujat 그림과 Table S2에 "
+                   "모두 반영됩니다(같은 연구는 다른 outcome에도 적용).")
+        ed = st.data_editor(pd.DataFrame({"원래 이름": studies, "표시할 이름": cur}), hide_index=True,
+                            width="stretch", disabled=["원래 이름"], key=_edit_key("sn_", (o, cur)))
+        for orig, new in zip(ed["원래 이름"], ed["표시할 이름"]):
+            new = F.clean_label(new) if isinstance(new, str) else ""
+            if new and new != orig:
+                names[orig] = new
+            else:
+                names.pop(orig, None)
+        st_["study_names"] = dict(names)
+    st.session_state.setdefault("fig_settings", {})[o] = {k_: v for k_, v in st_.items() if k_ != "study_names"}
+    _figure(res, "forest", st_, f"forest_{M._slug(o)}")
     for gcol in M.candidate_group_columns(res):
         st.markdown(f"**Subgroup · {gcol}**")
         suffix = "" if gcol == "Intervention" else f"_{M._slug(gcol).lower()}"
-        _figure(res, "subgroup", st_, f"subgroup{suffix}_{M._slug(res['outcome'])}", group_col=gcol)
+        _figure(res, "subgroup", st_, f"subgroup{suffix}_{M._slug(o)}", group_col=gcol)
 
 
 SENS_KINDS = {"Leave-one-out": "leave1out", "Influence": "influence", "Baujat": "baujat", "GOSH": "gosh",
@@ -302,20 +326,38 @@ def _table_s2_tab(results):
     if not outs:
         st.info("Table S2에는 실험군·대조군 n, Mean, SD가 필요합니다(데이터 추출 엑셀 또는 원자료 CSV).")
         return
-    rows, notes, missing = SUP.table_s2_rows(results, outs)
-    key = "|".join(r["_key"] for r in results if r["outcome"] in outs)
+    s2n = st.session_state.setdefault("s2_names", {})
+    defs = st.session_state.setdefault("s2_defs", {})
+    study_names = dict(st.session_state.get("study_names", {}))
+    with st.expander("✏️ Outcome 이름 · 약어 각주", expanded=False):
+        cur = [SUP.s2_outcome_name(o, s2n) for o in outs]
+        ed = st.data_editor(pd.DataFrame({"Outcome (파일)": outs, "Table S2 표기": cur}), hide_index=True,
+                            width="stretch", disabled=["Outcome (파일)"], key=_edit_key("s2n_", cur))
+        for o, v in zip(ed["Outcome (파일)"], ed["Table S2 표기"]):
+            if isinstance(v, str) and v.strip():
+                s2n[o] = " ".join(v.split())
+        cands = SUP.s2_abbr_candidates(results, outs, s2n)
+        dcur = [defs.get(t, SUP.KNOWN_ABBR.get(t, "")) for t in cands]
+        st.caption("약어 정의 — 정의를 적은 약어만 처음 나오는 칸에 위첨자 번호가 붙고 각주에 들어갑니다. 비워 두면 표시하지 않습니다.")
+        ab = st.data_editor(pd.DataFrame({"약어": cands, "정의": dcur}), hide_index=True, width="stretch",
+                            disabled=["약어"], key=_edit_key("s2d_", (cands, dcur)))
+        for t, v in zip(ab["약어"], ab["정의"]):
+            defs[t] = v.strip() if isinstance(v, str) else ""
+    use_defs = {t: defs.get(t, SUP.KNOWN_ABBR.get(t, "")) for t in SUP.s2_abbr_candidates(results, outs, s2n)}
+    rows, notes, _missing = SUP.table_s2_rows(results, outs, use_defs, s2n, study_names)
+    key = repr(("|".join(r["_key"] for r in results if r["outcome"] in outs), sorted(use_defs.items()),
+                sorted(s2n.items()), sorted(study_names.items())))
     if st.session_state.get("_s2_key") != key:
-        st.session_state["_s2_docx"] = SUP.build_table_s2_docx(results, outs)[0]
+        st.session_state["_s2_docx"] = SUP.build_table_s2_docx(results, outs, use_defs, names=s2n,
+                                                                study_names=study_names)[0]
         st.session_state["_s2_key"] = key
     st.download_button("⬇ Table_S2.docx", st.session_state["_s2_docx"], "Table_S2.docx", DOCX_MIME,
                        type="primary", width="stretch", key="s2_dl")
-    preview = pd.DataFrame([[r_[0] + r_[1], r_[2], r_[3]] + r_[4:] for r_ in rows],
+    preview = pd.DataFrame([[r_[0] + r_[1], r_[2], r_[3] + r_[10]] + r_[4:10] for r_ in rows],
                            columns=["Outcome", "Study", "Intervention", "Exp n", "Exp Mean", "Exp SD",
                                     "Ctrl n", "Ctrl Mean", "Ctrl SD"])
     st.dataframe(preview, width="stretch", hide_index=True, height=min(38 + 35 * len(preview), 560))
-    st.caption("각주: " + "; ".join(f"{a}: {d}" for a, d in notes) + ".")
-    if missing:
-        st.caption("정의를 모르는 약어(각주에 없음): " + ", ".join(missing))
+    st.caption("각주: " + "; ".join(f"{i}){a}: {d}" for i, (a, d) in enumerate(notes, start=1)) + ".")
     conf = _year_conflicts([r for r in results if r["outcome"] in outs])
     if conf:
         st.warning("같은 연구의 연도가 outcome마다 다릅니다. 엑셀에서 통일하세요: " + " / ".join(conf))

@@ -369,6 +369,11 @@ def default_settings(outcome: str) -> dict:
             "style": 1, "label_mode": "plain", "ci_footnote": False, "x_limits": None}
 
 
+def _renamed(names, st: dict | None) -> list[str]:
+    ren = {F.clean_label(k): v for k, v in ((st or {}).get("study_names") or {}).items() if str(v).strip()}
+    return [ren.get(F.clean_label(n), F.clean_label(n)) for n in names]
+
+
 def _pooled(res: dict) -> F.Pooled:
     s = res["summary"]
     return F.Pooled(s.g, s.ci_lb, s.ci_ub, s.pi_lb, s.pi_ub)
@@ -386,7 +391,7 @@ def _opts(res: dict, st: dict, **kw) -> F.ForestOptions:
         footer.append(f"95% CI: {s.ci_note}")
     base = dict(style=int(st.get("style", 1)), title=st.get("title") or F.short_title(res["outcome"]),
                 subtitle=st.get("subtitle"), favours=tuple(st.get("favours") or F.default_favours(res["outcome"])),
-                footer_lines=footer, x_limits=st.get("x_limits"))
+                footer_lines=footer, x_limits=st.get("x_limits"), rename=dict(st.get("study_names") or {}))
     base.update(kw)
     return F.ForestOptions(**base)
 
@@ -490,7 +495,7 @@ def influence_fig(res: dict, st: dict | None = None):
             ax.axvline(xv, color=GREY, lw=0.8, ls=ls)
         ax.axvline(0, color="#3A3F4A", lw=0.8)
         ax.set_yticks(y)
-        ax.set_yticklabels(inf["Study"], fontsize=10)
+        ax.set_yticklabels(_renamed(inf["Study"], st), fontsize=10)
         ax.set_xlabel("Studentized residual", fontsize=11)
         ax.set_title("Studentized residuals", fontsize=11.5, loc="left", weight="bold", color=NAVY)
         _style_axes(ax)
@@ -535,7 +540,7 @@ def baujat_fig(res: dict, st: dict | None = None, top_n: int = 3):
         colors = [RED if inf["influential_metafor"].iloc[i] else NAVY for i in range(len(bj))]
         ax.scatter(bj["x_heterogeneity"], bj["y_influence"], s=46, c=colors, edgecolor="white", lw=0.7, zorder=3)
         for i in sorted(lab_idx):
-            ax.annotate(bj["Study"].iloc[i], (bj["x_heterogeneity"].iloc[i], bj["y_influence"].iloc[i]),
+            ax.annotate(_renamed([bj["Study"].iloc[i]], st)[0], (bj["x_heterogeneity"].iloc[i], bj["y_influence"].iloc[i]),
                         textcoords="offset points", xytext=(6, 4), fontsize=10, color=colors[i])
         ax.set_xlabel("Contribution to overall heterogeneity", fontsize=11)
         ax.set_ylabel("Influence on pooled estimate", fontsize=11)

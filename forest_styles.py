@@ -149,6 +149,7 @@ class ForestOptions:
     left_header: str = "Study (year)"    # V2 왼쪽 열 제목
     ref_line: float | None = None        # 예: leave-one-out의 전체 추정치(파란 점선)
     pi_label: str = "95% prediction interval"
+    rename: dict = field(default_factory=dict)   # 그림에 표시할 이름 {원래 라벨: 새 라벨}
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +358,9 @@ def render(rows, pooled: Pooled | None, opts: ForestOptions, marker: str = "sq")
     """rows: (kind, label, est, lb, ub, extra) 목록. kind = study | header | subtotal | gap.
     pooled=None이면 pooled 행 없이 그린다. 좌표는 inch(캔버스 = 인쇄 크기)."""
     style = 1 if int(opts.style) != 2 else 2
-    rows = [(r[0], clean_label(r[1]) if r[1] is not None else r[1]) + tuple(r[2:]) for r in rows]
+    ren = {clean_label(k): clean_label(v) for k, v in (opts.rename or {}).items() if str(v).strip()}
+    rows = [(r[0], ren.get(clean_label(r[1]), clean_label(r[1])) if r[1] is not None else r[1]) + tuple(r[2:])
+            for r in rows]
     pal = V1_PAL if style == 1 else V2_PAL
     mk = pal["ink"] if style == 1 else pal["teal"]
     dia_col = pal["blue"] if style == 1 else pal["teal"]

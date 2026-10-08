@@ -464,51 +464,103 @@ def fmt_raw(v) -> str:
     return s if "e" not in s else f"{x:.6f}".rstrip("0").rstrip(".")
 
 
+def fmt_n(v) -> str:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "" if v is None else str(v)
+    if not np.isfinite(x):
+        return ""
+    return str(int(round(x))) if abs(x - round(x)) < 1e-9 else f"{x:.10g}"
+
+
+def fmt_2(v) -> str:
+    """Mean·SD 표기: 소수 둘째 자리 고정(예: 200.00, 0.04)."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "" if v is None else str(v)
+    return f"{x:.2f}" if np.isfinite(x) else ""
+
+
 def abbr_tokens(name: str, defs: dict) -> list[str]:
-    """outcome 이름 안의 약어(정의 사전에 있거나 대문자 2개 이상인 토큰)."""
+    """이름 안의 약어 후보(정의 사전에 있거나 대문자 2개 이상인 토큰, 예: CSA, EPA-PL, AA-Sev)."""
     import re as _re
     toks = _re.findall(r"[A-Za-z0-9α-ωΑ-Ω/\-]+", str(name))
     out = []
     for t in toks:
-        if t in defs or sum(ch.isupper() for ch in t) >= 2:
+        t = t.strip("-/")
+        if t and (t in defs or sum(ch.isupper() for ch in t) >= 2):
             out.append(t)
     return out
 
 
-def table_s2_rows(results: list[dict], outcomes: list[str], defs: dict | None = None):
-    """(rows, footnotes, missing_defs). rows: [outcome_text, marker, study, intervention, n1, m1, sd1, n2, m2, sd2]."""
-    defs = {**KNOWN_ABBR, **(defs or {})}
-    notes = [("n", "number"), ("SD", "standard deviation")]
-    defined: set[str] = set()
-    missing: list[str] = []
+def s2_outcome_name(outcome: str, names: dict | None = None) -> str:
+    import re as _re
+    if names and str(names.get(outcome, "")).strip():
+        return str(names[outcome]).strip()
+    return _re.sub(r"\s+", " ", str(outcome).replace("_", " ")).strip()
+
+
+def _s2_source(results, outcomes, names, study_names):
+    """(outcome 표기, 연구 표기, 중재, 원자료 행) 순서대로 — forest plot 행 순서와 같다."""
     by = {r["outcome"]: r for r in results}
-    rows = []
+    need = {"Mean_treat", "SD_treat", "N_treat", "Mean_control", "SD_control", "N_control"}
+    sn = study_names or {}
     for o in outcomes:
         r = by.get(o)
-        if r is None:
+        if r is None or not need.issubset(r["data"].columns):
             continue
         d = r["data"]
-        need = {"Mean_treat", "SD_treat", "N_treat", "Mean_control", "SD_control", "N_control"}
-        if not need.issubset(d.columns):
-            continue
-        markers = []
-        for t in abbr_tokens(o, defs):
-            if t in defined:
+        oname = s2_outcome_name(o, names)
+        for x in d.itertuples(index=False):
+            st_ = " ".join(str(getattr(x, "Study")).split())
+            iv = " ".join(str(getattr(x, "Intervention", "")).split()) if "Intervention" in d.columns else ""
+            yield oname, sn.get(st_, st_), iv, x
+
+
+def s2_abbr_candidates(results, outcomes, names=None) -> list[str]:
+    """Outcome·Intervention 칸에서 처음 나오는 순서대로 약어 후보."""
+    out: list[str] = []
+    for oname, _s, iv, _x in _s2_source(results, outcomes, names, None):
+        for t in abbr_tokens(oname, KNOWN_ABBR) + abbr_tokens(iv, KNOWN_ABBR):
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def table_s2_rows(results: list[dict], outcomes: list[str], defs: dict | None = None,
+                  names: dict | None = None, study_names: dict | None = None):
+    """(rows, footnotes, missing_defs).
+    rows: [outcome, outcome_marker, study, intervention, n1, m1, sd1, n2, m2, sd2, intervention_marker].
+    약어는 표에서 처음 나오는 칸(Outcome 또는 Intervention)에만 위첨자 번호를 단다. 정의가 빈 약어는 표시하지 않는다."""
+    defs = {**KNOWN_ABBR, **(defs or {})}
+    defs = {k: v for k, v in defs.items() if str(v).strip()}
+    notes = [("n", "number"), ("SD", "standard deviation")]
+    seen: set[str] = set()
+    missing: list[str] = []
+
+    def marks(text):
+        m = []
+        for t in abbr_tokens(text, defs):
+            if t in seen:
                 continue
+            seen.add(t)
             if t in defs:
                 notes.append((t, defs[t]))
-                markers.append(str(len(notes)))
+                m.append(f"{len(notes)})")
             elif t not in missing:
                 missing.append(t)
-            defined.add(t)
-        first = True
-        for x in d.itertuples(index=False):
-            rows.append([o, ",".join(f"{m})" for m in markers) if first else "", str(getattr(x, "Study")),
-                         str(getattr(x, "Intervention", "") if "Intervention" in d.columns else ""),
-                         fmt_raw(getattr(x, "N_treat")), fmt_raw(getattr(x, "Mean_treat")), fmt_raw(getattr(x, "SD_treat")),
-                         fmt_raw(getattr(x, "N_control")), fmt_raw(getattr(x, "Mean_control")),
-                         fmt_raw(getattr(x, "SD_control"))])
-            first = False
+        return ",".join(m)
+
+    rows = []
+    for oname, study, iv, x in _s2_source(results, outcomes, names, study_names):
+        om = marks(oname)
+        im = marks(iv)
+        rows.append([oname, om, study, iv,
+                     fmt_n(getattr(x, "N_treat")), fmt_2(getattr(x, "Mean_treat")), fmt_2(getattr(x, "SD_treat")),
+                     fmt_n(getattr(x, "N_control")), fmt_2(getattr(x, "Mean_control")), fmt_2(getattr(x, "SD_control")),
+                     im])
     return rows, notes, missing
 
 
@@ -613,13 +665,15 @@ def _s2_table_element(rows):
     last = len(rows) - 1
     for i, rw in enumerate(rows):
         cells = tbl.rows[2 + i].cells
-        vals = [rw[0], rw[2], rw[3]] + rw[4:]
+        vals = [rw[0], rw[2], rw[3]] + rw[4:10]
         for j, v in enumerate(vals):
             p = cell_fmt(cells[j], S2_WIDTHS[j], top=4, bottom=12 if i == last else 4,
                          align="left" if j < 3 else "center")
             run(p, v)
             if j == 0 and rw[1]:
                 run(p, rw[1], bold=True, sup=True)
+            if j == 2 and len(rw) > 10 and rw[10]:
+                run(p, rw[10], bold=True, sup=True)
     for tr in tbl.rows:
         trPr = tr._tr.get_or_add_trPr()
         jc = OxmlElement("w:jc")
@@ -652,13 +706,14 @@ def _s2_footnote_runs(p, notes):
 
 
 def build_table_s2_docx(results: list[dict], outcomes: list[str], defs: dict | None = None,
-                        caption: str = S2_CAPTION) -> tuple[bytes, dict]:
+                        caption: str = S2_CAPTION, names: dict | None = None,
+                        study_names: dict | None = None) -> tuple[bytes, dict]:
     """Table S2만 들어 있는 Word 파일(A4 가로, 사용자 원본과 같은 여백·서식)."""
     from docx import Document
     from docx.enum.section import WD_ORIENT
     from docx.shared import Pt, Twips
 
-    rows, notes, missing = table_s2_rows(results, outcomes, defs)
+    rows, notes, missing = table_s2_rows(results, outcomes, defs, names, study_names)
     doc = Document()
     sec = doc.sections[0]
     sec.orientation = WD_ORIENT.LANDSCAPE
@@ -728,7 +783,7 @@ def insert_table_s2(docx_bytes: bytes, results: list[dict], outcomes: list[str],
         a = old_rows[i] if i < len(old_rows) else None
         b = rows[i] if i < len(rows) else None
         av = None if a is None else [norm(a[0])] + a[1:]
-        bv = None if b is None else [b[0], b[2], b[3]] + b[4:]
+        bv = None if b is None else [b[0], b[2], b[3]] + b[4:10]
         if av != bv:
             diffs.append({"row": i + 1, "기존": " | ".join(av) if av else "(없음)", "새 표": " | ".join(bv) if bv else "(없음)"})
     buf = io.BytesIO()

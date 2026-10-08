@@ -1,5 +1,8 @@
 SR studio VER 36 — 메타분석 Figure 섹션 재구성 · V1 forest 디자인 · Table S2 생성 · 범용 스크리닝(자동 개념 게이트) · UI 개편
 
+[V36.3] Forest 탭 「그림 안 이름 바꾸기」(제목·부제·효과 방향·연구 이름 표 — 연구 이름은 forest·부분군·LOO·influence·Baujat·Table S2에 함께 반영).
+        Table S2: Mean·SD 소수 둘째 자리, n 정수, 「Outcome 이름 · 약어 각주」 표(Outcome 표기 변경, 약어 정의 → Outcome·Intervention 칸
+        처음 나오는 곳에 위첨자 번호 + 각주. 정의가 빈 약어는 표시 안 함).
 [V36.2] 메타분석 화면을 그림 + Table S2만 남기도록 정리, forest 라벨 겹침·범례 넘침 수정(아래 [1]).
 
 [V36.1 변경 요약]

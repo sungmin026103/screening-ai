@@ -243,7 +243,19 @@ def check_table_s2() -> None:
     rows, notes, missing = SUP.table_s2_rows([r], ["TG"])
     assert len(rows) == len(r["data"]) and rows[0][1] == "3)" and rows[1][1] == ""
     assert [a for a, _ in notes] == ["n", "SD", "TG"] and not missing
-    assert SUP.fmt_raw(58.0) == "58" and SUP.fmt_raw(0.126) == "0.126"
+    assert rows[0][4] == "10" and rows[0][5] == "1.03" and rows[0][6] == "0.13" and len(rows[0]) == 11
+    # 중재 칸 약어: 정의가 있을 때만, 처음 나오는 칸에만 위첨자
+    r["data"]["Intervention"] = ["EPA-PL"] + ["BAM15"] * (len(r["data"]) - 1)
+    rows2, notes2, _ = SUP.table_s2_rows([r], ["TG"], {"EPA-PL": "EPA phospholipid"}, {"TG": "Triglyceride TG"},
+                                         {"Jia (2016)": "Jia et al. (2016)"})
+    assert rows2[0][0] == "Triglyceride TG" and rows2[0][10] == "4)" and all(x[10] == "" for x in rows2[1:])
+    assert [a for a, _ in notes2] == ["n", "SD", "TG", "EPA-PL"]
+    assert any(x[2] == "Jia et al. (2016)" for x in rows2) or not any("Jia" in x[2] for x in rows2)
+    import forest_styles as F
+    fig = F.forest_figure(["A\n(2020)", "B (2021)"], [0.1, 0.2], [-0.1, 0.0], [0.3, 0.4], F.Pooled(0.15, 0.0, 0.3),
+                          F.ForestOptions(title="t", rename={"A (2020)": "Alpha (2020)"}))
+    labels = [t.get_text() for t in fig.axes[0].texts]
+    assert "Alpha (2020)" in labels and not any("\n" in x for x in labels), "라벨 정리·이름 변경 실패"
     b, info = SUP.build_table_s2_docx([r], ["TG"])
     doc = Document(io.BytesIO(b))
     assert doc.paragraphs[0].text.startswith("Table S2.") and len(doc.tables) == 1
