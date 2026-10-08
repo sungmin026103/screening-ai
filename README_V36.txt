@@ -1,5 +1,13 @@
 SR studio VER 36 — 메타분석 Figure 섹션 재구성 · V1 forest 디자인 · Table S2 생성 · 범용 스크리닝(자동 개념 게이트) · UI 개편
 
+[V36.4] · Sensitivity · Trim-and-fill 탭에도 「✏️ 그림 안 이름 바꾸기」(그림별 제목·부제, 효과 방향, 연구 이름).
+        · Figure 값 추출 자동화(figure_auto.py): 이미지를 올리면 y축 선·눈금을 찾고 눈금 숫자를 OCR(tesseract)로 읽어
+          축을 자동 보정 → 막대(채움·빈·색·묶음·0에서 뜬 막대)/점 그래프의 Mean과 위쪽 오차 막대 끝을 읽는다.
+          사용자는 n과 오차 종류(SEM/SD)만 고르면 SD가 나온다(SEM × √n). 여러 패널(A·B…)은 자동으로 나눠 고른다.
+          눈금이 지수 표기이거나 OCR이 없으면 가장 아래·위 눈금 값 2개만 입력. 점·글자가 cap에 겹친 값은 ⚠ 표시.
+          합성 그래프 112장 검증: 막대 수·축 보정 성공 104장(실패 8장 = 지수 표기 로그축 7 + 아주 작은 그림 1, 모두 경고),
+          Mean 위치 오차 중앙값 0.3 px(p95 < 1 px, 원본 해상도), 큰 오차 막대 오류는 대부분 ⚠로 표시됨.
+          배포: packages.txt에 tesseract-ocr, requirements.txt에 pytesseract 추가. 기존 수동 클릭 도구는 접힌 칸에 유지.
 [V36.3] Forest 탭 「그림 안 이름 바꾸기」(제목·부제·효과 방향·연구 이름 표 — 연구 이름은 forest·부분군·LOO·influence·Baujat·Table S2에 함께 반영).
         Table S2: Mean·SD 소수 둘째 자리, n 정수, 「Outcome 이름 · 약어 각주」 표(Outcome 표기 변경, 약어 정의 → Outcome·Intervention 칸
         처음 나오는 곳에 위첨자 번호 + 각주. 정의가 빈 약어는 표시 안 함).

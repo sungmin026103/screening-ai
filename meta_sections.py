@@ -369,6 +369,30 @@ def default_settings(outcome: str) -> dict:
             "style": 1, "label_mode": "plain", "ci_footnote": False, "x_limits": None}
 
 
+# 그림별 기본 제목·부제("{t}" = outcome 제목). 화면에서 그림마다 바꿀 수 있다(settings["fig_text"][kind]).
+FIG_TITLE = {"leave1out": "{t}", "robustness": "{t}", "trimfill_compare": "{t}",
+             "influence": "{t}: influence diagnostics", "baujat": "{t}: Baujat plot", "gosh": "{t}: GOSH plot",
+             "trimfill": "{t}: trim-and-fill funnel plot", "funnel": "{t}: contour-enhanced funnel plot"}
+FIG_SUBTITLE = {"leave1out": "Leave-one-study-out sensitivity analysis",
+                "robustness": "Robustness of the pooled estimate", "trimfill_compare": "Trim-and-fill (L0) sensitivity"}
+
+
+def fig_text(st: dict | None, kind: str, outcome: str) -> tuple[str, str | None]:
+    """(제목, 부제) — 사용자가 바꾼 값이 있으면 그 값, 없으면 기본값."""
+    st = st or {}
+    t = st.get("title") or F.short_title(outcome)
+    ov = (st.get("fig_text") or {}).get(kind) or {}
+    title = (ov.get("title") or "").strip() or FIG_TITLE.get(kind, "{t}").format(t=t)
+    sub = ov.get("subtitle")
+    sub = sub.strip() if isinstance(sub, str) and sub.strip() else FIG_SUBTITLE.get(kind)
+    return title, sub
+
+
+def _tt(st, default: str) -> str:
+    ov = ((st or {}).get("fig_text") or {}).get((st or {}).get("_kind")) or {}
+    return (ov.get("title") or "").strip() or default
+
+
 def _renamed(names, st: dict | None) -> list[str]:
     ren = {F.clean_label(k): v for k, v in ((st or {}).get("study_names") or {}).items() if str(v).strip()}
     return [ren.get(F.clean_label(n), F.clean_label(n)) for n in names]
@@ -393,6 +417,9 @@ def _opts(res: dict, st: dict, **kw) -> F.ForestOptions:
                 subtitle=st.get("subtitle"), favours=tuple(st.get("favours") or F.default_favours(res["outcome"])),
                 footer_lines=footer, x_limits=st.get("x_limits"), rename=dict(st.get("study_names") or {}))
     base.update(kw)
+    kind = st.get("_kind")
+    if kind in FIG_TITLE:
+        base["title"], base["subtitle"] = fig_text(st, kind, res["outcome"])
     return F.ForestOptions(**base)
 
 
@@ -510,7 +537,7 @@ def influence_fig(res: dict, st: dict | None = None):
         ax.set_title("Cook's distance", fontsize=11.5, loc="left", weight="bold", color=NAVY)
         ax.tick_params(axis="y", length=0)
         _style_axes(ax)
-        fig.suptitle(f"{title}: influence diagnostics", x=0.01, ha="left", fontsize=F.PT_TITLE, weight="bold",
+        fig.suptitle(_tt(st, f"{title}: influence diagnostics"), x=0.01, ha="left", fontsize=F.PT_TITLE, weight="bold",
                      color=NAVY)
         fig.text(0.01, 0.005, "Red = influential (metafor) | dashed = ±1.96 screening reference | dotted = "
                  "Bonferroni threshold | ✖ = formal Bonferroni outlier", fontsize=8.6, color="#333333",
@@ -544,7 +571,7 @@ def baujat_fig(res: dict, st: dict | None = None, top_n: int = 3):
                         textcoords="offset points", xytext=(6, 4), fontsize=10, color=colors[i])
         ax.set_xlabel("Contribution to overall heterogeneity", fontsize=11)
         ax.set_ylabel("Influence on pooled estimate", fontsize=11)
-        ax.set_title(f"{title}: Baujat plot", fontsize=F.PT_TITLE, loc="left", weight="bold", color=NAVY)
+        ax.set_title(_tt(st, f"{title}: Baujat plot"), fontsize=F.PT_TITLE, loc="left", weight="bold", color=NAVY)
         ax.grid(color="#E7EAF0", lw=0.6)
         _style_axes(ax)
         ax.set_xlim(left=0)
@@ -577,7 +604,7 @@ def gosh_fig(res: dict, st: dict | None = None):
         ax.set_ylabel("I² (%) (subset)", fontsize=11)
         n_total = 2 ** len(sd) - 1
         sub_txt = "all" if len(gt) >= n_total else f"{len(gt):,} random"
-        ax.set_title(f"{title}: GOSH plot", fontsize=F.PT_TITLE, loc="left", weight="bold", color=NAVY)
+        ax.set_title(_tt(st, f"{title}: GOSH plot"), fontsize=F.PT_TITLE, loc="left", weight="bold", color=NAVY)
         ax.text(0.0, -0.20, f"{sub_txt} subsets of {len(sd)} studies (REML); k = 1 subsets omitted from display",
                 transform=ax.transAxes, fontsize=9, color="#333333")
         ax.legend(loc="upper right", fontsize=9, frameon=True)
@@ -619,7 +646,7 @@ def trimfill_funnel_fig(res: dict, st: dict | None = None):
         ax.set_ylim(se_max, 0)
         ax.set_xlabel("Hedges' g", fontsize=11)
         ax.set_ylabel("Standard error", fontsize=11)
-        ax.set_title(f"{title}: trim-and-fill funnel plot", fontsize=F.PT_TITLE, loc="left", weight="bold",
+        ax.set_title(_tt(st, f"{title}: trim-and-fill funnel plot"), fontsize=F.PT_TITLE, loc="left", weight="bold",
                      color=NAVY)
         _style_axes(ax)
 
@@ -664,7 +691,7 @@ def funnel_fig(res: dict, st: dict | None = None):
         ax.set_xlim(min(-1.0, yi.min() - 0.6, po.beta - 1.0), max(1.0, yi.max() + 0.6, po.beta + 1.0))
         ax.set_xlabel("Hedges' g", fontsize=11)
         ax.set_ylabel("Standard error", fontsize=11)
-        ax.set_title(f"{title}: contour-enhanced funnel plot", fontsize=F.PT_TITLE, loc="left", weight="bold",
+        ax.set_title(_tt(st, f"{title}: contour-enhanced funnel plot"), fontsize=F.PT_TITLE, loc="left", weight="bold",
                      color=NAVY)
         _style_axes(ax)
         if eg is not None and np.isfinite(eg.p_value):
@@ -734,6 +761,7 @@ SECTIONS = {
 
 def make_figure(kind: str, res: dict, st: dict | None = None, ci_mode: str = "CR2", group_col: str | None = None):
     st = dict(st or default_settings(res["outcome"]))
+    st["_kind"] = kind
     if kind in ("forest_V1", "forest_V2"):
         st["style"] = 1 if kind.endswith("V1") else 2
         return forest_fig(res, st)

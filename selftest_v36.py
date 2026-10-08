@@ -265,6 +265,34 @@ def check_table_s2() -> None:
     assert info2["old_rows"] == info2["rows"] and not info2["diffs"], "같은 데이터로 교체했는데 차이가 남"
 
 
+def check_figure_auto() -> None:
+    """그래프 자동 추출: 알려진 값으로 그린 막대그래프(빈 막대·검은 막대·SEM 위쪽만)에서 Mean·오차를 되찾는지.
+    tesseract가 없으면 눈금 값 2개 입력 경로로 확인한다."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import figure_auto as FA
+    import forest_styles as F
+    means, errs = [12.0, 7.5, 18.2], [1.1, 0.8, 2.4]
+    for face in ("white", "#444444"):
+        fig, ax = F.subplots(figsize=(3.6, 3.0))
+        fig.set_dpi(150)
+        ax.bar(range(3), means, 0.6, color=face, edgecolor="black", linewidth=1.2,
+               yerr=[[0, 0, 0], errs], capsize=4)
+        ax.set_ylim(0, 25)
+        ax.set_yticks([0, 5, 10, 15, 20, 25])
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        fig.tight_layout()
+        png = F.save_figure(fig, "png", 150)
+        manual = None if FA.HAS_OCR else (0.0, 25.0, False)
+        r = FA.analyze(png, manual)
+        assert r.ok and len(r.items) == 3, (face, r.messages, len(r.items))
+        for it, m, e in zip(r.items, means, errs):
+            assert abs(it.mean - m) <= 0.2, (face, it.mean, m)
+            assert it.error is not None and abs(it.error - e) <= 0.25, (face, it.error, e)
+    assert FA._parse_num("008") == 0.08 and FA._parse_num("1,000") == 1000.0
+
+
 def check_app_imports() -> None:
     import ast
     for fname, mod in (("app.py", "screening"), ("meta_page.py", None)):
@@ -285,5 +313,6 @@ if __name__ == "__main__":
     check_figures_tables()
     check_auto_gate()
     check_table_s2()
+    check_figure_auto()
     print("V36 self-test: PASS")
     sys.exit(0)

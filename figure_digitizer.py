@@ -1,14 +1,230 @@
 from __future__ import annotations
 
+import hashlib
+import math
+
+import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+
+import figure_auto as FA
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _panels(data: bytes):
+    try:
+        return FA.find_panels(data)
+    except Exception:
+        return []
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _analyze(data: bytes, manual: tuple | None):
+    r = FA.analyze(data, manual)
+    ax = r.axis
+    return {
+        "ok": r.ok, "messages": r.messages, "overlay": r.overlay,
+        "calibrated": bool(ax is not None and ax.a is not None),
+        "ticks": [] if ax is None else list(ax.ticks),
+        "labels": [] if ax is None else [(float(v), t) for _r, v, t in ax.labels],
+        "log": bool(ax is not None and ax.log),
+        "items": [{"label": it.label, "mean": it.mean, "error": it.error, "sure": it.sure, "kind": it.kind}
+                  for it in r.items],
+    }
+
+
+def _sig(v, n=4):
+    if v is None or not math.isfinite(v):
+        return None
+    if v == 0:
+        return 0.0
+    return round(v, max(0, n - 1 - int(math.floor(math.log10(abs(v))))))
+
+
+_CSS = """
+<style>
+.fd-card-t{font-weight:750;font-size:1.02rem;color:#0F1F3D;margin:0 0 2px}
+.fd-card-s{font-size:.82rem;color:#667085;margin:0 0 8px}
+.fd-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:.8rem;color:#475467;margin-top:6px}
+.fd-legend i{display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:middle}
+.fd-pill{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;font-size:.86rem;font-weight:650;margin-bottom:8px}
+.fd-pill.ok{background:#ecfdf3;color:#067647;border:1px solid #abefc6}
+.fd-pill.warn{background:#fffaeb;color:#b54708;border:1px solid #fedf89}
+.fd-pill.bad{background:#fef3f2;color:#b42318;border:1px solid #fecdca}
+.fd-meta{font-size:.8rem;color:#667085;margin:-2px 0 10px}
+.fd-hint{font-size:.8rem;color:#667085;margin-top:4px}
+</style>
+"""
+
+
+def _apply_edits(tkey: str, skey: str):
+    """편집표(Group·n) 변경을 저장 표에 반영하고 SD를 다시 계산한 뒤 표를 새로 그린다."""
+    state = st.session_state.get(skey)
+    ed = st.session_state.get(f"{tkey}_{state['ver']}") if state else None
+    if not state or not ed:
+        return
+    for i, chg in ed.get("edited_rows", {}).items():
+        row = state["rows"][int(i)]
+        if "Group" in chg and str(chg["Group"]).strip():
+            row["Group"] = str(chg["Group"]).strip()
+        if "n" in chg and chg["n"] is not None:
+            try:
+                row["n"] = max(1, int(chg["n"]))
+            except (TypeError, ValueError):
+                pass
+    state["ver"] += 1
+
+
+def _sd(err, n, etype):
+    if err is None:
+        return None
+    return _sig(err * math.sqrt(n) if etype == "SEM" else err)
 
 
 def render_figure_digitizer() -> None:
-    """Compact, beginner-friendly 2D figure digitizer.
+    st.markdown(_CSS, unsafe_allow_html=True)
 
-    Client-side only. Extracted values are intentionally not persisted.
-    """
+    top_l, top_r = st.columns([1.35, 1], gap="medium")
+    with top_l:
+        with st.container(border=True):
+            st.markdown('<div class="fd-card-t">① 그래프 이미지</div>'
+                        '<div class="fd-card-s">논문 그래프를 캡처해 올리세요 (PNG·JPG). 여러 패널이 있어도 됩니다.</div>',
+                        unsafe_allow_html=True)
+            up = st.file_uploader("그래프 이미지", type=["png", "jpg", "jpeg"], key="fd_img",
+                                  label_visibility="collapsed")
+    with top_r:
+        with st.container(border=True):
+            st.markdown('<div class="fd-card-t">② n · 오차 종류</div>'
+                        '<div class="fd-card-s">결과는 항상 SD로 나옵니다.</div>', unsafe_allow_html=True)
+            c1, c2 = st.columns([1, 1.1])
+            n_all = c1.number_input("n (군당)", min_value=1, max_value=10000, value=8, step=1, key="fd_n")
+            etype = c2.segmented_control("그림의 오차 막대", ["SEM", "SD"], default="SEM", key="fd_et") or "SEM"
+            st.markdown(f'<div class="fd-hint">{"SD = SEM × √n" if etype == "SEM" else "그림의 오차 = SD (그대로 사용)"}</div>',
+                        unsafe_allow_html=True)
+
+    if up is None:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="text-align:center;padding:26px 8px;color:#667085">'
+                '<div style="font-size:2.2rem">📊</div>'
+                '<div style="font-weight:700;color:#0F1F3D;font-size:1.05rem;margin:6px 0">이미지만 올리면 자동으로 읽습니다</div>'
+                '<div style="font-size:.88rem;line-height:1.7">y축 눈금 숫자로 축을 맞추고 → 막대·점의 Mean과 위쪽 오차 막대 끝을 찾아 →'
+                ' n과 오차 종류로 SD를 계산합니다.<br>채운·빈·색·묶음 막대와 점 그래프, 여러 패널 그림을 지원합니다.</div></div>',
+                unsafe_allow_html=True)
+        with st.expander("자동 인식이 안 될 때: 직접 찍어서 추출", expanded=False):
+            _render_manual()
+        return
+
+    full = up.getvalue()
+    boxes = _panels(full)
+    data = full
+    pick = "1"
+    if len(boxes) > 1:
+        pick = st.session_state.get("fd_panel_" + hashlib.sha1(full).hexdigest()[:8]) or "1"
+        data = FA.crop_bytes(full, boxes[int(pick) - 1])
+
+    key = hashlib.sha1(data).hexdigest()[:10]
+    manual = st.session_state.get(f"fd_manual_{key}")
+    with st.spinner("축과 막대를 읽는 중..."):
+        res = _analyze(data, manual)
+
+    # 저장 표(Group·n 편집 유지)
+    skey = f"fd_state_{key}"
+    items = res["items"]
+    state = st.session_state.get(skey)
+    sig_items = [(it["mean"], it["error"]) for it in items]
+    if state is None or state.get("sig") != sig_items:
+        state = {"sig": sig_items, "ver": 0,
+                 "rows": [{"Group": it["label"] or f"Group {i}", "n": int(n_all)} for i, it in enumerate(items, start=1)]}
+        st.session_state[skey] = state
+    if state.get("n_all") != int(n_all):          # 위에서 n을 바꾸면 모든 군에 적용
+        for r_ in state["rows"]:
+            r_["n"] = int(n_all)
+        state["n_all"] = int(n_all)
+        state["ver"] += 1
+
+    left, right = st.columns([0.95, 1.05], gap="medium")
+    with left:
+        with st.container(border=True):
+            if len(boxes) > 1:
+                h1, h3 = st.columns([1.6, 1], vertical_alignment="center")
+                h1.markdown(f'<div class="fd-card-t">인식 결과 · 패널 {len(boxes)}개</div>', unsafe_allow_html=True)
+                with h3.popover("🖼 전체 그림", width="stretch"):
+                    st.image(FA.panels_overlay(full, boxes), width=640)
+                st.segmented_control("패널", [str(i) for i in range(1, len(boxes) + 1)], default="1",
+                                     key="fd_panel_" + hashlib.sha1(full).hexdigest()[:8],
+                                     label_visibility="collapsed", format_func=lambda v: f"패널 {v}")
+            else:
+                st.markdown('<div class="fd-card-t">인식 결과</div>', unsafe_allow_html=True)
+            if res["overlay"]:
+                st.image(res["overlay"], width="stretch")
+            st.markdown('<div class="fd-legend"><span><i style="background:#16a34a"></i>읽은 눈금</span>'
+                        '<span><i style="background:#2563eb"></i>Mean</span>'
+                        '<span><i style="background:#dc2626"></i>오차 막대 끝</span></div>', unsafe_allow_html=True)
+    with right:
+        with st.container(border=True):
+            st.markdown('<div class="fd-card-t">③ 결과 확인 · 내보내기</div>', unsafe_allow_html=True)
+            unsure = [i for i, it in enumerate(items, start=1) if it["error"] is None or not it["sure"]]
+            if not items:
+                st.markdown('<span class="fd-pill bad">✕ 막대나 점을 찾지 못했습니다</span>', unsafe_allow_html=True)
+                st.caption("아래 「직접 찍어서 추출」을 쓰세요.")
+            elif not res["calibrated"]:
+                st.markdown('<span class="fd-pill warn">! 축 눈금 값을 읽지 못했습니다</span>', unsafe_allow_html=True)
+                st.caption("그림의 LOW·TOP 눈금 값을 아래 「축 값 고치기」에 넣으면 바로 계산됩니다.")
+            else:
+                labs = sorted(v for v, _t in res["labels"])
+                rng = f"눈금 {labs[0]:g} – {labs[-1]:g}" if labs else ""
+                if unsure:
+                    st.markdown(f'<span class="fd-pill warn">! {len(items)}개 중 {len(unsure)}개 확인 필요</span>',
+                                unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<span class="fd-pill ok">✓ {len(items)}개 자동 추출 완료</span>', unsafe_allow_html=True)
+                st.markdown(f'<div class="fd-meta">{"수동 축" if manual else "자동 축 보정"} · {rng}'
+                            f'{" · 로그축" if res["log"] else ""}</div>', unsafe_allow_html=True)
+                rows = []
+                for i, (it, r_) in enumerate(zip(items, state["rows"]), start=1):
+                    rows.append({"#": f"{i} ⚠" if i in unsure else str(i), "Group": r_["Group"], "n": r_["n"],
+                                 "Mean": _sig(it["mean"]), etype: _sig(it["error"]),
+                                 "SD": _sd(it["error"], r_["n"], etype)})
+                df = pd.DataFrame(rows)
+                tkey = f"fd_tbl_{key}"
+                st.data_editor(
+                    df, hide_index=True, width="stretch", key=f"{tkey}_{state['ver']}",
+                    disabled=["#", "Mean", etype, "SD"],
+                    on_change=_apply_edits, args=(tkey, skey),
+                    column_config={
+                        "#": st.column_config.TextColumn("#", width="small"),
+                        "Group": st.column_config.TextColumn("Group ✎"),
+                        "n": st.column_config.NumberColumn("n ✎", min_value=1, step=1, width="small"),
+                        "SD": st.column_config.NumberColumn("SD", help="최종 값(데이터 추출표에 넣을 값)"),
+                    })
+                if unsure:
+                    st.caption(f"⚠ {', '.join(map(str, unsure))}번: 점·글자가 오차 막대 끝에 겹쳐 확신하지 못한 값 — 왼쪽 그림의 빨간 선을 확인하세요.")
+                out = pd.DataFrame([{"Group": r_["Group"], "n": r_["n"], "Mean": row["Mean"], "SD": row["SD"]}
+                                    for r_, row in zip(state["rows"], rows)])
+                d1, d2 = st.columns(2)
+                d1.download_button("⬇ CSV 저장", out.to_csv(index=False).encode("utf-8-sig"), "figure_values.csv",
+                                   "text/csv", key=f"fd_dl_{key}", type="primary", width="stretch")
+                with d2.popover("📋 엑셀 붙여넣기용", width="stretch"):
+                    st.code(out.to_csv(sep="\t", index=False), language=None)
+            with st.popover("축 값 고치기", width="stretch", type="tertiary"):
+                st.caption(f"찾은 눈금 {len(res['ticks'])}개 중 가장 아래(그림의 LOW)와 가장 위(TOP) 눈금 값을 넣으세요.")
+                e1, e2 = st.columns(2)
+                lo = e1.number_input("가장 아래 눈금", value=0.0, format="%g", key=f"fd_lo_{key}")
+                hi = e2.number_input("가장 위 눈금", value=100.0, format="%g", key=f"fd_hi_{key}")
+                lg = st.toggle("로그축", key=f"fd_log_{key}")
+                if st.button("이 값으로 다시 계산", key=f"fd_apply_{key}", type="primary", width="stretch"):
+                    st.session_state[f"fd_manual_{key}"] = (float(lo), float(hi), bool(lg))
+                    st.rerun()
+                if manual and st.button("자동 보정으로 되돌리기", key=f"fd_reset_{key}", width="stretch"):
+                    st.session_state.pop(f"fd_manual_{key}", None)
+                    st.rerun()
+
+    with st.expander("자동 인식이 안 될 때: 직접 찍어서 추출", expanded=False):
+        _render_manual()
+
+
+def _render_manual() -> None:
+    """수동 추출(클릭으로 축 보정 → Mean·오차 끝). 자동 인식이 어려운 그림용. 값은 저장되지 않는다."""
     st.caption("그래프 이미지를 보정한 뒤 클릭해 Mean, SD/SE/95% CI 값을 읽습니다. 추출값은 저장되지 않습니다.")
 
     html = r'''
@@ -156,4 +372,4 @@ def render_figure_digitizer() -> None:
     })();
     </script>
     '''
-    components.html(html, height=1010, scrolling=False)
+    st.iframe(html, height=1010)       # 고정 HTML(사용자 입력 아님)

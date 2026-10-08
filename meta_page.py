@@ -252,33 +252,57 @@ def _pick(results, key: str) -> dict:
 # ---------------------------------------------------------------------------
 # 탭
 # ---------------------------------------------------------------------------
+STUDY_KINDS = {"forest", "subgroup", "leave1out", "influence", "baujat"}
+FAV_KINDS = {"forest", "leave1out", "robustness", "trimfill_compare"}
+
+
+def _name_editor(res: dict, kind: str) -> dict:
+    """「✏️ 그림 안 이름 바꾸기」 — 제목·부제·효과 방향·연구 이름. 반환: 이 그림에 쓸 settings."""
+    o = res["outcome"]
+    store = st.session_state.setdefault("fig_settings", {})
+    st_ = _settings(res)
+    k = f"ne_{kind}_{res['_key'][:8]}"
+    with st.expander("✏️ 그림 안 이름 바꾸기", expanded=False):
+        if kind == "forest":
+            st_["title"] = st.text_input("제목", st_["title"], key=f"{k}_t").strip() or st_["title"]
+            st_["subtitle"] = st.text_input("부제", st_.get("subtitle") or "", key=f"{k}_s").strip() or None
+        else:
+            ft = dict(st_.get("fig_text") or {})
+            t0, s0 = M.fig_text(st_, kind, o)
+            t1 = st.text_input("제목", t0, key=f"{k}_t").strip()
+            ent = {"title": t1 if t1 and t1 != M.FIG_TITLE.get(kind, "{t}").format(t=st_["title"]) else ""}
+            if kind in M.FIG_SUBTITLE:
+                s1 = st.text_input("부제", s0 or "", key=f"{k}_s").strip()
+                ent["subtitle"] = s1 if s1 != M.FIG_SUBTITLE[kind] else ""
+            ft[kind] = ent
+            st_["fig_text"] = ft
+        if kind in FAV_KINDS:
+            inc = st.radio("효과 방향", ["감소가 유익", "증가가 유익"], horizontal=True, key=f"{k}_f",
+                           index=0 if tuple(st_["favours"])[0] == "Favours Intervention" else 1)
+            st_["favours"] = (("Favours Intervention", "Favours Control") if inc == "감소가 유익"
+                              else ("Favours Control", "Favours Intervention"))
+        if kind in STUDY_KINDS:
+            names = st.session_state.setdefault("study_names", {})
+            studies = list(dict.fromkeys(F.clean_label(x) for x in res["data"]["Study"].astype(str)))
+            cur = [names.get(x, x) for x in studies]
+            st.caption("연구 이름 — 오른쪽 칸을 고치면 모든 그림과 Table S2에 반영됩니다(같은 연구는 다른 outcome에도 적용).")
+            ed = st.data_editor(pd.DataFrame({"원래 이름": studies, "표시할 이름": cur}), hide_index=True,
+                                width="stretch", disabled=["원래 이름"], key=_edit_key(f"sn_{kind}_", (o, cur)))
+            for orig, new in zip(ed["원래 이름"], ed["표시할 이름"]):
+                new = F.clean_label(new) if isinstance(new, str) else ""
+                if new and new != orig:
+                    names[orig] = new
+                else:
+                    names.pop(orig, None)
+            st_["study_names"] = dict(names)
+    store[o] = {k_: v for k_, v in st_.items() if k_ != "study_names"}
+    return st_
+
+
 def _forest_tab(results):
     res = _pick(results, "forest_outcome")
     o = res["outcome"]
-    st_ = _settings(res)
-    with st.expander("✏️ 그림 안 이름 바꾸기 · 효과 방향", expanded=False):
-        k = f"fs_{res['_key'][:8]}"
-        st_["title"] = st.text_input("제목", st_["title"], key=f"{k}_t").strip() or st_["title"]
-        st_["subtitle"] = st.text_input("부제", st_.get("subtitle") or "", key=f"{k}_s").strip() or None
-        inc = st.radio("효과 방향", ["감소가 유익", "증가가 유익"], horizontal=True, key=f"{k}_f",
-                       index=0 if tuple(st_["favours"])[0] == "Favours Intervention" else 1)
-        st_["favours"] = (("Favours Intervention", "Favours Control") if inc == "감소가 유익"
-                          else ("Favours Control", "Favours Intervention"))
-        names = st.session_state.setdefault("study_names", {})
-        studies = list(dict.fromkeys(F.clean_label(x) for x in res["data"]["Study"].astype(str)))
-        cur = [names.get(x, x) for x in studies]
-        st.caption("연구 이름 — 오른쪽 칸을 고치면 forest·부분군·leave-one-out·influence·Baujat 그림과 Table S2에 "
-                   "모두 반영됩니다(같은 연구는 다른 outcome에도 적용).")
-        ed = st.data_editor(pd.DataFrame({"원래 이름": studies, "표시할 이름": cur}), hide_index=True,
-                            width="stretch", disabled=["원래 이름"], key=_edit_key("sn_", (o, cur)))
-        for orig, new in zip(ed["원래 이름"], ed["표시할 이름"]):
-            new = F.clean_label(new) if isinstance(new, str) else ""
-            if new and new != orig:
-                names[orig] = new
-            else:
-                names.pop(orig, None)
-        st_["study_names"] = dict(names)
-    st.session_state.setdefault("fig_settings", {})[o] = {k_: v for k_, v in st_.items() if k_ != "study_names"}
+    st_ = _name_editor(res, "forest")
     _figure(res, "forest", st_, f"forest_{M._slug(o)}")
     for gcol in M.candidate_group_columns(res):
         st.markdown(f"**Subgroup · {gcol}**")
@@ -291,7 +315,6 @@ SENS_KINDS = {"Leave-one-out": "leave1out", "Influence": "influence", "Baujat": 
 TF_KINDS = {"Trim-and-fill funnel": "trimfill", "Contour-enhanced funnel": "funnel", "보정 전후 비교": "trimfill_compare"}
 
 
-@st.fragment
 def _kind_tab(results, kinds: dict, key: str):
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -299,7 +322,8 @@ def _kind_tab(results, kinds: dict, key: str):
     lab = c2.segmented_control("그림", list(kinds), default=list(kinds)[0], key=f"{key}_kind",
                                label_visibility="collapsed") or list(kinds)[0]
     kind = kinds[lab]
-    _figure(res, kind, _settings(res), f"{kind}_{M._slug(res['outcome'])}")
+    st_ = _name_editor(res, kind)
+    _figure(res, kind, st_, f"{kind}_{M._slug(res['outcome'])}")
 
 
 def _year_conflicts(results: list[dict]) -> list[str]:

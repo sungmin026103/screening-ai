@@ -1628,7 +1628,7 @@ elif nav == "pdf_analysis":
 elif nav == "figure_digitizer":
     hero(
         "Figure 값 추출",
-        "그래프 이미지를 보정한 뒤 Mean, SD/SE, 95% CI 값을 클릭으로 읽습니다.",
+        "그래프 이미지를 올리면 축을 자동으로 맞추고 막대·점의 Mean과 오차를 읽어 SD로 돌려줍니다.",
         eyebrow="FIGURE DATA EXTRACTOR",
     )
     render_figure_digitizer()
