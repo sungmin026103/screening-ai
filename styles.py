@@ -214,6 +214,126 @@ header[data-testid="stHeader"]{height:3.75rem;background:rgba(247,249,252,.96);b
 
 @media(max-width:900px){.landing-links{display:none}.landing-hero-content{grid-template-columns:1fr;padding:48px 34px 54px}.hero-art{display:none}.landing-actions{grid-template-columns:1fr 1fr}.summary-strip{grid-template-columns:repeat(2,1fr)}.summary-item:nth-child(2){border-right:0}.project-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:620px){.block-container{padding-top:4.65rem;padding-left:1rem;padding-right:1rem}.landing-tag{display:none}.landing-hero h1{font-size:2rem}.landing-hero-content{padding:42px 24px 48px}.landing-actions{grid-template-columns:1fr;margin-bottom:14px}.summary-strip{margin:0 0 24px}.summary-item{padding:18px 16px}.project-grid{grid-template-columns:1fr}.hero{padding:26px 23px}.hero-visual{display:none}.step-label{font-size:.68rem}}
+/* ===== V36 professional theme: ink + gold, serif headings, flat editorial surfaces ===== */
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@300;500&display=swap');
+:root{
+  --navy:#0A1517; --navy2:#0F1C1F; --blue:#8F5F0B; --blue2:#B9831F;
+  --paper:#EDF0EF; --surface:#F8FAF9; --ink:#0E1A1C; --muted:#5B6B6D; --line:#CFD8D6;
+  --gold:#8F5F0B; --gold-hi:#E3B455; --teal:#1F5C5A;
+  --serif:'Noto Serif KR','Iowan Old Style',Georgia,serif;
+}
+.stApp{background:var(--paper)}
+header[data-testid="stHeader"]{background:rgba(237,240,239,.94);border-bottom:1px solid var(--line)}
+:focus-visible{outline:2px solid var(--ink) !important;outline-offset:2px}
+[data-testid="stSidebar"] :focus-visible{outline-color:var(--gold-hi) !important}
+[data-testid="stSidebar"] .stButton>button{border-radius:0;border-left:2px solid transparent;min-height:44px}
+[data-testid="stSidebar"] .stButton>button[kind="primary"]{background:rgba(227,180,85,.08);border-left:2px solid var(--gold-hi);color:#fff}
+.brandbar .mark{font-family:var(--serif);font-weight:500;letter-spacing:.02em}
+.stButton>button,.stDownloadButton>button{border-radius:2px;min-height:44px;font-weight:500;border:1px solid var(--ink);background:transparent;color:var(--ink);transition:background-color .15s,color .15s,border-color .15s}
+.stButton>button:hover,.stDownloadButton>button:hover{border-color:var(--gold);color:var(--gold);background:transparent}
+.stButton>button[kind="primary"],.stDownloadButton>button[kind="primary"]{background:var(--ink);border-color:var(--ink);color:var(--paper)}
+.stButton>button[kind="primary"]:hover,.stDownloadButton>button[kind="primary"]:hover{background:var(--gold);border-color:var(--gold);color:#fff}
+[data-testid="stFileUploader"]{background:var(--surface);border:1px dashed var(--muted);border-radius:2px}
+[data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:2px}
+.small-note{background:var(--surface);border:1px solid var(--line);border-left:2px solid var(--gold);border-radius:2px;color:var(--muted)}
+.section-title{font-family:var(--serif);font-weight:500}
+[data-testid="stMetricValue"]{font-family:var(--serif);font-weight:300}
+
+/* landing */
+.landing-logo{display:none}
+.landing-brand{font-family:var(--serif);font-weight:500;letter-spacing:.02em;gap:14px}
+.landing-tag{font-family:'JetBrains Mono',monospace;font-size:.62rem;letter-spacing:.14em;text-transform:uppercase;color:#93A7A5}
+.landing-nav{position:absolute;z-index:5;left:40px;right:40px;top:26px;padding:0;color:#E8EFED}
+.landing-links{color:#93A7A5;font-size:.82rem;font-weight:400}
+.landing-links .active{color:#E8EFED;border-bottom:1px solid var(--gold-hi);padding-bottom:3px}
+.landing-hero{background:#0A1517;border-radius:2px;box-shadow:none;min-height:440px;margin-top:0}
+.landing-hero:after{content:"";position:absolute;inset:0;z-index:2;background:linear-gradient(90deg,#0A1517 0%,rgba(10,21,23,.8) 34%,transparent 68%);pointer-events:none}
+.landing-hero-art{position:absolute;inset:0;z-index:1}
+.landing-hero-art svg{width:100%;height:100%;display:block}
+.landing-hero-content{display:block;padding:150px 56px 96px;max-width:720px}
+.landing-hero h1{font-family:var(--serif);font-weight:300;font-size:4.2rem;line-height:1.05;letter-spacing:.01em;margin:0;color:#E8EFED}
+.landing-seed{position:absolute;right:22px;bottom:14px;z-index:3;font-family:'JetBrains Mono',monospace;font-size:.62rem;letter-spacing:.1em;color:#93A7A5}
+.summary-strip{background:transparent;border:0;border-bottom:1px solid var(--line);border-radius:0;box-shadow:none;margin-top:6px}
+.summary-item{padding:22px 24px 20px 0;border-right:0}
+.summary-item+.summary-item{padding-left:24px;border-left:1px solid var(--line)}
+.summary-label{font-size:.8rem;letter-spacing:.04em}
+.summary-value{font-family:var(--serif);font-weight:300;font-size:2.4rem}
+.recent-head{border-top:0}
+.recent-head h2{font-family:var(--serif);font-weight:500}
+.project-card{border-radius:2px;background:var(--surface);box-shadow:none}
+.project-card:hover{transform:none;box-shadow:none;border-color:var(--gold)}
+.project-card .pct{color:var(--gold)}
+.progress-shell{border-radius:0;height:3px;background:var(--line)}
+.progress-fill{border-radius:0;background:var(--gold)}
+.empty-state{border-radius:2px;background:var(--surface);border:1px dashed var(--muted)}
+
+/* in-project page header: banner -> editorial header */
+.hero{background:transparent;color:var(--ink);border-radius:0;box-shadow:none;padding:0 0 16px;margin:4px 0 24px;border-bottom:1px solid var(--ink)}
+.hero:after,.hero-visual{display:none}
+.hero .eyebrow{color:var(--gold);font-family:'JetBrains Mono',monospace;font-size:.62rem;letter-spacing:.18em}
+.hero h1{font-family:var(--serif);font-weight:300;font-size:2.5rem;line-height:1.2;letter-spacing:0;color:var(--ink);margin:0 0 6px}
+.hero p{color:var(--muted);font-size:.9rem}
+.topbar .avatar{border-radius:2px;background:var(--ink)}
+
+/* KPI / stepper / activity */
+.kpi{border-radius:2px;background:var(--surface);box-shadow:none;border-top:2px solid var(--ink)}
+.kpi .value{font-family:var(--serif);font-weight:300;font-size:2.2rem}
+.stepper{border-radius:2px;background:var(--surface)}
+.stepper-fill{background:var(--ink)}
+.step-circle.done{background:var(--ink);border-color:var(--ink)}
+.step-circle.current{border-color:var(--gold-hi);color:var(--ink);box-shadow:0 0 0 4px rgba(227,180,85,.25)}
+.activity-icon{border-radius:2px;background:var(--paper)}
+
+[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"],[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]{justify-content:flex-start !important;text-align:left !important;border-radius:0 !important}
+[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"] div,[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] div,[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"] span,[data-testid="stSidebar"] [data-testid="stBaseButton-primary"] span{justify-content:flex-start !important;text-align:left !important;width:100%}
+[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]{background:transparent !important;border:0 !important;border-left:2px solid transparent !important;color:#B9C8C5 !important}
+[data-testid="stSidebar"] [data-testid="stBaseButton-secondary"]:hover{background:rgba(255,255,255,.05) !important;color:#fff !important}
+[data-testid="stSidebar"] [data-testid="stBaseButton-primary"]{background:rgba(227,180,85,.10) !important;border:0 !important;border-left:2px solid #E3B455 !important;color:#fff !important}
+[data-testid="stAlert"]{background:var(--surface) !important;border:1px solid var(--line) !important;border-left:2px solid var(--gold) !important;border-radius:2px !important;color:var(--ink) !important}
+[data-testid="stAlert"] *{color:var(--ink) !important}
+[data-testid="stAlertContainer"],[data-testid="stAlert"] [class*="st-emotion"]{background:transparent !important}
+[data-testid="stAlert"]:has([data-testid="stAlertContentError"]){border-left-color:#B3382F !important}
+[data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]){border-left-color:var(--teal) !important}
+[data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]){border-left-color:var(--muted) !important}
+[data-testid="stSidebar"] .stButton>button{justify-content:flex-start !important;text-align:left !important}
+[data-testid="stSidebar"] .stButton>button p{text-align:left !important;width:100%}
+.summary-hint,.kpi .hint,.step-date,.hub-note{color:var(--muted) !important}
+.stButton>button p{white-space:nowrap}
+@media(prefers-reduced-motion:reduce){*{animation:none !important;transition:none !important}}
+@media(max-width:900px){.landing-nav{left:20px;right:20px}.landing-hero-content{padding:130px 28px 80px}.landing-hero h1{font-size:3rem}}
+
+/* ----- V36.5: 기존 V36 "motion & premium" 레이어(파랑 그라디언트·유리 카드·탭)를 잉크+금색으로 재도색 ----- */
+.hero{background:transparent !important;color:var(--ink) !important}
+.hero:before,.hero:after{display:none !important}
+.hero .eyebrow{color:var(--gold) !important}
+.hero h1{color:var(--ink) !important;animation:none !important}
+.hero p{color:var(--muted) !important;animation:none !important}
+.mcard{background:var(--surface);backdrop-filter:none;border:1px solid var(--line);border-top:2px solid var(--ink);border-radius:2px;box-shadow:none;animation:none}
+.mcard:hover{transform:none;box-shadow:none}
+.mcard:after,.mcard .accent{display:none}
+.mcard .lab,.mcard .hint{color:var(--muted)}
+.mcard .val{font-family:var(--serif);font-weight:300;color:var(--ink);font-size:2rem}
+.mcard .delta{border-radius:2px}
+.sec-head .ico{border-radius:2px;background:var(--ink);box-shadow:none;color:var(--gold-hi)}
+.sec-head .t{font-family:var(--serif);font-weight:500;color:var(--ink)}
+.sec-head .s{color:var(--muted)}
+.live{border-radius:2px;background:var(--surface);color:var(--ink);border:1px solid var(--line)}
+.stTabs [role="tablist"]{border-bottom:1px solid var(--ink) !important;gap:4px}
+.stTabs [role="tab"]{border-radius:0 !important;background:transparent !important;border:0 !important;border-bottom:2px solid transparent !important;box-shadow:none !important;color:var(--muted) !important;min-height:48px;transform:none !important}
+.stTabs [role="tab"]:hover{color:var(--gold) !important}
+.stTabs [role="tab"][aria-selected="true"]{background:transparent !important;color:var(--ink) !important;border-bottom:2px solid var(--gold-hi) !important;box-shadow:none !important}
+.stTabs [role="tab"][aria-selected="true"] p{color:var(--ink) !important}
+.stButton>button:hover,.stDownloadButton>button:hover{transform:none;box-shadow:none}
+.stButton>button[kind="primary"],.stDownloadButton>button[kind="primary"]{background:var(--ink) !important;border:1px solid var(--ink) !important;color:var(--paper) !important}
+.stButton>button[kind="primary"]:hover,.stDownloadButton>button[kind="primary"]:hover{background:var(--gold) !important;border-color:var(--gold) !important;color:#fff !important}
+.stButton>button[kind="primary"]:after,.stDownloadButton>button[kind="primary"]:after{display:none !important}
+section[data-testid="stSidebar"] .stButton>button[kind="primary"]{background:rgba(227,180,85,.10) !important;border:0 !important;border-left:2px solid #E3B455 !important;color:#fff !important;border-radius:0 !important}
+section[data-testid="stSidebar"] .stButton>button[kind="secondary"]{background:transparent !important;border:0 !important;color:#B9C8C5 !important;border-radius:0 !important}
+section[data-testid="stSidebar"] .stButton>button[kind="secondary"]:hover{background:rgba(255,255,255,.05) !important;color:#fff !important}
+[data-testid="stProgress"] div[role="progressbar"]>div>div{background:var(--gold) !important;animation:none !important}
+.meter{border-radius:0}.meter>span{border-radius:0;background:var(--gold)}
+.fig-frame{border-radius:2px;box-shadow:none}
+.kpi:hover{transform:none;box-shadow:none}
 </style>
 """
 
@@ -222,28 +342,69 @@ def apply_styles() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
 
 
+def _landing_nav_html() -> str:
+    return ('<div class="landing-nav" role="navigation" aria-label="주요 메뉴">'
+            '<div class="landing-brand"><span class="landing-tag">Systematic review</span></div>'
+            '<div class="landing-links"><span class="active">프로젝트</span><span>문헌 관리</span>'
+            '<span>AI 스크리닝</span><span>메타분석</span></div></div>')
+
+
 def landing_nav() -> None:
-    st.markdown(
-        '<div class="landing-nav">'
-        '<div class="landing-brand"><span class="landing-logo">▰</span><span>SR Studio</span>'
-        '<span class="landing-tag">Systematic Review Workspace</span></div>'
-        '<div class="landing-links"><span class="active">프로젝트</span><span>문헌 관리</span>'
-        '<span>AI 스크리닝</span><span>메타분석</span><span>도움말</span></div></div>',
-        unsafe_allow_html=True,
-    )
+    """상단 메뉴는 히어로 안에 함께 그려진다(landing_hero). 호환을 위해 함수만 남긴다."""
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def _hero_art_svg(seed: int = 42, width: int = 1200, height: int = 440) -> str:
+    """시드 고정 유동장 SVG. 같은 시드는 항상 같은 그림이다.
+    왼쪽에서 출발한 선(문헌)은 게이트를 지나며 대부분 흐려지고, 소수만 금빛으로 오른쪽 끝에 모인다."""
+    import math
+    import random
+
+    rng = random.Random(seed)
+    ph = [rng.random() * 6.283 for _ in range(3)]
+    gate = width * 0.62
+
+    def angle(x: float, y: float) -> float:
+        u, v = x / width, y / height
+        a = math.sin(u * 5.1 + ph[0]) * .55 + math.cos(v * 6.3 + ph[1]) * .45 + math.sin((u + v) * 7.7 + ph[2]) * .3
+        g = max(0.0, (u - .55) / .45)
+        toward = math.atan2(height * .52 - y, width * .9 - x)
+        return a * (1 - g * .85) + toward * g * .85
+
+    out = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg" '
+           f'role="img" aria-label="문헌이 필터를 지나며 소수만 남는 생성형 이미지" fill="none" stroke-linecap="round">']
+    for i in range(240):
+        keep = rng.random() < .05
+        x, y = rng.random() * width * .1, rng.random() * height
+        pts = [(x, y)]
+        for _ in range(int(width / 12)):
+            a = angle(x, y) + (0 if keep else (rng.random() - .5) * .08)
+            x += math.cos(a) * 9.6
+            y += math.sin(a) * 9.6
+            if x > width + 10 or y < -10 or y > height + 10:
+                break
+            if not keep and x > gate + width * .22:
+                break
+            pts.append((x, y))
+        if len(pts) < 4:
+            continue
+        d = " ".join(f"{px:.0f},{py:.0f}" for px, py in pts)
+        if keep:
+            out.append(f'<polyline points="{d}" stroke="#E3B455" stroke-width="1.3" opacity=".7"/>')
+        else:
+            out.append(f'<polyline points="{d}" stroke="#8FB3AF" stroke-width=".8" opacity=".16"/>')
+    out.append(f'<line x1="{gate:.0f}" y1="{height*.12:.0f}" x2="{gate:.0f}" y2="{height*.88:.0f}" stroke="#E3B455" stroke-width="1" stroke-dasharray="2 6" opacity=".3"/>')
+    out.append("</svg>")
+    return "".join(out)
 
 
 def landing_hero() -> None:
     st.markdown(
-        '<div class="landing-hero"><div class="landing-hero-content">'
-        '<div><div class="landing-eyebrow">SYSTEMATIC REVIEW WORKSPACE</div>'
-        '<h1>체계적인 리뷰를,<br>더 효율적으로.</h1>'
-        '<p>문헌을 정리하고, 검토 우선순위를 설정하고,<br>분석 결과를 한 프로젝트에서 관리합니다.</p></div>'
-        '<div class="hero-art"><div class="hero-orbit o1"></div><div class="hero-orbit o2"></div>'
-        '<div class="hero-core"></div><div class="hero-dot d1"></div><div class="hero-dot d2"></div>'
-        '<div class="hero-dot d3"></div><div class="hero-dot d4"></div>'
-        '<div class="hero-line l1"></div><div class="hero-line l2"></div></div>'
-        '</div></div>', unsafe_allow_html=True,
+        '<div class="landing-hero"><div class="landing-hero-art">' + _hero_art_svg() + '</div>' + _landing_nav_html() +
+        '<div class="landing-hero-content"><h1>SR Studio</h1></div>'
+        '<div class="landing-seed">seed 42</div></div>',
+        unsafe_allow_html=True,
     )
 
 

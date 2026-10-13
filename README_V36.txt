@@ -1,7 +1,5 @@
 SR studio VER 36 — 메타분석 Figure 섹션 재구성 · V1 forest 디자인 · Table S2 생성 · 범용 스크리닝(자동 개념 게이트) · UI 개편
 
-[V36.5] Figure 값 추출: 기울어진(45°·90°) x축 그룹 이름 OCR(회전 후 판독, 배율 3단계 다수결, '+'↔'t' 오독 보정),
-        붙어 읽힌 이웃 이름을 막대 경계에서 분리, cap 대칭 판정을 중앙값으로 바꿔 JPEG 잡음에 의한 거짓 ⚠ 감소. 화면: 단계 카드·결과 카드 한 표.
 [V36.4] · Sensitivity · Trim-and-fill 탭에도 「✏️ 그림 안 이름 바꾸기」(그림별 제목·부제, 효과 방향, 연구 이름).
         · Figure 값 추출 자동화(figure_auto.py): 이미지를 올리면 y축 선·눈금을 찾고 눈금 숫자를 OCR(tesseract)로 읽어
           축을 자동 보정 → 막대(채움·빈·색·묶음·0에서 뜬 막대)/점 그래프의 Mean과 위쪽 오차 막대 끝을 읽는다.
@@ -108,3 +106,9 @@ Streamlit Cloud: packages.txt가 한글 글꼴을 설치한다. use_container_wi
    Table S2 행/각주/교체 일치)
   AppTest: 모든 메뉴 화면 예외 0 · 메타분석 화면을 엑셀/R zip/효과크기 CSV/원자료 CSV 4가지 입력으로
   파일 준비·섹션 zip·Supplementary·일괄 zip·실시간 탐색기까지 실행해 예외 0.
+
+[V36.5 · 디자인만] 스크리닝·메타분석 로직 변경 없음.
+· 잉크+금색 테마: .streamlit/config.toml, styles.py 하단 "V36 professional theme" 블록(기존 CSS 뒤에 덧씌움).
+· 홈 히어로: 시드 42 고정 SVG(_hero_art_svg, 캐시), 제목 "SR Studio". 상단 메뉴는 히어로 안에 그려짐.
+· 페이지 머리글을 배너 → 명조 제목+가는 선으로, KPI·단계·알림창 평면화, 포커스 링·44px 버튼·움직임 줄이기.
+· 홈 버튼 열 폭 [1.5, 1.6, 3.9].

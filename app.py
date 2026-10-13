@@ -317,7 +317,7 @@ if not st.session_state.active_project:
 
     # 버튼은 Hero와 요약 카드 사이의 독립 행에 배치해 화면 폭과 관계없이 겹치지 않게 합니다.
     st.markdown('<div class="landing-actions-anchor"></div>', unsafe_allow_html=True)
-    b1, b2, spacer = st.columns([1.0, 1.0, 4.8], gap="small")
+    b1, b2, spacer = st.columns([1.5, 1.6, 3.9], gap="small")
     with b1:
         create_clicked = st.button("＋ 새 프로젝트", type="primary", width="stretch", key="landing_new")
     with b2:
