@@ -386,6 +386,26 @@ def calibrate_manual(ax: Axis, v_low: float, v_high: float, log: bool = False) -
     return True
 
 
+def calibrate_two_points(ax: Axis, y_low: float, v_low: float, y_high: float, v_high: float, log: bool = False) -> bool:
+    """WebPlotDigitizer-style two-point Y-axis calibration, in analyzed-image pixels.
+
+    Unlike tick-only manual calibration, this works even when the chart has no
+    machine-detectable tick marks. The user supplies the two pixel positions.
+    """
+    if not all(math.isfinite(float(v)) for v in (y_low, v_low, y_high, v_high)):
+        return False
+    if abs(y_high - y_low) < 1 or (log and (v_low <= 0 or v_high <= 0)):
+        return False
+    lo = math.log10(v_low) if log else float(v_low)
+    hi = math.log10(v_high) if log else float(v_high)
+    b = (hi - lo) / (y_high - y_low)
+    if not math.isfinite(b) or abs(b) < 1e-14:
+        return False
+    ax.a, ax.b, ax.log, ax.ocr_ok = lo - b * y_low, b, bool(log), False
+    ax.labels = [(float(y_low), float(v_low), 'manual LOW'), (float(y_high), float(v_high), 'manual HIGH')]
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 2. 막대 · 점
 # ---------------------------------------------------------------------------
@@ -848,9 +868,15 @@ def analyze(data: bytes, manual_range: tuple | None = None) -> Result:
         return Result(False, None, [], msgs, size=im.size)
     ax.up = up
     if manual_range is not None:
-        ok = calibrate_manual(ax, *manual_range)
+        if len(manual_range) == 5:
+            # Pixel positions entered in original-image coordinates; analysis may upscale.
+            low_y, low_value, high_y, high_value, is_log = manual_range
+            ok = calibrate_two_points(ax, float(low_y) * up, float(low_value),
+                                      float(high_y) * up, float(high_value), bool(is_log))
+        else:
+            ok = calibrate_manual(ax, *manual_range)
         if not ok:
-            msgs.append("눈금을 2개 이상 찾지 못해 수동 값으로도 맞출 수 없습니다.")
+            msgs.append("수동 축 보정 실패: 눈금 또는 지정 좌표·값을 확인하세요.")
     else:
         labels = _ocr_labels(im, ax, msgs)
         ok = calibrate(ax, labels, msgs) if len(labels) >= 2 else False

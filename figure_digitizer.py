@@ -27,6 +27,9 @@ def _analyze(data: bytes, manual: tuple | None):
         "ticks": [] if ax is None else list(ax.ticks),
         "labels": [] if ax is None else [(float(v), t) for _r, v, t in ax.labels],
         "log": bool(ax is not None and ax.log),
+        "image_size": tuple(r.size),
+        "axis_top": (float(ax.top / getattr(ax, 'up', 1)) if ax is not None else None),
+        "axis_bottom": (float(ax.bottom / getattr(ax, 'up', 1)) if ax is not None else None),
         "items": [{"label": it.label, "mean": it.mean, "error": it.error, "sure": it.sure, "kind": it.kind}
                   for it in r.items],
     }
@@ -185,6 +188,17 @@ def render_figure_digitizer() -> None:
                     rows.append({"#": f"{i} ⚠" if i in unsure else str(i), "Group": r_["Group"], "n": r_["n"],
                                  "Mean": _sig(it["mean"]), etype: _sig(it["error"]),
                                  "SD": _sd(it["error"], r_["n"], etype)})
+                # Reviewable numerical corrections: unlike automatic segmentation, the
+                # researcher's checked values are retained and clearly identified.
+                correction_key = f"fd_corrections_{key}"
+                corrections = st.session_state.setdefault(correction_key, {})
+                for j, row in enumerate(rows):
+                    override = corrections.get(j, {})
+                    if override.get("Mean") is not None:
+                        row["Mean"] = override["Mean"]
+                    if override.get("Error") is not None:
+                        row[etype] = override["Error"]
+                    row["SD"] = _sd(row[etype], row["n"], etype)
                 df = pd.DataFrame(rows)
                 tkey = f"fd_tbl_{key}"
                 st.data_editor(
@@ -199,8 +213,54 @@ def render_figure_digitizer() -> None:
                     })
                 if unsure:
                     st.caption(f"⚠ {', '.join(map(str, unsure))}번: 점·글자가 오차 막대 끝에 겹쳐 확신하지 못한 값 — 왼쪽 그림의 빨간 선을 확인하세요.")
-                out = pd.DataFrame([{"Group": r_["Group"], "n": r_["n"], "Mean": row["Mean"], "SD": row["SD"]}
-                                    for r_, row in zip(state["rows"], rows)])
+                with st.expander("🔍 추출값 검증·수동 보정 (WebPlotDigitizer 방식)", expanded=False):
+                    st.caption("자동 추출값을 원본 그림과 대조한 뒤 Mean과 오차 길이를 수정하세요. "
+                               "수정한 값은 자동 재분석 후에도 유지되고, CSV에 수정 여부가 기록됩니다. "
+                               "오차 길이는 SD/SEM 변환 전의 그래프 표시값입니다.")
+                    correction_rows = []
+                    for j, (it, row) in enumerate(zip(items, rows)):
+                        correction_rows.append({"Group": row["Group"],
+                                                "Mean": row["Mean"],
+                                                "Error": row[etype]})
+                    correction_df = pd.DataFrame(correction_rows)
+                    # A form prevents Streamlit from re-running midway through editing.
+                    with st.form(key=f"fd_correct_form_{key}"):
+                        edited = st.data_editor(correction_df, hide_index=True, width="stretch",
+                                                disabled=["Group"], key=f"fd_correct_editor_{key}",
+                                                column_config={
+                                                    "Mean": st.column_config.NumberColumn("Mean ✎", format="%.6g"),
+                                                    "Error": st.column_config.NumberColumn("Error ± ✎", format="%.6g", min_value=0.0),
+                                                })
+                        apply_c = st.form_submit_button("보정값 적용", type="primary")
+                    if apply_c:
+                        valid = True
+                        new_values = {}
+                        for j, rec in edited.iterrows():
+                            mean, error = rec["Mean"], rec["Error"]
+                            if pd.isna(mean) or not math.isfinite(float(mean)) or (pd.notna(error) and
+                                (not math.isfinite(float(error)) or float(error) < 0)):
+                                valid = False
+                                break
+                            original = items[j]
+                            changed = ((original["mean"] is None or abs(float(mean) - float(original["mean"])) > 1e-9)
+                                       or (pd.notna(error) and (original["error"] is None or
+                                           abs(float(error) - float(original["error"])) > 1e-9)))
+                            if changed:
+                                new_values[j] = {"Mean": float(mean),
+                                                 "Error": float(error) if pd.notna(error) else None}
+                        if valid:
+                            st.session_state[correction_key] = new_values
+                            st.rerun()
+                        else:
+                            st.error("Mean은 유한한 숫자, Error는 0 이상의 숫자로 입력하세요.")
+                    if st.button("모든 수동 보정 취소", key=f"fd_clear_corr_{key}"):
+                        st.session_state.pop(correction_key, None)
+                        st.rerun()
+                out = pd.DataFrame([{"Group": r_["Group"], "n": r_["n"], "Mean": row["Mean"], "SD": row["SD"],
+                                     "Error_Type": etype, "Error_Raw": row[etype],
+                                     "Extraction": "manual_review" if j in corrections else "automatic",
+                                     "Axis_Calibration": "manual" if manual else "OCR"}
+                                    for j, (r_, row) in enumerate(zip(state["rows"], rows))])
                 d1, d2 = st.columns(2)
                 d1.download_button("⬇ CSV 저장", out.to_csv(index=False).encode("utf-8-sig"), "figure_values.csv",
                                    "text/csv", key=f"fd_dl_{key}", type="primary", width="stretch")
@@ -212,8 +272,22 @@ def render_figure_digitizer() -> None:
                 lo = e1.number_input("가장 아래 눈금", value=0.0, format="%g", key=f"fd_lo_{key}")
                 hi = e2.number_input("가장 위 눈금", value=100.0, format="%g", key=f"fd_hi_{key}")
                 lg = st.toggle("로그축", key=f"fd_log_{key}")
+                mode = st.radio("축 보정 방식", ["자동 탐지 눈금 위치", "직접 지정한 픽셀 위치"],
+                                horizontal=True, key=f"fd_cal_mode_{key}")
+                low_y = high_y = None
+                if mode == "직접 지정한 픽셀 위치":
+                    st.caption("이미지의 왼쪽 위가 (0, 0)입니다. Y좌표는 아래로 증가합니다. "
+                               "OCR/눈금 검출이 실패한 그림에도 적용할 수 있습니다.")
+                    cy1, cy2 = st.columns(2)
+                    low_y = cy1.number_input("LOW 눈금 Y(px)", min_value=0.0,
+                        value=float(res["axis_bottom"] or 100), step=1.0, key=f"fd_ylow_{key}")
+                    high_y = cy2.number_input("TOP 눈금 Y(px)", min_value=0.0,
+                        value=float(res["axis_top"] or 0), step=1.0, key=f"fd_yhigh_{key}")
                 if st.button("이 값으로 다시 계산", key=f"fd_apply_{key}", type="primary", width="stretch"):
-                    st.session_state[f"fd_manual_{key}"] = (float(lo), float(hi), bool(lg))
+                    if mode == "직접 지정한 픽셀 위치":
+                        st.session_state[f"fd_manual_{key}"] = (float(low_y), float(lo), float(high_y), float(hi), bool(lg))
+                    else:
+                        st.session_state[f"fd_manual_{key}"] = (float(lo), float(hi), bool(lg))
                     st.rerun()
                 if manual and st.button("자동 보정으로 되돌리기", key=f"fd_reset_{key}", width="stretch"):
                     st.session_state.pop(f"fd_manual_{key}", None)
