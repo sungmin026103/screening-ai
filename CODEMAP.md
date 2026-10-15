@@ -90,3 +90,11 @@
 | 기본 설계·검증 성적 (화면이 실행 시점에 읽음, 값 하드코딩 금지) | feasibility/design_default.json | 키 `n_total`, `census_top`, `bounds`, `phase2`, `phase1_frac`, `decision`, `threshold`, `cap`, `validated`, `metrics_real`, `metrics_real_nested`, `srs` (session.`load_design`, `validation_badge`) | tests/feasibility/test_session.py |
 
 **라이브러리 ETL 노트 (2026-10-15 빌드).** 전문 시트 행은 L1–L8 모두 정규화 제목 exact로 제목 모집단에 연결됨(fuzzy 0, 미매칭 0, added_from_ft 0). 초록 매칭률(전체/z1): L1 97.9/98.8%, L6 97.3/100%, L7 95.7/100%, L8 98.7/98.8%, L2 0.3/0%, L3 0.5/0%, L4 5.4/4.1%, L5 4.7/0% — L2–L5는 초록 소스(EndNote export·RIS/NBIB/CIW)에 해당 SR 레코드가 없음. fuzzy는 token_set_ratio ≥95 + 길이비 ≥0.8 가드(부분집합 제목 오매칭 방지). L7은 전문 단계 미완(ground_truth_complete=False).
+
+## 메뉴를 옮겨도 유지되는 입력·계속 도는 작업 (V37.1)
+| 하는 일 | 파일 | 핵심 | 테스트 |
+|---|---|---|---|
+| 입력 위젯 값·업로드 파일을 다른 메뉴에 갔다 와도 유지 (위젯을 감싸서 기억; 버튼류 제외, `fz:` 키 제외) | keepalive.py | `install`, `begin_run`, `forget(prefix)` | tests/app/test_jobs_keepalive.py |
+| 오래 걸리는 계산을 스레드로 실행, 끝나면 `collect()`가 화면 상태에 반영, 사이드바·해당 화면에 진행 표시 | jobs.py | `submit(project, name, label, fn, apply)`, `panel`, `sidebar_status`, `collect`, `wait`(테스트) | tests/app/test_jobs_keepalive.py, tests/app/test_menu_switch_e2e.py |
+| 작업으로 돌리는 곳 | app.py: `screen_sample`·`screen_rule`·`screen_train`·`pdf_extract` / feasibility_page.py: `fz_fetch`·`fz_llm`·`fz_oa:<rid>`·`fz_ftllm:<rid>` | | |
+규칙: 작업 함수 안에서 `st.*` 금지, 디스크 저장은 작업 함수 안에서, 화면 상태 변경은 `apply`에서. 새 긴 작업은 `jobs.submit`으로 추가. 서버를 끄면 실행 중 작업은 중단된다.

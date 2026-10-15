@@ -1,4 +1,5 @@
 """Headless AppTest smoke tests for feasibility_page.py (no network: search/LLM monkeypatched)."""
+import jobs
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -12,8 +13,10 @@ SLUG = "fz-demo"
 
 
 def _script():
+    import jobs
     import feasibility_page
 
+    jobs.collect("fz-demo")                    # app.py가 실행마다 하는 일: 끝난 백그라운드 작업 반영
     feasibility_page.render("fz-demo", lambda *a, **k: None)
 
 
@@ -37,6 +40,20 @@ def _records(n=80):
     df = pd.DataFrame(rows, columns=["title", "abstract", "doi", "pmid"])
     df["year"], df["source_db"] = 2020, "pubmed"
     return df
+
+
+def _settle(at):
+    """백그라운드 작업이 끝나길 기다린 뒤 다시 실행해 결과를 반영한다."""
+    assert jobs.wait(SLUG, 30)
+    return at.run()
+
+
+@pytest.fixture(autouse=True)
+def _clean_jobs():
+    jobs._JOBS.clear()
+    yield
+    jobs.wait(SLUG, 10)
+    jobs._JOBS.clear()
 
 
 @pytest.fixture
@@ -81,6 +98,7 @@ def test_step1_inputs_validation_and_search(env):
     at.segmented_control(key=f"fz:{SLUG}:step").set_value("② 검색 실행").run()
     assert not at.exception
     at.button(key=f"fz:{SLUG}:fetch").click().run()
+    _settle(at)
     assert not at.exception
     assert env and env[-1][1] is True and env[-1][2].endswith("feasibility_cache")
     saved = projects.load_project_state(SLUG, "feasibility")
@@ -245,6 +263,7 @@ def test_next_step_button_gating(env):
     assert at.button(key=f"fz:{SLUG}:next").disabled                         # not searched yet
     assert "PubMed" in at.info[0].value
     at.button(key=f"fz:{SLUG}:fetch").click().run()
+    _settle(at)
     assert not at.button(key=f"fz:{SLUG}:next").disabled
     at.button(key=f"fz:{SLUG}:next").click().run()
     assert at.segmented_control(key=f"fz:{SLUG}:step").value == "③ 표본 판정"
@@ -321,3 +340,34 @@ def test_guide_open_first_visit_only(env):
     at2 = _app().run()
     assert at2.expander[0].label == "처음이신가요? 3분 안내"
     assert at2.session_state[f"fz:{SLUG}:guide_first"] is False
+
+
+def test_fetch_keeps_running_when_user_changes_step_or_menu(env, monkeypatch):
+    import time as _t
+    orig = search_apis.pubmed_search
+
+    def slow(*a, **k):
+        _t.sleep(1.2)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(search_apis, "pubmed_search", slow)
+    projects.save_pico(SLUG, {"population": "obese mice", "intervention": "carotenoid", "comparator": "",
+                              "outcome": "triglyceride", "exclusion_criteria": ""})
+    at = _app().run()
+    at.text_area(key=f"fz:{SLUG}:in:outcomes_text").set_value("TG: triglyceride").run()
+    at.text_area(key=f"fz:{SLUG}:in:q_pubmed").set_value("carotenoid AND obesity").run()
+    at.segmented_control(key=f"fz:{SLUG}:step").set_value("② 검색 실행").run()
+    at.button(key=f"fz:{SLUG}:fetch").click().run()
+    assert jobs.is_running(SLUG, "fz_fetch")
+    assert at.button(key=f"fz:{SLUG}:fetch").disabled                      # 중복 실행 방지
+    at.segmented_control(key=f"fz:{SLUG}:step").set_value("① 입력").run()  # 단계 이동
+    assert not at.exception and jobs.is_running(SLUG, "fz_fetch")
+    assert at.text_area(key=f"fz:{SLUG}:in:q_pubmed").value == "carotenoid AND obesity"
+    assert jobs.wait(SLUG, 30)                                              # (메뉴 이동 중 완료)
+    at2 = _app().run()                                                      # 새 세션이 열려도 디스크의 결과를 쓴다
+    assert not at2.exception
+    saved = projects.load_project_state(SLUG, "feasibility")
+    assert saved["search"].get("n_unique") in (None, 0) or saved["search"]["n_unique"] == 80
+    at.run()                                                                # 같은 세션: collect가 결과 반영
+    assert projects.load_project_state(SLUG, "feasibility")["search"]["n_unique"] == 80
+    assert len(projects.load_project_state(SLUG, "feasibility_records")) == 80

@@ -59,6 +59,11 @@ from pdf_analyzer import FIELD_LABELS, analyze_pdf_bytes, extraction_to_datafram
 from figure_digitizer import render_figure_digitizer
 
 st.set_page_config(page_title="SR Studio · 문헌 스크리닝 워크스페이스", page_icon="◈", layout="wide")
+
+import jobs
+import keepalive
+keepalive.install()      # 메뉴를 옮겨도 입력값·업로드 파일 유지
+keepalive.begin_run()
 apply_styles()
 
 if "active_project" not in st.session_state:
@@ -394,6 +399,9 @@ if not st.session_state.active_project:
     st.markdown('<div class="hub-note">SR Studio · 프로젝트 작업 내용은 자동 저장됩니다.</div>', unsafe_allow_html=True)
     st.stop()
 
+if st.session_state.active_project:
+    jobs.collect(st.session_state.active_project)   # 백그라운드 작업이 끝났으면 결과를 화면 상태에 반영 (사이드바보다 먼저)
+
 with st.sidebar:
     st.markdown('<div class="brandbar"><span class="mark">SR Studio</span></div>', unsafe_allow_html=True)
     projects = list_projects()
@@ -409,6 +417,8 @@ with st.sidebar:
                      type="primary" if is_active else "secondary"):
             st.session_state.nav = key
             st.rerun()
+    if st.session_state.active_project:
+        jobs.sidebar_status(st.session_state.active_project)      # 실행 중인 백그라운드 작업
 
     st.divider()
     if active_meta:
@@ -448,6 +458,10 @@ topbar(active_meta["name"] if active_meta else active)
 # ===========================================================================
 # 1. 대시보드
 # ===========================================================================
+def _include_too_few(msg: str) -> bool:
+    return "Include" in str(msg) and "교차검증" in str(msg)
+
+
 def _read_screening_upload(uploaded):
     """초보자도 시트/열을 직접 맞출 필요 없이 Title+Abstract가 있는 시트를 자동 선택한다."""
     suffix = Path(uploaded.name).suffix.lower()
@@ -540,6 +554,7 @@ elif nav == "import":
     )
     uploaded = st.file_uploader(
         "검색 결과 파일 업로드", type=["nbib", "ris", "ciw", "csv", "tsv", "txt", "xlsx", "xls"], accept_multiple_files=True,
+        key="import_upload",
     )
     st.markdown(
         '<div class="small-note">지원 형식: PubMed NBIB, RIS, Web of Science CIW, CSV/TSV, Excel. DOI를 우선으로, 없으면 정규화된 제목으로 '
@@ -722,6 +737,11 @@ elif nav == "screen":
         "전체 문헌에서 Human validation 200편만 사람이 판정하고, 그 결과로 AI 선별의 안전성과 효율성을 검증한 뒤 전체 문헌을 우선순위화합니다.",
         eyebrow="AI SCREENING",
     )
+    for _jn in ("screen_sample", "screen_rule", "screen_train"):
+        _jb0 = jobs.get(active, _jn)
+        if _jb0 is not None and _jb0.status == "error" and _include_too_few(_jb0.error):
+            continue                 # 오류 안내와 추가 표본 뽑기는 ④ 단계에서 보여 줍니다
+        jobs.panel(active, _jn)      # 다른 메뉴에 갔다 와도 진행 상황이 여기에 보입니다
 
     criteria_text = " ".join(
         v for v in [
@@ -793,25 +813,24 @@ elif nav == "screen":
                 "표본 상단에 모여 같은 노동으로 Include를 더 확보합니다. "
                 "적격 기준(PECO)을 바꾸는 것이 아니라 '먼저 읽을 순서'만 바꾸며, 층별 가중치는 그대로 적용됩니다."
             )
-            if st.button("② AI가 Human validation 200편 선정", type="primary", width="stretch"):
-                try:
-                    with st.spinner("PICO/PECO 적합도를 이용해 High/Mid/Low 층화 validation 표본을 만드는 중입니다..."):
-                        training_sample = build_training_sample(
-                            df,
-                            pico_sectioned_text,
-                            pico.get("exclusion_criteria", ""),
-                            sample_size=TRAINING_SAMPLE_SIZE,
-                            seed_texts=[t.strip() for t in str(
-                                st.session_state.get("sample_seed_titles", "")).splitlines() if t.strip()] or None,
-                        )
-                    st.session_state["training_sample"] = training_sample
-                    save_project_state(active, "training_sample", training_sample)
-                    st.success(
-                        f"Human validation 문헌 {len(training_sample):,}편을 만들었습니다. "
-                        "Human_Label 열에 O(포함 가능) 또는 X(확실히 제외)를 모두 입력하세요."
-                    )
-                except Exception as exc:
-                    st.error(str(exc))
+            if st.button("② AI가 Human validation 200편 선정", type="primary", width="stretch",
+                         disabled=jobs.is_running(active, "screen_sample")):
+                _seeds = [t.strip() for t in str(st.session_state.get("sample_seed_titles", "")).splitlines()
+                          if t.strip()] or None
+                _crit, _excl, _slug = pico_sectioned_text, pico.get("exclusion_criteria", ""), active
+
+                def _work_sample(ctx, df=df):
+                    ts = build_training_sample(df, _crit, _excl, sample_size=TRAINING_SAMPLE_SIZE, seed_texts=_seeds)
+                    save_project_state(_slug, "training_sample", ts)
+                    return ts
+
+                def _apply_sample(ts):
+                    st.session_state["training_sample"] = ts
+                    return (f"Human validation 문헌 {len(ts):,}편을 만들었습니다. "
+                            "Human_Label 열에 O(포함 가능) 또는 X(확실히 제외)를 모두 입력하세요.")
+
+                jobs.submit(active, "screen_sample", "Human validation 표본 선정", _work_sample, _apply_sample)
+                st.rerun()
 
             training_sample = st.session_state.get("training_sample")
             if isinstance(training_sample, pd.DataFrame) and not training_sample.empty:
@@ -879,53 +898,67 @@ elif nav == "screen":
                         if st.button(
                             "④-B 규칙 기반으로 바로 선별 (모델 없음 · 결과 고정)",
                             width="stretch",
+                            disabled=jobs.is_running(active, "screen_rule"),
                         ):
-                            try:
-                                with st.spinner("규칙 게이트로 전체 문헌을 선별하는 중입니다..."):
-                                    rres = rule_only_screen(
-                                        merged_df, criteria_text,
-                                        pico.get("exclusion_criteria", ""), gate_rules=_gate_rules)
+                            _excl, _slug, _crit, _rules = pico.get("exclusion_criteria", ""), active, criteria_text, _gate_rules
+
+                            def _work_rule(ctx, merged_df=merged_df):
+                                rres = rule_only_screen(merged_df, _crit, _excl, gate_rules=_rules)
+                                save_project_state(_slug, "screening_result", rres)
+                                return rres
+
+                            def _apply_rule(rres):
                                 st.session_state["screening_result"] = rres
                                 st.session_state.pop("zero_shot_result", None)
-                                save_project_state(active, "screening_result", rres)
-                                log_activity(
-                                    "📏", "규칙 기반 선별 완료",
-                                    f"자동 제외 {rres.metrics['auto_excluded_n']:,}편 / "
-                                    f"사람 검토 {rres.metrics['human_review_n']:,}편 · "
-                                    f"Include 탈락 {rres.metrics['gate_fn_on_labels']}편",
-                                )
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(str(exc))
+                                detail = (f"자동 제외 {rres.metrics['auto_excluded_n']:,}편 / "
+                                          f"사람 검토 {rres.metrics['human_review_n']:,}편 · "
+                                          f"Include 탈락 {rres.metrics['gate_fn_on_labels']}편")
+                                log_activity("📏", "규칙 기반 선별 완료", detail)
+                                return "규칙 기반 선별 완료 — " + detail
+
+                            jobs.submit(active, "screen_rule", "규칙 기반 선별", _work_rule, _apply_rule)
+                            st.rerun()
 
                         if st.button(
                             "④ 200편으로 AI 학습·교차검증·전체 선별",
                             type="primary",
                             width="stretch",
-                            disabled=not enough_classes,
+                            disabled=not enough_classes or jobs.is_running(active, "screen_train"),
                         ):
-                            with st.spinner("200편의 사람 판정을 이용해 OOF 교차검증과 전체 문헌 선별을 계산하는 중입니다..."):
+                            _slug, _crit, _rules = active, criteria_text, _gate_rules
+                            _n_sample, _n_lab, _vsid = len(training_sample), int(label_stats["labeled_n"]), \
+                                label_stats.get("validation_set_id", "")
+
+                            def _work_train(ctx, merged_df=merged_df):
                                 result = train_and_predict(
                                     merged_df,
                                     recall_target=DEFAULT_RECALL_TARGET,
-                                    criteria_text=criteria_text,
-                                    gate_rules=_gate_rules,  # V36: 개념 게이트(자동/직접/없음)
-                                    validation_expected_n=len(training_sample),
+                                    criteria_text=_crit,
+                                    gate_rules=_rules,  # V36: 개념 게이트(자동/직접/없음)
+                                    validation_expected_n=_n_sample,
                                 )
-                            result.metrics["training_design"] = "fixed_200_pico_enriched_stratified_validation"
-                            result.metrics["training_sample_requested"] = int(len(training_sample))
-                            result.metrics["training_sample_labeled"] = int(label_stats["labeled_n"])
-                            result.metrics["validation_set_id"] = label_stats.get("validation_set_id", "")
-                            st.session_state["screening_result"] = result
-                            st.session_state.pop("zero_shot_result", None)
-                            save_project_state(active, "screening_result", result)
-                            safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
-                            status0 = result.metrics.get("quality_gate_status", "REVIEW")
-                            log_activity(
-                                "🤖", "AI 문헌 선별 완료",
-                                f"Human validation {len(training_sample)}편 · {status0} → 전체 {len(result.predictions):,}편 / 안전 제외 후보 {safe_n0:,}편",
-                            )
+                                result.metrics["training_design"] = "fixed_200_pico_enriched_stratified_validation"
+                                result.metrics["training_sample_requested"] = _n_sample
+                                result.metrics["training_sample_labeled"] = _n_lab
+                                result.metrics["validation_set_id"] = _vsid
+                                save_project_state(_slug, "screening_result", result)
+                                return result
+
+                            def _apply_train(result):
+                                st.session_state["screening_result"] = result
+                                st.session_state.pop("zero_shot_result", None)
+                                safe_n0 = int((result.predictions["AI_Recommendation"] == "안전 제외 후보").sum())
+                                status0 = result.metrics.get("quality_gate_status", "REVIEW")
+                                detail = (f"Human validation {_n_sample}편 · {status0} → "
+                                          f"전체 {len(result.predictions):,}편 / 안전 제외 후보 {safe_n0:,}편")
+                                log_activity("🤖", "AI 문헌 선별 완료", detail)
+                                return "AI 문헌 선별 완료 — " + detail
+
+                            jobs.submit(active, "screen_train", "AI 학습·교차검증·전체 선별", _work_train, _apply_train)
                             st.rerun()
+                        _jb = jobs.get(active, "screen_train")
+                        if _jb is not None and _jb.status == "error" and _include_too_few(_jb.error):
+                            raise ValueError(_jb.error)      # 아래 처리(오류 안내 + 추가 표본 뽑기)를 그대로 쓴다
                     except Exception as exc:
                         st.error(str(exc))
                         # Include가 너무 적어 교차검증 자체가 불가능한 경우: 모델이 없으니
@@ -1536,24 +1569,35 @@ elif nav == "pdf_analysis":
     pdf_files = st.file_uploader(
         "PDF 업로드", type=["pdf"], accept_multiple_files=True, key="pdf_stage1_upload"
     )
+    jobs.panel(active, "pdf_extract")
     run_pdf = st.button(
         "PDF 기본정보 추출", type="primary", width="stretch",
-        disabled=not pdf_files, key="run_pdf_stage1"
+        disabled=not pdf_files or jobs.is_running(active, "pdf_extract"), key="run_pdf_stage1"
     )
     if run_pdf and pdf_files:
-        results = []
-        progress = st.progress(0.0, text="PDF 분석 중")
-        for idx, pdf in enumerate(pdf_files, start=1):
-            try:
-                results.append(analyze_pdf_bytes(pdf.getvalue(), pdf.name))
-            except Exception as exc:
-                results.append({"filename": pdf.name, "warning": str(exc), "fields": {}, "pages": 0, "text_length": 0})
-            progress.progress(idx / len(pdf_files), text=f"PDF 분석 중 ({idx}/{len(pdf_files)})")
-        progress.empty()
-        st.session_state["pdf_extractions"] = results
-        if active:
-            save_project_state(active, "pdf_extractions", results)
-        log_activity("📄", "PDF 기본정보 추출", f"{len(results)}개 PDF")
+        blobs = [(pdf.name, pdf.getvalue()) for pdf in pdf_files]      # 화면의 업로더에 의존하지 않도록 바이트로 복사
+        _slug = active
+
+        def _work_pdf(ctx):
+            results = []
+            for idx, (name, data) in enumerate(blobs, start=1):
+                ctx.check()
+                ctx.set((idx - 1) / len(blobs), f"{idx}/{len(blobs)}개 · {name}")
+                try:
+                    results.append(analyze_pdf_bytes(data, name))
+                except Exception as exc:
+                    results.append({"filename": name, "warning": str(exc), "fields": {}, "pages": 0, "text_length": 0})
+            if _slug:
+                save_project_state(_slug, "pdf_extractions", results)
+            return results
+
+        def _apply_pdf(results):
+            st.session_state["pdf_extractions"] = results
+            keepalive.forget("pdf_edit_")        # 새 추출값이 이전 편집값에 가려지지 않게
+            log_activity("📄", "PDF 기본정보 추출", f"{len(results)}개 PDF")
+            return f"PDF 기본정보 추출 완료 — {len(results)}개"
+
+        jobs.submit(active, "pdf_extract", "PDF 기본정보 추출", _work_pdf, _apply_pdf, cancellable=True)
         st.rerun()
 
     pdf_results = st.session_state.get("pdf_extractions", [])
@@ -1619,6 +1663,7 @@ elif nav == "pdf_analysis":
             )
         if st.button("PDF 분석 결과 초기화", width="stretch"):
             st.session_state.pop("pdf_extractions", None)
+            keepalive.forget("pdf_edit_")
             if active:
                 save_project_state(active, "pdf_extractions", [])
             st.rerun()

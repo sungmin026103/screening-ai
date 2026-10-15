@@ -19,6 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import jobs
 from feasibility import fulltext as FT
 from feasibility import llm_local as LL
 from feasibility import population as POP
@@ -404,6 +405,8 @@ def render(active, log_activity) -> None:
         st.html(SCROLL_TOP_JS, unsafe_allow_javascript=True)
 
     nav_slot, banner_slot = st.container(), st.container()
+    for _jn in (FETCH_JOB, LLM_JOB):
+        jobs.panel(active, _jn)              # 다른 메뉴에 갔다 와도 진행 상황이 여기에 보입니다
     try:
         records = _records(active)
         if idx == 0:
@@ -640,11 +643,13 @@ def _step_search(active: str, state: dict, log_activity) -> None:
         confirm = st.checkbox("다시 수집하면 기존 표본·판정·전문 확인·결과가 지워집니다. 계속합니다.",
                               key=_k(active, "refetch_ok"))
     with c2:
-        go_fetch = st.button("전체 수집 · 중복 제거", type="primary", disabled=bool(probs) or not confirm,
+        go_fetch = st.button("전체 수집 · 중복 제거", type="primary",
+                             disabled=bool(probs) or not confirm or jobs.is_running(active, FETCH_JOB),
                              key=_k(active, "fetch"), width="stretch", icon=":material/search:",
                              help=" ".join(probs) or "DB별 논문을 모두 받아 중복을 제거합니다.")
     if go_fetch:
         _fetch_all(active, state, inp, qs, ups, cache_dir, log_activity, refresh)
+        st.rerun()
 
     prev = state["search"].get("preview")
     if prev:
@@ -654,43 +659,53 @@ def _step_search(active: str, state: dict, log_activity) -> None:
     _search_summary(state)
 
 
+FETCH_JOB = "fz_fetch"
+LLM_JOB = "fz_llm"
+
+
 def _fetch_all(active, state, inp, qs, ups, cache_dir, log_activity, refresh: bool = False) -> None:
-    results, rows = [], []
-    with st.status("검색 실행 중…", expanded=True) as box:
-        for db, q in qs:
-            st.write(f"{DB_NAMES[db]} 수집 중…")
+    """전체 수집을 백그라운드 작업으로 시작한다(메뉴를 옮겨도 계속). 결과는 끝나면 자동 반영된다."""
+    inp_c, qs_c = dict(inp), list(qs)
+    co = S.parse_count_only(inp_c.get("count_only"))
+    n_up = int(len(ups)) if ups is not None else 0
+
+    def work(ctx):
+        results, rows = [], []
+        total = len(qs_c) + 1
+        for n, (db, q) in enumerate(qs_c):
+            ctx.set(n / total, f"{DB_NAMES[db]} 수집 중")
             try:
-                res = _run_db(db, q, inp, True, cache_dir, refresh)
+                res = _run_db(db, q, inp_c, True, cache_dir, refresh)
             except Exception as exc:
-                st.error(f"{DB_NAMES[db]} 검색 실패: {exc}")
                 rows.append({"db": db, "query": q, "count": 0, "fetched": 0, "partial": True,
-                             "notes": [f"실패: {exc}"]})
+                             "notes": [f"{DB_NAMES[db]} 검색 실패: {exc}"]})
                 continue
             results.append(res)
             rows.append(_db_row(res))
-        st.write("중복 제거 중…")
+        ctx.set(len(qs_c) / total, "중복 제거 중")
+        recs, extra = POP.unique_population(results, uploads=ups, count_only=co)
+        recs = recs.reset_index(drop=True)
+        save_project_state(active, REC_KEY, recs)          # 화면이 없어도 디스크에는 남긴다
+        return {"recs": recs, "rows": rows, "extra": extra}
+
+    def apply(out):
+        st_ = _state(active)
+        recs = out["recs"]
+        _save_obj(active, REC_KEY, recs)
+        st_["search"] = {**st_["search"], "dbs": out["rows"], "n_unique": int(len(recs)),
+                         "extra_N": [float(out["extra"][0]), float(out["extra"][1])], "count_only": co,
+                         "n_upload": n_up, "at": _dt.datetime.now().isoformat(timespec="seconds")}
+        st_.update({"sample": {}, "labels": {}, "llm": {}, "fulltext": {}, "result": {}})
+        _save_obj(active, TXT_KEY, {})
+        _clear_widgets(active, "lab", "ftd", "q", "pdf")
+        _save(active, st_)
         try:
-            co = S.parse_count_only(inp.get("count_only"))
-            recs, extra = POP.unique_population(results, uploads=ups, count_only=co)
-        except Exception as exc:
-            box.update(label="중복 제거 실패", state="error")
-            st.error(f"모집단 구성 실패: {exc}")
-            return
-        box.update(label="검색 완료", state="complete", expanded=False)
-    recs = recs.reset_index(drop=True)
-    _save_obj(active, REC_KEY, recs)
-    state["search"] = {**state["search"], "dbs": rows, "n_unique": int(len(recs)),
-                       "extra_N": [float(extra[0]), float(extra[1])], "count_only": co,
-                       "n_upload": int(len(ups)) if ups is not None else 0,
-                       "at": _dt.datetime.now().isoformat(timespec="seconds")}
-    state.update({"sample": {}, "labels": {}, "llm": {}, "fulltext": {}, "result": {}})
-    _save_obj(active, TXT_KEY, {})
-    _clear_widgets(active, "lab", "ftd", "q", "pdf")
-    _save(active, state)
-    try:
-        log_activity("🔎", "가능성 예측: 검색 완료", f"고유 {len(recs):,}건")
-    except Exception:
-        pass
+            log_activity("🔎", "가능성 예측: 검색 완료", f"고유 {len(recs):,}건")
+        except Exception:
+            pass
+        return f"검색 완료 — 중복 제거 후 {len(recs):,}편"
+
+    jobs.submit(active, FETCH_JOB, "DB 검색·중복 제거", work, apply)
 
 
 def _search_summary(state: dict) -> None:
@@ -847,9 +862,11 @@ def _list_mode(active, state, items, model, only_todo: bool = False) -> None:
     n_pages = max(1, (len(view) + PAGE - 1) // PAGE)
     page = _page_input(active, state, "page3", n_pages)
     chunk = view[(page - 1) * PAGE: page * PAGE]
-    if model and st.button("이 페이지 LLM 제안 생성", key=_k(active, "llm_go", page), icon=":material/smart_toy:"):
+    if model and st.button("이 페이지 LLM 제안 생성", key=_k(active, "llm_go", page), icon=":material/smart_toy:",
+                           disabled=jobs.is_running(active, LLM_JOB)):
         todo = [it for it in chunk if it["rid"] not in state["llm"]] or chunk   # resume after a time-out
         _llm_suggest(active, state, todo, model)
+        st.rerun()
     for i, it in enumerate(chunk):
         rid = it["rid"]
         lab = labels.get(rid)
@@ -871,29 +888,41 @@ def _list_mode(active, state, items, model, only_todo: bool = False) -> None:
 
 
 def _llm_suggest(active, state, chunk, model) -> None:
-    inp = state["inputs"]
-    failed = skipped = 0
-    t0 = time.monotonic()
-    with st.spinner("LLM 제안 생성 중…"):
-        for n, it in enumerate(chunk):
+    """이 페이지의 LLM 제안을 백그라운드로 만든다(메뉴를 옮겨도 계속, 끝나면 자동 반영)."""
+    inp = dict(state["inputs"])
+    ptxt, excl = S.pico_text(inp), inp.get("exclusion", "")
+    work_items = [{"rid": it["rid"], "title": it.get("title"), "abstract": it.get("abstract")} for it in chunk]
+
+    def work(ctx):
+        out, failed, skipped, t0 = {}, 0, 0, time.monotonic()
+        for n, it in enumerate(work_items):
+            ctx.check()
             if time.monotonic() - t0 > LLM_BUDGET_S:
-                skipped = len(chunk) - n
+                skipped = len(work_items) - n
                 break
+            ctx.set(n / len(work_items), f"{n}/{len(work_items)}편")
             try:
-                sug = LL.llm_screen_abstract(it.get("title"), it.get("abstract"), S.pico_text(inp),
-                                             inp.get("exclusion", ""), model)
+                sug = LL.llm_screen_abstract(it["title"], it["abstract"], ptxt, excl, model)
             except Exception:
                 sug = None
             if sug:
-                state["llm"][it["rid"]] = sug
+                out[it["rid"]] = sug
             else:
                 failed += 1
-    _save(active, state)
-    if skipped:
-        st.warning(f"LLM 제안 시간 한도({LLM_BUDGET_S // 60}분)를 넘어 {skipped}편은 건너뛰었습니다. "
-                   "다시 누르면 이어서 생성하거나 직접 판정하세요.")
-    if failed:
-        st.warning(f"{failed}편은 LLM 응답을 받지 못했습니다 (모델 미설치·시간 초과). 직접 판정하세요.")
+        return {"sug": out, "failed": failed, "skipped": skipped}
+
+    def apply(r):
+        st_ = _state(active)
+        st_["llm"].update(r["sug"])
+        _save(active, st_)
+        msg = f"LLM 제안 {len(r['sug'])}편 생성"
+        if r["skipped"]:
+            msg += f" · 시간 한도({LLM_BUDGET_S // 60}분)로 {r['skipped']}편 건너뜀(다시 누르면 이어서)"
+        if r["failed"]:
+            msg += f" · {r['failed']}편은 응답 없음(직접 판정)"
+        return msg
+
+    jobs.submit(active, LLM_JOB, "LLM 제안 생성", work, apply, cancellable=True)
 
 
 def _card_mode(active, state, items) -> None:
@@ -1101,25 +1130,34 @@ def _paper_panel(active, state, it, outcomes, texts, email, llm_ok, models) -> N
     c1, c2 = st.columns([1, 2])
     with c1:
         can = bool(it.get("doi") or it.get("pmcid"))
-        if st.button("OA 전문 가져오기", key=_k(active, "oa", rid), disabled=not can, icon=":material/download:",
+        oa_job = f"fz_oa:{rid}"
+        if st.button("OA 전문 가져오기", key=_k(active, "oa", rid), icon=":material/download:",
+                     disabled=not can or jobs.is_running(active, oa_job),
                      help="Europe PMC → Unpaywall 순서로 무료 전문을 찾습니다." if can
                      else "DOI/PMCID가 없어 자동으로 가져올 수 없습니다. PDF를 올리세요."):
-            with st.spinner("Europe PMC → Unpaywall 순서로 시도 중…"):
+            pm, doi, em, outs_c = it.get("pmcid") or None, it.get("doi") or None, email, list(outcomes)
+
+            def work_oa(ctx):
                 try:
-                    text, reason = FT.fetch_oa_fulltext_ex(pmcid=it.get("pmcid") or None,
-                                                           doi=it.get("doi") or None, email=email)
+                    text, reason = FT.fetch_oa_fulltext_ex(pmcid=pm, doi=doi, email=em)
                 except Exception as exc:
                     text, reason = None, str(exc)
-            if text:
-                _store_text(active, state, rid, text, reason, outcomes)
-                st.toast(f"전문 확보: {reason}", icon=":material/check:")
-                st.rerun()
-            else:
-                _ft(state, rid)["reason"] = reason
-                _save(active, state)
-                st.warning(f"전문 확보 실패: {reason}. PDF를 올리거나 「전문 없음」으로 표시하세요.")
+                return {"text": text, "reason": reason}
+
+            def apply_oa(r):
+                st_ = _state(active)
+                if r["text"]:
+                    _store_text(active, st_, rid, r["text"], r["reason"], outs_c)
+                    return f"전문 확보: {r['reason']}"
+                _ft(st_, rid)["reason"] = r["reason"]
+                _save(active, st_)
+                return f"전문 확보 실패: {r['reason']}"
+
+            jobs.submit(active, oa_job, "OA 전문 가져오기", work_oa, apply_oa)
+            st.rerun()
         elif d.get("reason") and not has_text:
             st.caption(f"이전 시도 실패: {d['reason']}")
+        jobs.panel(active, oa_job)
     with c2:
         up = st.file_uploader("PDF 업로드", type=["pdf"], key=_k(active, "pdf", rid), label_visibility="collapsed")
         if up is not None and d.get("pdf_name") != f"{up.name}:{up.size}":
@@ -1148,20 +1186,30 @@ def _paper_panel(active, state, it, outcomes, texts, email, llm_ok, models) -> N
     if llm_ok and has_text:
         model = (st.session_state.get(_k(active, "llm_model")) or (state.get("prefs") or {}).get("llm_model")
                  or LL.CPU_DEFAULT)
-        if st.button("LLM 전문 평가 (제안)", key=_k(active, "llmft", rid), icon=":material/smart_toy:"):
-            with st.spinner(f"{model}로 평가 중…"):
+        ft_job = f"fz_ftllm:{rid}"
+        if st.button("LLM 전문 평가 (제안)", key=_k(active, "llmft", rid), icon=":material/smart_toy:",
+                     disabled=jobs.is_running(active, ft_job)):
+            txt, onames, ptxt = texts.get(rid, ""), [o["name"] for o in outcomes], S.pico_text(state["inputs"])
+
+            def work_ft(ctx):
                 try:
-                    res = LL.llm_assess_fulltext(texts.get(rid, ""), [o["name"] for o in outcomes],
-                                                 S.pico_text(state["inputs"]), model)
+                    return LL.llm_assess_fulltext(txt, onames, ptxt, model)
                 except Exception:
-                    res = None
-            if res:
-                _ft(state, rid)["llm"] = {"eligibility": res.get("eligibility"),
-                                          "outcomes": [{"name": o.get("name"), "status": o.get("status")}
-                                                       for o in res.get("outcomes", [])]}
-                _save(active, state)
-            else:
-                st.warning("LLM 응답을 받지 못했습니다.")
+                    return None
+
+            def apply_ft(res):
+                if not res:
+                    return "LLM 응답을 받지 못했습니다."
+                st_ = _state(active)
+                _ft(st_, rid)["llm"] = {"eligibility": res.get("eligibility"),
+                                        "outcomes": [{"name": o.get("name"), "status": o.get("status")}
+                                                     for o in res.get("outcomes", [])]}
+                _save(active, st_)
+                return "LLM 전문 평가 완료 (제안)"
+
+            jobs.submit(active, ft_job, "LLM 전문 평가", work_ft, apply_ft, cancellable=True)
+            st.rerun()
+        jobs.panel(active, ft_job)
         sug = (state["fulltext"].get(rid) or {}).get("llm")
         if sug:
             st.caption("LLM 제안: 적격성 " + str(sug.get("eligibility")) + " · " +
