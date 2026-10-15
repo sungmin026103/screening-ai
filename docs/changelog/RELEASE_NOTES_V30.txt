@@ -1,0 +1,39 @@
+SR Studio VER 30 — Release Notes
+================================
+
+Release focus
+-------------
+One 200-record human-validation set replaces the former mandatory second audit.
+The same 200 records are used for review-specific model training, out-of-fold scoring,
+and fold-held-out operational policy validation.
+
+Safety / quality controls
+-------------------------
+- Exactly 200/200 O/X labels are required; partial uploads are rejected.
+- Validation_Record_ID and Validation_Set_ID detect missing, duplicated, or substituted rows.
+- Sampling metadata are restored from the canonical in-app sample rather than trusted from the uploaded workbook.
+- Sampling design: High PICO/PECO relevance 100 + Mid 70 + Low 30, with inverse-probability weights.
+- Default operational recall target: 95%.
+- PASS requires weighted AND unweighted fold-held-out priority recall >=95% and safe-exclude recall >=95%.
+- PASS also requires >=10 human Include records and zero human-Include removals by any explicitly enabled custom gate.
+- REVIEW disables AUTO_EXCLUDE for the entire corpus.
+- Generic mode applies no hidden topic-specific regex exclusion rules.
+- Optional sentence-embedding failure falls back to TF-IDF instead of terminating the app.
+- QC workbook records summary metrics, the human-validation set, observed safe-exclude errors, methods wording, and interpretation notes.
+
+Verification performed for this release
+---------------------------------------
+- Python syntax compilation: PASS
+- Offline V30 self-test: PASS
+- Validation sampling integrity: PASS
+- Incomplete-label rejection: PASS
+- Synthetic PASS and REVIEW pathways: PASS
+- QC workbook generation/opening: PASS
+
+Scope limitation
+----------------
+This is production-oriented research software, not a regulatory-certified or externally
+validated commercial medical device. A 95% recall target is an operational setting, not a
+universal guarantee. External benchmark validation, security/privacy review, persistent
+production storage, authentication, logging, backup/recovery, and deployment monitoring
+should be completed before offering the software as a hosted commercial service.

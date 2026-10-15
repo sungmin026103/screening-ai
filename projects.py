@@ -126,11 +126,26 @@ def touch_project(slug: str, **fields) -> None:
 
 def save_project_state(slug: str, key: str, value) -> None:
     """Persist a Python object that belongs to one project."""
+    import os
     import pickle
+    import tempfile
     path = project_path(slug) / "state"
     path.mkdir(parents=True, exist_ok=True)
-    with open(path / f"{key}.pkl", "wb") as fh:
-        pickle.dump(value, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    # atomic: write a temp file in the same directory, then os.replace (a crash or a pickling error
+    # never leaves a truncated <key>.pkl behind)
+    fd, tmp = tempfile.mkstemp(prefix=f".{key}.", suffix=".tmp", dir=path)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            pickle.dump(value, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path / f"{key}.pkl")
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     touch_project(slug)
 
 

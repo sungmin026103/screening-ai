@@ -1,0 +1,3 @@
+{"meta":{"count":2,"db_response_time_ms":5,"page":1,"per_page":200,"next_cursor":null},"results":[
+{"id":"https://openalex.org/W1","title":"Synthetic OA one","doi":"https://doi.org/10.9999/synth.oa1","publication_year":2017,"ids":{"openalex":"https://openalex.org/W1","pmid":"https://pubmed.ncbi.nlm.nih.gov/3001","pmcid":"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC800001"},"abstract_inverted_index":{"Effects":[0],"of":[1,4],"synthetic":[2],"dose":[3],"widgets":[5]}},
+{"id":"https://openalex.org/W2","title":"Synthetic OA two","doi":null,"publication_year":2022,"ids":{"openalex":"https://openalex.org/W2"},"abstract_inverted_index":null}]}

@@ -1,0 +1,4 @@
+{"version":"6.9","hitCount":3,"nextCursorMark":"*","request":{"queryString":"synthetic"},"resultList":{"result":[
+{"id":"2001","source":"MED","pmid":"2001","pmcid":"PMC900001","doi":"10.9999/synth.one","title":"Synthetic EPMC one.","abstractText":"<h4>Aim</h4> Alpha <i>beta</i> gamma.","pubYear":"2018"},
+{"id":"2002","source":"MED","pmid":"2002","title":"Synthetic EPMC two","pubYear":"2019"},
+{"id":"PPR3","source":"PPR","doi":"10.9999/synth.three","title":"Synthetic EPMC three","abstractText":"Plain abstract.","pubYear":"2020"}]}}

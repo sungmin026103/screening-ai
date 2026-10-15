@@ -693,6 +693,60 @@ def _upper_error(xc_lo, xc_hi, t_top, ink, dark, bar_w):
     return {"x": x, "cands": cands, "line_end": y_end - 0.5, "top": top - 0.5}
 
 
+def _refine_short_error_cap(info, ink, top_row, bar_width):
+    """Conservative cap validation for short error bars.
+
+    A real cap must be supported on both sides of the detected stem, occupy
+    more than one column, and be connected to the stem.  No cap => no numeric
+    error estimate.  Pixel interpolation is deliberately not treated as data.
+    """
+    if info is None:
+        return None, False
+    H, W = ink.shape
+    x = int(info["x"])
+    if not (0 <= x < W):
+        return None, False
+    upper = max(0, int(top_row) - max(28, int(0.9 * bar_width)))
+    lower = min(H - 1, int(top_row) - 1)
+    if lower <= upper:
+        return None, False
+    half = max(2, min(12, int(bar_width * 0.38)))
+    candidates = []
+    for y in range(upper, lower + 1):
+        if not ink[y, x]:
+            continue
+        left = 0
+        while x-left-1 >= 0 and left < half and ink[y, x-left-1]:
+            left += 1
+        right = 0
+        while x+right+1 < W and right < half and ink[y, x+right+1]:
+            right += 1
+        width = left + right + 1
+        if left < 2 or right < 2 or width < 6:
+            continue
+        if abs(left-right) > max(2, 0.35 * max(left,right)):
+            continue
+        # Stem support immediately below cap: reject disconnected labels/stars.
+        stem_end = min(lower, y + max(2, min(6, int(top_row-y))))
+        support = sum(bool(ink[yy, x]) for yy in range(y+1, stem_end+1))
+        if support < max(1, int(0.65*(stem_end-y))):
+            continue
+        # Thin horizontal line: no broad filled block just below cap.
+        if y+2 < H:
+            nearby = sum(bool(ink[y+dy, x-half]) and bool(ink[y+dy, x+half]) for dy in (1,2))
+            if nearby == 2:
+                continue
+        candidates.append((y, width))
+    if not candidates:
+        return None, False
+    # Prefer cap nearest to the mean. Farther marks are often significance bars.
+    candidates.sort(key=lambda a: (top_row-a[0], -a[1]))
+    y = candidates[0][0]
+    if top_row-y < 2:
+        return None, False
+    return float(y), True
+
+
 def _pick_cap(info):
     """cap 선택 → (행, 확실 여부). 얇은 가로 줄(cap) 중 가장 위를 고르고, 좌우 대칭이면 '확실'.
     cap이 없으면 이어진 선의 맨 위(점·잡음이 겹쳤을 수 있어 '확인 필요')."""
@@ -904,7 +958,10 @@ def analyze(data: bytes, manual_range: tuple | None = None) -> Result:
         items[-1]._info = info
     for it in items:
         if hasattr(it, "_info"):
-            it.err, it.sure = _pick_cap(it._info)
+            it.err, it.sure = _refine_short_error_cap(it._info, ink, int(round(it.top)), it.x1-it.x0+1)
+            if it.err is None:
+                # Avoid converting an unverified line endpoint into a precise SD.
+                it.sure = False
             del it._info
     if not items:
         items = _find_points(ink, dark, ax)
@@ -918,6 +975,9 @@ def analyze(data: bytes, manual_range: tuple | None = None) -> Result:
             it.mean = ax.value(it.top)
             if it.err is not None:
                 it.error = abs(ax.value(it.err) - it.mean)
+    uncertain = [i + 1 for i, it in enumerate(items) if it.err is not None and not it.sure]
+    if uncertain:
+        msgs.append("오차 막대 확인 필요(자동값은 참고용): " + ", ".join(map(str, uncertain)))
     no_err = [i + 1 for i, it in enumerate(items) if it.err is None]
     if no_err and items:
         msgs.append("오차 막대를 찾지 못한 항목: " + ", ".join(map(str, no_err)))

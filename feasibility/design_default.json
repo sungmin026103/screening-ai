@@ -1,0 +1,55 @@
+{
+ "n_total": 150,
+ "census_top": 100,
+ "bounds": [
+  0.01,
+  0.05,
+  0.2,
+  1.0
+ ],
+ "phase2": false,
+ "phase1_frac": 1.0,
+ "decision": [
+  0.9,
+  0.1
+ ],
+ "threshold": 5,
+ "cap": 5.0,
+ "q3_min_sr": 0,
+ "date": "2026-10-15",
+ "acceptance": {
+  "cov80": true,
+  "cov50": true,
+  "acc": true,
+  "all": true
+ },
+ "verdict_source": "nested-LOSO tuning",
+ "validated": true,
+ "n_rep": 200,
+ "srs": [
+  "L1",
+  "L2",
+  "L3",
+  "L4",
+  "L5",
+  "L6",
+  "L8"
+ ],
+ "metrics_real": {
+  "cov50": 0.5169,
+  "cov80": 0.8623,
+  "cov95": 0.9591,
+  "acc": 0.8552,
+  "abstain": 0.713
+ },
+ "metrics_real_nested": {
+  "cov50": 0.5414,
+  "cov80": 0.8738,
+  "cov95": 0.9666,
+  "acc": 0.8511,
+  "abstain": 0.7145,
+  "acc_sr": 0.722,
+  "n_sr": 6,
+  "n_units": 32
+ }
+}

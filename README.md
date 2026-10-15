@@ -1,10 +1,12 @@
 # SR Studio VER 36
 
+> **V37 신규 — 메타분석 가능성 예측:** PICO와 검색식으로 SR 전에 outcome별 예상 k를 구간으로 예측합니다. 사용법 `FEASIBILITY_GUIDE.md`, 코드 지도 `CODEMAP.md`, 검증 보고서 `docs/validation/replay_report.md`.
+
 > **V36:** 메타분석 Figure 화면을 Forest / Sensitivity / Trim-and-fill / Supplementary 탭으로 재구성하고, 논문용 V1/V2 forest 디자인과 S1–S9 Supplementary 표 생성을 추가했습니다. 스크리닝의 주제 특이적 기본 규칙을 제거하고 재현성을 강화했습니다. 자세한 내용은 `README_V36.txt`.
 
 Streamlit application for systematic-review literature management, AI-assisted title/abstract screening, human-validation quality control, and meta-analysis result visualization.
 
-> **VER 30 screening policy:** the required human-validation set is fixed at 200 records. All 200 must be labelled O/X. Auto-exclusion is enabled only after the fold-held-out operational quality gate passes; otherwise the model may rank records but `AUTO_EXCLUDE` remains locked. See `README_V30.txt`.
+> **VER 30 screening policy:** the required human-validation set is fixed at 200 records. All 200 must be labelled O/X. Auto-exclusion is enabled only after the fold-held-out operational quality gate passes; otherwise the model may rank records but `AUTO_EXCLUDE` remains locked. See `docs/changelog/README_V30.txt`.
 
 ## Included features
 
@@ -110,4 +112,4 @@ Projects are saved under `data/projects/` on the running machine. Streamlit Comm
 
 ## VER 30 screening validation
 
-V30 changes the AI-screening workflow to a fixed **200-record human-validation design**. All 200 records must be labelled O/X. The app then performs out-of-fold model scoring plus fold-held-out policy validation and enables auto-exclusion only when the operational recall quality gate passes. Project-specific hidden regex gates are disabled by default. See `README_V30.txt` for details.
+V30 changes the AI-screening workflow to a fixed **200-record human-validation design**. All 200 records must be labelled O/X. The app then performs out-of-fold model scoring plus fold-held-out policy validation and enables auto-exclusion only when the operational recall quality gate passes. Project-specific hidden regex gates are disabled by default. See `docs/changelog/README_V30.txt` for details.

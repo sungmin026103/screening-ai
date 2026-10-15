@@ -282,6 +282,7 @@ NAV_ITEMS = [
     ("dashboard", "프로젝트 개요"),
     ("import", "문헌 가져오기 · 중복 제거"),
     ("pico", "PICO 설정"),
+    ("feasibility", "메타분석 가능성 예측"),
     ("screen", "AI 스크리닝"),
     ("pdf_analysis", "PDF 분석"),
     ("figure_digitizer", "Figure 값 추출"),
@@ -1668,6 +1669,14 @@ elif nav == "analytics":
 elif nav == "meta":
     import meta_page
     meta_page.render(active, log_activity)
+
+
+# ===========================================================================
+# 메타분석 가능성 예측 (feasibility_page.py — 검색·표본 판정·전문 확인 → outcome별 k 예측)
+# ===========================================================================
+elif nav == "feasibility":
+    import feasibility_page
+    feasibility_page.render(active, log_activity)
 
 
 # ===========================================================================
