@@ -98,3 +98,11 @@
 | 오래 걸리는 계산을 스레드로 실행, 끝나면 `collect()`가 화면 상태에 반영, 사이드바·해당 화면에 진행 표시 | jobs.py | `submit(project, name, label, fn, apply)`, `panel`, `sidebar_status`, `collect`, `wait`(테스트) | tests/app/test_jobs_keepalive.py, tests/app/test_menu_switch_e2e.py |
 | 작업으로 돌리는 곳 | app.py: `screen_sample`·`screen_rule`·`screen_train`·`pdf_extract` / feasibility_page.py: `fz_fetch`·`fz_llm`·`fz_oa:<rid>`·`fz_ftllm:<rid>` | | |
 규칙: 작업 함수 안에서 `st.*` 금지, 디스크 저장은 작업 함수 안에서, 화면 상태 변경은 `apply`에서. 새 긴 작업은 `jobs.submit`으로 추가. 서버를 끄면 실행 중 작업은 중단된다.
+
+## 메타분석 방법 추천·선택 (V37.2)
+| 하는 일 | 파일 | 핵심 | 테스트 |
+|---|---|---|---|
+| 데이터 진단 → 효과크기(SMD/MD/lnRR/given)·모형(3-level CR2/t, 합산+HKSJ, REML+HKSJ/z, DL, FE) 추천과 대안, Methods 문장 | ma_methods.py | `diagnose`, `recommend`, `options`, `analyze(d, outcome, Spec)`, `fit_model`, `fit_two_level`, `escalc`, `methods_text` | tests/app/test_ma_methods.py (R metafor 4.x·clubSandwich 기준값 21조합, 생성 스크립트 tests/app/fixtures/ref.R) |
+| 여러 파일 업로드·outcome 합치기, ① 분석 방법 패널 → ② 그림과 표 | meta_page.py | `_collect_datasets`, `_datasets_from_file`, `_datasets_from_table`, `_method_panel` | tests/app/test_meta_page_methods.py, tests/app/test_all_figures_all_methods.py |
+결과 객체에 `method`(Spec), `effect_label`, `effect_axis`, (합산 모형이면) `data_raw`가 붙는다. 민감도 재적합(`meta_sections._refit_without`)과 이질성 표기(`_het`)는 고른 모형을 따른다. Supplementary S1–S7 빌더(supplementary.build_tables, 화면 미사용)는 여전히 3-level SMD 문구를 쓴다.
+

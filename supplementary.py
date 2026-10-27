@@ -511,9 +511,9 @@ def _s2_source(results, outcomes, names, study_names):
     sn = study_names or {}
     for o in outcomes:
         r = by.get(o)
-        if r is None or not need.issubset(r["data"].columns):
+        d = None if r is None else r.get("data_raw", r["data"])
+        if d is None or not need.issubset(d.columns):
             continue
-        d = r["data"]
         oname = s2_outcome_name(o, names)
         for x in d.itertuples(index=False):
             st_ = " ".join(str(getattr(x, "Study")).split())

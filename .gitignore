@@ -7,3 +7,4 @@ venv/
 .streamlit/secrets.toml
 data/projects/*
 !data/projects/.gitkeep
+.superpowers/

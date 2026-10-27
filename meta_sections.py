@@ -49,7 +49,8 @@ def _summary_from_fit(fit, ci_mode: str) -> ForestSummary:
         p_value=fit.cr2_p if use_cr2 else fit.pval, k=fit.k, i2=fit.i2,
         tau2=fit.tau2_L2 + fit.tau2_L3, tau2_L2=fit.tau2_L2, tau2_L3=fit.tau2_L3,
         pi_lb=fit.pi_lb, pi_ub=fit.pi_ub,
-        ci_note=f"CR2 (Satterthwaite df = {fit.cr2_df:.1f})" if use_cr2 else f"model-based t (df = {fit.k - 1})",
+        ci_note=(f"CR2 (Satterthwaite df = {fit.cr2_df:.1f})" if use_cr2
+                 else (getattr(fit, "note", "") or f"model-based t (df = {fit.k - 1})")),
     )
 
 
@@ -256,6 +257,12 @@ def _refit_without(res: dict, studies: list[str], ci_mode: str):
     keep = ~d["Study"].astype(str).isin(studies)
     if keep.sum() < 2 or d.loc[keep, "Study"].nunique() < 2:
         return None
+    spec = res.get("method")
+    if spec is not None:                       # 사용자가 고른 주 분석 모형으로 다시 적합
+        import ma_methods
+        fit = ma_methods.fit_model(spec.model, res["g"][keep.to_numpy()], res["vi"][keep.to_numpy()],
+                                   d.loc[keep, "Study"].astype(str))
+        return _summary_from_fit(fit, "CR2" if spec.model == "ML3_CR2" else "t"), fit
     fit = rmeta.fit_three_level(res["g"][keep.to_numpy()], res["vi"][keep.to_numpy()], d.loc[keep, "Study"])
     return _summary_from_fit(fit, ci_mode), fit
 
@@ -263,7 +270,8 @@ def _refit_without(res: dict, studies: list[str], ci_mode: str):
 def robustness_table(res: dict, ci_mode: str = "CR2") -> pd.DataFrame:
     """Primary vs. 민감도 분석 결과 한 표(robustness forest와 Supplementary에 공통 사용)."""
     s, f = res["summary"], res["fit"]
-    rows = [{"Analysis": "Primary (3-level REML)", "k": f.k, "Studies": f.n_studies, "g": s.g,
+    prim = f"Primary ({res['method'].label})" if res.get("method") is not None else "Primary (3-level REML)"
+    rows = [{"Analysis": prim, "k": f.k, "Studies": f.n_studies, "g": s.g,
              "ci_lb": s.ci_lb, "ci_ub": s.ci_ub, "p": s.p_value, "Removed": "", "Note": s.ci_note}]
     sd = res["study_df"]
     if res["pooled"] is not None:
@@ -403,8 +411,16 @@ def _pooled(res: dict) -> F.Pooled:
     return F.Pooled(s.g, s.ci_lb, s.ci_ub, s.pi_lb, s.pi_ub)
 
 
+def _two_level(res: dict) -> bool:
+    spec = res.get("method")
+    return spec is not None and not spec.model.startswith("ML3")
+
+
 def _het(res: dict) -> str:
     s = res["summary"]
+    if _two_level(res):                      # 2-level/공통효과: τ² 하나만
+        line = F.het_line(s.i2, None, None)
+        return (line + f"; τ² = {float(s.tau2):.3f}") if res["method"].model != "FE" else line
     return F.het_line(s.i2, s.tau2_L2, s.tau2_L3)
 
 
@@ -415,7 +431,12 @@ def _opts(res: dict, st: dict, **kw) -> F.ForestOptions:
         footer.append(f"95% CI: {s.ci_note}")
     base = dict(style=int(st.get("style", 1)), title=st.get("title") or F.short_title(res["outcome"]),
                 subtitle=st.get("subtitle"), favours=tuple(st.get("favours") or F.default_favours(res["outcome"])),
-                footer_lines=footer, x_limits=st.get("x_limits"), rename=dict(st.get("study_names") or {}))
+                footer_lines=footer, x_limits=st.get("x_limits"), rename=dict(st.get("study_names") or {}),
+                effect_label=res.get("effect_label", "SMD"))
+    spec = res.get("method")
+    if spec is not None and spec.model == "FE":
+        base["pooled_label"] = "Pooled effect (common effect)"
+        base["show_pi"] = False                  # 공통효과 모형에는 예측구간이 없다
     base.update(kw)
     kind = st.get("_kind")
     if kind in FIG_TITLE:
@@ -463,7 +484,7 @@ def loo_fig(res: dict, st: dict | None = None):
     change = float(np.max(np.abs(loo["estimate"] - po.beta)))
     o = _opts(res, st, subtitle="Leave-one-study-out sensitivity analysis",
               pooled_label=f"All studies (k = {len(sd)})", show_pi=False, ref_line=po.beta,
-              effect_label="g", left_header="Omitted study",
+              effect_label=("g" if res.get("effect_label", "SMD") == "SMD" else res["effect_label"]), left_header="Omitted study",
               footer_lines=[f"Study-level model (CS, \u03c1 = 0.6; REML + HKSJ). "
                             f"Largest change: \u0394g\u00a0=\u00a0{change:.2f}"],
               legend_items=[("sq", "Estimate with study omitted"), ("ci", "95% CI"), ("dia", "All studies"),
@@ -483,7 +504,7 @@ def robustness_fig(res: dict, st: dict | None = None, ci_mode: str = "CR2"):
         lab = r.Analysis
         rows.append(("study", lab, r.g, r.ci_lb, r.ci_ub, None))
     o = _opts(res, st, subtitle="Robustness of the pooled estimate", show_pi=False, ref_line=res["summary"].g,
-              effect_label="g", left_header="Analysis",
+              effect_label=("g" if res.get("effect_label", "SMD") == "SMD" else res["effect_label"]), left_header="Analysis",
               footer_lines=["Outliers: Bonferroni-adjusted |rstudent|; influential: metafor influence() criteria."],
               legend_items=[("sq", "Estimate"), ("ci", "95% CI"), ("ref", "Primary estimate"),
                             ("zero", "No effect (g = 0)")])
@@ -600,7 +621,7 @@ def gosh_fig(res: dict, st: dict | None = None):
             ax.scatter(multi["estimate"], multi["I2"], s=10, color=BLUE, alpha=0.35, lw=0)
         ax.scatter([full_b], [full_i2], marker="*", s=190, color=RED, edgecolor="white", lw=0.8, zorder=5,
                    label="Full model")
-        ax.set_xlabel("Pooled g (subset)", fontsize=11)
+        ax.set_xlabel(f"Pooled {res.get('effect_axis', 'g')} (subset)", fontsize=11)
         ax.set_ylabel("I² (%) (subset)", fontsize=11)
         n_total = 2 ** len(sd) - 1
         sub_txt = "all" if len(gt) >= n_total else f"{len(gt):,} random"
@@ -644,7 +665,7 @@ def trimfill_funnel_fig(res: dict, st: dict | None = None):
         ax.axvline(a.beta, color=RED, lw=1.4, ls=(0, (5, 2)) if tf["n_missing"] == 0 else "-",
                    label="Trim-and-fill adjusted g", zorder=3)
         ax.set_ylim(se_max, 0)
-        ax.set_xlabel("Hedges' g", fontsize=11)
+        ax.set_xlabel(res.get("effect_axis", "Hedges' g"), fontsize=11)
         ax.set_ylabel("Standard error", fontsize=11)
         ax.set_title(_tt(st, f"{title}: trim-and-fill funnel plot"), fontsize=F.PT_TITLE, loc="left", weight="bold",
                      color=NAVY)
@@ -683,13 +704,13 @@ def funnel_fig(res: dict, st: dict | None = None):
             z = norm.ppf(1 - p_ / 2)
             ax.fill_betweenx(ss, -z * ss, z * ss, color=c, lw=0, zorder=1, label=lab)
         ax.axvline(0, color="#555555", lw=0.8, ls=(0, (3, 2)))
-        ax.axvline(po.beta, color=BLUE, lw=1.3, label="Pooled g (study-level)")
+        ax.axvline(po.beta, color=BLUE, lw=1.3, label=f"Pooled {('g' if res.get('effect_label', 'SMD') == 'SMD' else res['effect_label'])} (study-level)")
         if eg is not None and np.isfinite(eg.p_value) and np.isfinite(eg.slope):
             ax.plot(eg.intercept + eg.slope * ss, ss, color=ORANGE, lw=1.5, ls=(0, (5, 2)), label="Egger line")
         ax.scatter(yi, se, s=46, color=NAVY, edgecolor="white", lw=0.7, zorder=5, label="Study")
         ax.set_ylim(se_max, 0)
         ax.set_xlim(min(-1.0, yi.min() - 0.6, po.beta - 1.0), max(1.0, yi.max() + 0.6, po.beta + 1.0))
-        ax.set_xlabel("Hedges' g", fontsize=11)
+        ax.set_xlabel(res.get("effect_axis", "Hedges' g"), fontsize=11)
         ax.set_ylabel("Standard error", fontsize=11)
         ax.set_title(_tt(st, f"{title}: contour-enhanced funnel plot"), fontsize=F.PT_TITLE, loc="left", weight="bold",
                      color=NAVY)
@@ -717,7 +738,7 @@ def trimfill_compare_fig(res: dict, st: dict | None = None):
     o, a = tf["original"], tf["adjusted"]
     rows = [("study", f"Original (k = {o.k})", o.beta, o.ci[0], o.ci[1], None),
             ("study", f"Adjusted (k = {a.k}, k0 = {tf['n_missing']})", a.beta, a.ci[0], a.ci[1], None)]
-    opt = _opts(res, st, subtitle="Trim-and-fill (L0) sensitivity", show_pi=False, effect_label="g",
+    opt = _opts(res, st, subtitle="Trim-and-fill (L0) sensitivity", show_pi=False, effect_label=("g" if res.get("effect_label", "SMD") == "SMD" else res["effect_label"]),
                 left_header="Model", footer_lines=[f"Study-level model; L0 estimator; side = {tf['side']}."],
                 legend_items=[("sq", "Pooled estimate"), ("ci", "95% CI"), ("zero", "No effect (g = 0)")])
     if int(st.get("style", 1)) == 2:

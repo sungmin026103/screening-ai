@@ -1,0 +1,15 @@
+[theme]
+base = "light"
+primaryColor = "#8F5F0B"
+backgroundColor = "#EDF0EF"
+secondaryBackgroundColor = "#F8FAF9"
+textColor = "#0E1A1C"
+font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#0A1517"
+secondaryBackgroundColor = "#0F1C1F"
+textColor = "#E6EEEC"
+
+[server]
+maxUploadSize = 500

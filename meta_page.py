@@ -16,9 +16,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import auto_figures as AF
 import extraction
 import forest_styles as F
+import ma_methods as MM
 import meta_sections as M
 import rmeta
 import supplementary as SUP
@@ -50,13 +50,6 @@ def _tag(results: list[dict]) -> list[dict]:
     return results
 
 
-@st.cache_data(show_spinner=False)
-def _load_workbook(file_bytes: bytes, ci_mode: str):
-    outs, qc = extraction.read_extraction_workbook(io.BytesIO(file_bytes))
-    results = [AF.analyze_outcome(d, o, ci_mode) for o, d in outs.items() if d["Study"].nunique() >= 2]
-    return _tag(results), qc
-
-
 def _read_r_sets(file_bytes: bytes) -> dict:
     want = ("effects", "pooled", "vardecomp", "study_level")
     out: dict = {}
@@ -75,14 +68,6 @@ def _read_r_sets(file_bytes: bytes) -> dict:
                         out.setdefault(outcome, {})[kind] = pd.read_csv(fh)
                     break
     return {o: d for o, d in out.items() if {"effects", "pooled"}.issubset(d)}
-
-
-@st.cache_data(show_spinner=False)
-def _load_r_zip(file_bytes: bytes, ci_mode: str):
-    sets = _read_r_sets(file_bytes)
-    results = [M.result_from_r_sets(o, rs, ci_mode) for o, rs in sorted(sets.items())
-               if rs["effects"]["Study"].nunique() >= 2]
-    return _tag(results), None
 
 
 def _detect_raw_columns(cols: list[str]) -> dict:
@@ -114,8 +99,8 @@ def _detect_raw_columns(cols: list[str]) -> dict:
     return role
 
 
-def _results_from_table(df: pd.DataFrame, default_name: str, ci_mode: str):
-    """CSV/단일 시트: 원자료(Mean/SD/N) 또는 효과크기(yi + vi/CI). 'Outcome' 열이 있으면 outcome별로 나눈다."""
+def _datasets_from_table(df: pd.DataFrame, default_name: str) -> list[dict]:
+    """CSV/단일 시트 → outcome별 데이터셋. 원자료(Mean/SD/N)는 표준 열 이름으로, 효과크기 표는 yi/vi로."""
     df = df.copy()
     df.columns = [F.clean_label(c) for c in df.columns]
     for c in df.columns:
@@ -133,41 +118,106 @@ def _results_from_table(df: pd.DataFrame, default_name: str, ci_mode: str):
     eff_ok = guess.get("study") and guess.get("yi") and (guess.get("vi") or (guess.get("ci_lo") and guess.get("ci_hi")))
     if not raw_ok and not eff_ok:
         raise ValueError("열을 인식하지 못했습니다. Study + (Mean/SD/N × 실험·대조) 또는 Study + yi + vi(또는 CI 하한/상한)가 필요합니다.")
+    std = {"mean_treat": "Mean_treat", "sd_treat": "SD_treat", "n_treat": "N_treat",
+           "mean_control": "Mean_control", "sd_control": "SD_control", "n_control": "N_control"}
     out = []
     for name, g in groups:
-        extra = [c for c in ("Intervention", "dose", "Species", "Gender", "Intervention_day") if c in g.columns]
+        extra = [c for c in ("Intervention", "dose", "Species", "Gender", "Intervention_day", "Unit", "Units", "단위")
+                 if c in g.columns]
         if raw_ok:
-            w = g.copy()
-            num = {k: pd.to_numeric(w[guess[k]], errors="coerce")
-                   for k in ("mean_treat", "sd_treat", "n_treat", "mean_control", "sd_control", "n_control")}
-            ok = pd.concat(num, axis=1).notna().all(axis=1) & (num["n_treat"] >= 2) & (num["n_control"] >= 2) \
-                & (num["sd_treat"] > 0) & (num["sd_control"] > 0)
-            w = w.loc[ok]
-            yi, vi = rmeta.escalc_smd(num["mean_treat"][ok], num["sd_treat"][ok], num["n_treat"][ok],
-                                      num["mean_control"][ok], num["sd_control"][ok], num["n_control"][ok])
-            e = pd.DataFrame({"study": w[guess["study"]].astype(str).to_numpy(), "yi": yi, "vi": vi,
-                              "Mean_treat": num["mean_treat"][ok].to_numpy(), "SD_treat": num["sd_treat"][ok].to_numpy(),
-                              "N_treat": num["n_treat"][ok].to_numpy(), "Mean_control": num["mean_control"][ok].to_numpy(),
-                              "SD_control": num["sd_control"][ok].to_numpy(), "N_control": num["n_control"][ok].to_numpy()})
+            e = pd.DataFrame({"Study": g[guess["study"]].astype(str).to_numpy()})
+            for k_, c_ in std.items():
+                e[c_] = pd.to_numeric(g[guess[k_]], errors="coerce").to_numpy()
+            ok = e[list(std.values())].notna().all(axis=1) & (e["N_treat"] >= 2) & (e["N_control"] >= 2) \
+                & (e["SD_treat"] > 0) & (e["SD_control"] > 0)
             for c in extra:
-                e[c] = w[c].to_numpy()
+                e[c] = g[c].to_numpy()
+            e = e.loc[ok.to_numpy()]
+            kind = "raw"
         else:
-            e = pd.DataFrame({"study": g[guess["study"]].astype(str),
-                              "yi": pd.to_numeric(g[guess["yi"]], errors="coerce")})
+            e = pd.DataFrame({"Study": g[guess["study"]].astype(str).to_numpy(),
+                              "yi": pd.to_numeric(g[guess["yi"]], errors="coerce").to_numpy()})
             if guess.get("vi"):
-                e["vi"] = pd.to_numeric(g[guess["vi"]], errors="coerce")
+                e["vi"] = pd.to_numeric(g[guess["vi"]], errors="coerce").to_numpy()
             else:
                 lo = pd.to_numeric(g[guess["ci_lo"]], errors="coerce")
                 hi = pd.to_numeric(g[guess["ci_hi"]], errors="coerce")
-                e["vi"] = ((hi - lo) / (2 * 1.959963984540054)) ** 2
+                e["vi"] = (((hi - lo) / (2 * 1.959963984540054)) ** 2).to_numpy()
             for c in extra:
                 e[c] = g[c].to_numpy()
-        e = e.dropna(subset=["yi", "vi"]).reset_index(drop=True)
-        if e["study"].nunique() >= 2:
-            out.append(M.result_from_effects(e, name, ci_mode))
-    if not out:
-        raise ValueError("연구가 2편 이상인 outcome이 없습니다.")
-    return _tag(out)
+            e = e.dropna(subset=["yi", "vi"])
+            kind = "effect"
+        e = e.reset_index(drop=True)
+        if e["Study"].nunique() >= 2:
+            out.append({"outcome": name, "kind": kind, "data": e})
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _datasets_from_file(name: str, data: bytes) -> list[dict]:
+    """파일 1개 → [{"outcome", "kind": raw|effect|r, "data" 또는 "rsets"}]."""
+    suffix = Path(name).suffix.lower()
+    stem = Path(name).stem
+    if suffix in (".xlsx", ".xls"):
+        outs, _qc = extraction.read_extraction_workbook(io.BytesIO(data))
+        ds = [{"outcome": o, "kind": "raw", "data": d} for o, d in outs.items() if d["Study"].nunique() >= 2]
+        return ds or _datasets_from_table(pd.read_excel(io.BytesIO(data)), stem)
+    if suffix == ".zip":
+        sets = _read_r_sets(data)
+        return [{"outcome": o, "kind": "r", "rsets": rs} for o, rs in sorted(sets.items())
+                if rs["effects"]["Study"].nunique() >= 2]
+    return _datasets_from_table(pd.read_csv(io.BytesIO(data)), stem)
+
+
+def _ds_key(ds: dict) -> str:
+    h = hashlib.sha1(str(ds["outcome"]).encode())
+    if "data" in ds:
+        h.update(pd.util.hash_pandas_object(ds["data"].astype(str), index=False).values.tobytes())
+    else:
+        h.update(pd.util.hash_pandas_object(ds["rsets"]["effects"].astype(str), index=False).values.tobytes())
+    return h.hexdigest()[:12]
+
+
+def _collect_datasets(uploads) -> tuple[list[dict], list[str]]:
+    """여러 파일을 합친다. 같은 outcome 이름이 다른 파일에도 있으면 ' · 파일명'을 붙여 구분한다."""
+    out, errors, seen = [], [], set()
+    for up in uploads:
+        try:
+            got = _datasets_from_file(up.name, up.getvalue())
+        except Exception as exc:
+            errors.append(f"{up.name}: 읽지 못했습니다 — {exc}")
+            continue
+        if not got:
+            errors.append(f"{up.name}: 연구가 2편 이상인 outcome을 찾지 못했습니다.")
+        for ds in got:
+            ds = dict(ds, file=up.name)
+            name = ds["outcome"]
+            if name in seen:
+                name = f"{name} · {Path(up.name).stem}"
+                i = 2
+                while name in seen:
+                    name = f"{ds['outcome']} · {Path(up.name).stem} ({i})"
+                    i += 1
+            ds["outcome"] = name
+            seen.add(name)
+            ds["key"] = _ds_key(ds)
+            out.append(ds)
+    return out, errors
+
+
+@st.cache_data(show_spinner=False)
+def _diagnose(key: str, data: pd.DataFrame) -> dict:
+    return MM.diagnose(data)
+
+
+@st.cache_data(show_spinner=False)
+def _analyze(key: str, data: pd.DataFrame, outcome: str, measure: str, model: str) -> dict:
+    return MM.analyze(data, outcome, MM.Spec(measure, model))
+
+
+@st.cache_data(show_spinner=False)
+def _analyze_r(key: str, outcome: str, rsets: dict) -> dict:
+    return M.result_from_r_sets(outcome, rsets, CI_MODE)
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +396,7 @@ RAW = {"Mean_treat", "SD_treat", "N_treat", "Mean_control", "SD_control", "N_con
 
 
 def _table_s2_tab(results):
-    outs = [r["outcome"] for r in results if RAW.issubset(r["data"].columns)]
+    outs = [r["outcome"] for r in results if RAW.issubset(r.get("data_raw", r["data"]).columns)]
     if not outs:
         st.info("Table S2에는 실험군·대조군 n, Mean, SD가 필요합니다(데이터 추출 엑셀 또는 원자료 CSV).")
         return
@@ -390,33 +440,132 @@ def _table_s2_tab(results):
 # ---------------------------------------------------------------------------
 # 진입점
 # ---------------------------------------------------------------------------
+def _method_panel(datasets: list[dict]) -> list[dict]:
+    """① 분석 방법: outcome별 추천과 대안, 선택. 고른 방법으로 계산한 결과 객체 목록을 돌려준다."""
+    choices = st.session_state.setdefault("meta_methods", {})        # ds key → (measure, model)
+    st.subheader("① 분석 방법")
+    st.caption("데이터를 보고 outcome마다 가장 적합한 효과크기와 모형을 추천했습니다. 그대로 써도 되고, 아래에서 "
+               "outcome을 골라 다른 방법으로 바꿀 수 있습니다. 바꾸면 모든 그림과 표가 그 방법으로 다시 계산됩니다.")
+    recs, rows = {}, []
+    for ds in datasets:
+        if ds["kind"] == "r":
+            rows.append({"Outcome": ds["outcome"], "파일": ds["file"], "k": len(ds["rsets"]["effects"]),
+                         "연구 수": ds["rsets"]["effects"]["Study"].nunique(), "추천": "R 결과 그대로",
+                         "사용 중": "R 결과 그대로 (변경 불가)"})
+            continue
+        diag = _diagnose(ds["key"], ds["data"])
+        rec = MM.recommend(diag)
+        recs[ds["key"]] = (diag, rec)
+        cur = MM.Spec(*choices[ds["key"]]) if ds["key"] in choices else rec["spec"]
+        rows.append({"Outcome": ds["outcome"], "파일": ds["file"], "k": diag["k"], "연구 수": diag["n_studies"],
+                     "추천": rec["spec"].label,
+                     "사용 중": "✓ 추천대로" if cur == rec["spec"] else f"변경: {cur.label}"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                 column_config={"k": st.column_config.NumberColumn("효과크기 수 (k)")})
+
+    editable = [ds for ds in datasets if ds["kind"] != "r"]
+    if editable:
+        names = [ds["outcome"] for ds in editable]
+        with st.container(border=True):
+            pick = st.selectbox("방법을 확인하거나 바꿀 outcome", names, key="mm_pick") if len(names) > 1 else names[0]
+            ds = next(x for x in editable if x["outcome"] == pick)
+            dk = ds["key"]
+            diag, rec = recs[dk]
+            cur = MM.Spec(*choices[dk]) if dk in choices else rec["spec"]
+            st.markdown(f"**추천: {rec['spec'].label}**")
+            for r_ in rec["reasons"]:
+                st.markdown(f"- {r_}")
+            for c_ in rec["cautions"]:
+                st.warning(c_, icon=":material/warning:")
+            ms, mos = MM.options(diag)
+            mk, mok = f"mm_measure_{dk}", f"mm_model_{dk}"
+            st.session_state[mk] = cur.measure if cur.measure in ms else ms[0]     # 선택의 기준은 choices
+            st.session_state[mok] = cur.model if cur.model in mos else mos[0]
+
+            def _save_choice(dk=dk, mk=mk, mok=mok):
+                choices[dk] = (st.session_state[mk], st.session_state[mok])
+
+            mnote = dict(rec["measure_alts"])
+            monote = dict(rec["model_alts"])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.radio("효과크기 지표", ms, key=mk, on_change=_save_choice,
+                         format_func=lambda m, r=rec["spec"].measure: MM.MEASURES[m]["label"] + ("  (추천)" if m == r else ""),
+                         captions=[MM.MEASURES[m]["desc"] if m == rec["spec"].measure else (mnote.get(m) or MM.MEASURES[m]["desc"])
+                                   for m in ms])
+            with c2:
+                st.radio("통계 모형", mos, key=mok, on_change=_save_choice,
+                         format_func=lambda m, r=rec["spec"].model: MM.MODELS[m]["label"] + ("  (추천)" if m == r else ""),
+                         captions=[MM.MODELS[m]["desc"] if m == rec["spec"].model else (monote.get(m) or MM.MODELS[m]["desc"])
+                                   for m in mos])
+            b1, b2 = st.columns(2)
+            if b1.button("추천으로 되돌리기", key=f"mm_reset_{dk}", disabled=cur == rec["spec"],
+                         icon=":material/restart_alt:", width="stretch"):
+                choices.pop(dk, None)
+                st.rerun()
+            if len(editable) > 1 and b2.button("이 선택을 모든 outcome에 적용", key=f"mm_all_{dk}",
+                                               icon=":material/done_all:", width="stretch"):
+                skipped = []
+                for other in editable:
+                    od, _orec = recs[other["key"]]
+                    oms, omos = MM.options(od)
+                    if cur.measure in oms and cur.model in omos:
+                        choices[other["key"]] = (cur.measure, cur.model)
+                    else:
+                        skipped.append(other["outcome"])
+                if skipped:
+                    st.session_state["_mm_skipped"] = skipped
+                st.rerun()
+            skipped = st.session_state.pop("_mm_skipped", None)
+            if skipped:
+                st.info("데이터에 맞지 않아 적용하지 않은 outcome: " + ", ".join(skipped) +
+                        " (예: 연구당 효과가 하나인데 3-level 모형, 평균이 음수인데 lnRR)")
+            with st.expander("논문 Methods 문장 초안", icon=":material/edit_note:"):
+                st.code(MM.methods_text(cur, diag), language=None, wrap_lines=True)
+
+    results, failed = [], []
+    for ds in datasets:
+        try:
+            if ds["kind"] == "r":
+                r = _analyze_r(ds["key"], ds["outcome"], ds["rsets"])
+            else:
+                diag, rec = recs[ds["key"]]
+                spec = MM.Spec(*choices[ds["key"]]) if ds["key"] in choices else rec["spec"]
+                r = _analyze(ds["key"], ds["data"], ds["outcome"], spec.measure, spec.model)
+            results.append(r)
+        except Exception as exc:
+            failed.append(f"{ds['outcome']}: {exc}")
+    for f_ in failed:
+        st.error(f"계산 실패 — {f_}")
+    for r in results:
+        if r.get("dropped_rows"):
+            st.caption(f"{r['outcome']}: 선택한 지표로 계산할 수 없는 {r['dropped_rows']}행을 제외했습니다 "
+                       "(예: lnRR에서 평균 ≤ 0).")
+    return _tag(results)
+
+
 def render(active, log_activity) -> None:
-    hero("메타분석 Figure", "데이터 추출 엑셀 · R r_outputs zip · CSV를 올리면 forest plot, 민감도, "
-         "trim-and-fill 그림과 Table S2를 만듭니다.", eyebrow="META-ANALYSIS")
-    up = st.file_uploader("데이터 추출 엑셀 / R r_outputs zip / CSV", type=["xlsx", "xls", "zip", "csv"],
-                          key="meta_upload_v36")
-    if not up:
+    hero("메타분석 Figure", "데이터 추출 엑셀 · R r_outputs zip · CSV를 올리면(여러 개 가능) 데이터에 맞는 분석 방법을 "
+         "추천하고, 고른 방법으로 forest plot, 민감도, trim-and-fill 그림과 Table S2를 만듭니다.", eyebrow="META-ANALYSIS")
+    ups = st.file_uploader("데이터 추출 엑셀 / R r_outputs zip / CSV (여러 개를 한 번에 올릴 수 있습니다)",
+                           type=["xlsx", "xls", "zip", "csv"], accept_multiple_files=True, key="meta_upload_v37")
+    if not ups:
         empty_state("📈", "파일을 올리세요",
                     "outcome별 시트에 Study, Mean_treat, SD_treat, N_treat, Mean_control, SD_control, N_control 열이 "
-                    "있으면 자동 인식합니다. R r_outputs zip과 효과크기 CSV(Study, yi, vi)도 받습니다.")
+                    "있으면 자동 인식합니다(Unit 열이 있으면 단위 일치 여부도 봅니다). R r_outputs zip과 효과크기 "
+                    "CSV(Study, yi, vi)도 받습니다. 여러 파일을 올리면 outcome을 모두 합쳐 보여 줍니다.")
         return
-    data = up.getvalue()
-    suffix = Path(up.name).suffix.lower()
-    try:
-        with st.spinner("분석하는 중..."):
-            if suffix in (".xlsx", ".xls"):
-                results, _qc = _load_workbook(data, CI_MODE)
-                if not results:
-                    results = _results_from_table(pd.read_excel(io.BytesIO(data)), Path(up.name).stem, CI_MODE)
-            elif suffix == ".zip":
-                results, _ = _load_r_zip(data, CI_MODE)
-                if not results:
-                    st.error("zip 안에서 effects_<outcome>.csv와 pooled_<outcome>.csv 쌍을 찾지 못했습니다.")
-                    return
-            else:
-                results = _results_from_table(pd.read_csv(io.BytesIO(data)), Path(up.name).stem, CI_MODE)
-    except Exception as exc:
-        st.error(f"파일을 읽지 못했습니다: {exc}")
+    with st.spinner("파일을 읽는 중..."):
+        datasets, errors = _collect_datasets(ups)
+    for e in errors:
+        st.warning(e)
+    if not datasets:
+        st.error("분석할 수 있는 outcome이 없습니다.")
+        return
+    st.caption(f"파일 {len(ups)}개 · outcome {len(datasets)}개")
+    with st.spinner("분석하는 중..."):
+        results = _method_panel(datasets)
+    if not results:
         return
 
     st.session_state["meta_raw"] = {"done": True, "n_outcomes": len(results)}
@@ -428,6 +577,7 @@ def render(active, log_activity) -> None:
         log_activity("📈", "메타분석 데이터 분석", f"{len(results)}개 outcome")
         st.session_state["_meta_logged"] = sig
 
+    st.subheader("② 그림과 표")
     t1, t2, t3, t4 = st.tabs(["🌲 Forest plot", "🎯 Sensitivity analysis", "🔻 Trim-and-fill", "📋 Table S2"])
     with t1:
         _forest_tab(results)
