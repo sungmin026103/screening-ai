@@ -150,6 +150,8 @@ class ForestOptions:
     ref_line: float | None = None        # 예: leave-one-out의 전체 추정치(파란 점선)
     pi_label: str = "95% prediction interval"
     rename: dict = field(default_factory=dict)   # 그림에 표시할 이름 {원래 라벨: 새 라벨}
+    legend_mode: str = "auto"            # auto(한 줄, 너무 작으면 두 줄) | one(항상 한 줄) | two(두 줄) | none(숨김)
+    fav_highlight: int | None = None     # favours 라벨 중 강조색(Intervention) 쪽: 0 = 왼쪽, 1 = 오른쪽
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +249,7 @@ def _dia(ax, lb, est, ub, y, color, dy):
                          facecolor=color, edgecolor=color, zorder=4))
 
 
-def _sym(ax, kind, cx, y, color_sq, color_dia):
-    hw = 0.09
+def _sym(ax, kind, cx, y, color_sq, color_dia, hw=0.09):
     if kind == "sq":
         ax.add_patch(Rectangle((cx - 0.035, y - 0.035), 0.07, 0.07, facecolor=color_sq, edgecolor=color_sq))
     elif kind == "dot":
@@ -278,13 +279,28 @@ def _legend_fit(items, avail, symw, pad, mgap, margin, fs_max):
         fs = round(fs - 0.1, 1)
 
 
-def _legend_one_row(ax, x0, x1, y, items, color_sq, color_dia, face, edge):
-    """범례 상자(y = 위 가장자리). 한 줄로 9.5 pt 이상이 안 되면 두 줄(위·아래 균형)로 나눈다. 반환: 상자 높이."""
-    symw, pad, mgap, margin = 0.20, 0.05, 0.14, 0.10
+def _legend_one_row(ax, x0, x1, y, items, color_sq, color_dia, face, edge, mode: str = "auto"):
+    """범례 상자(y = 위 가장자리). 반환: 상자 높이.
+    auto: 한 줄로 9.5 pt 이상이 안 되면 두 줄(위·아래 균형). one: 항상 한 줄 — 내용 폭에 맞춘 상자를 가운데에.
+    two: 항상 두 줄."""
+    symw, pad, mgap, margin = (0.14, 0.04, 0.08, 0.06) if mode == "one" else (0.20, 0.05, 0.14, 0.10)
     avail = x1 - x0
     fs, widths = _legend_fit(items, avail, symw, pad, mgap, margin, PT_LEGEND_MAX)
     rows = [list(zip(items, widths))]
-    if fs < LEGEND_MIN_ONE_ROW and len(items) >= 3:
+    if mode == "one":                          # 6.3 in 폭에서 기본 5항목은 약 8 pt
+        line_h = fs / 72 * 1.75
+        h = line_h + fs / 72 * 0.35
+        bw = min(avail, sum(widths) + mgap * (len(items) - 1) + 2 * margin)
+        bx = x0 + (avail - bw) / 2
+        ax.add_patch(FancyBboxPatch((bx, y), bw, h, boxstyle="round,pad=0,rounding_size=0.03",
+                                    facecolor=face, edgecolor=edge, lw=0.7, zorder=0))
+        yy, x = y + h / 2, bx + margin
+        for (kind, lab), w in zip(items, widths):
+            _sym(ax, kind, x + symw / 2, yy, color_sq, color_dia, hw=0.06)
+            ax.text(x + symw + pad, yy, lab, fontsize=fs, va="center", ha="left", color="#222222")
+            x += w + mgap
+        return h
+    if (mode == "two" or fs < LEGEND_MIN_ONE_ROW) and len(items) >= 3:
         cut = (len(items) + 1) // 2
         groups = [items[:cut], items[cut:]]
         fs = min(_legend_fit(g, avail, symw, pad, mgap, margin, PT_LEGEND_MAX - 1)[0] for g in groups)
@@ -539,11 +555,14 @@ def render(rows, pooled: Pooled | None, opts: ForestOptions, marker: str = "sq")
 
         if opts.favours:
             fav_l, fav_r = opts.favours
+            hi_idx = opts.fav_highlight
+            if hi_idx is None:
+                hi_idx = 0 if "Intervention" in fav_l else (1 if "Intervention" in fav_r else None)
             if style == 1:
-                def fc(s_):
-                    return pal["blue"] if "Intervention" in s_ else pal["fav_other"]
+                def fc(s_, i_):
+                    return pal["blue"] if i_ == hi_idx else pal["fav_other"]
             else:
-                def fc(s_):
+                def fc(s_, i_):
                     return "#222222"
             lab_l, lab_r = f"← {fav_l}", f"{fav_r} →"
             z = mapx(0) if lo <= 0 <= hi else (fx0 + fx1) / 2
@@ -554,19 +573,23 @@ def render(rows, pooled: Pooled | None, opts: ForestOptions, marker: str = "sq")
                 shift = (W - 0.04) - x_right_edge
             elif x_left_edge < cs:
                 shift = cs - x_left_edge
-            ax.text(z - 0.08 + shift, y_fav, lab_l, fontsize=PT, color=fc(fav_l), ha="right", va="center")
-            ax.text(z + 0.08 + shift, y_fav, lab_r, fontsize=PT, color=fc(fav_r), ha="left", va="center")
+            ax.text(z - 0.08 + shift, y_fav, lab_l, fontsize=PT, color=fc(fav_l, 0), ha="right", va="center")
+            ax.text(z + 0.08 + shift, y_fav, lab_r, fontsize=PT, color=fc(fav_r, 1), ha="left", va="center")
 
-        items = opts.legend_items or default_legend(opts.effect_label, show_pi)
-        lh = _legend_one_row(ax, 0.0, W, y_leg, items, mk, dia_col, pal["leg_face"], pal["leg_edge"])
-        yf = y_leg + lh + 0.17
+        if opts.legend_mode == "none":
+            lh, yf = 0.0, y_leg + 0.02
+        else:
+            items = opts.legend_items or default_legend(opts.effect_label, show_pi)
+            lh = _legend_one_row(ax, 0.0, W, y_leg, items, mk, dia_col, pal["leg_face"], pal["leg_edge"],
+                                 opts.legend_mode)
+            yf = y_leg + lh + 0.24
         lines = []
         for ln in [ln for ln in opts.footer_lines if ln]:
             lines += _wrap(ln, W - 2 * cs)
         for line in lines:
             ax.text(cs, yf, line, fontsize=PT, va="center", color="#222222")
-            yf += 0.21
-        H2 = (yf - 0.21 + 0.14) if lines else (y_leg + lh + 0.08)
+            yf += 0.24
+        H2 = (yf - 0.24 + 0.14) if lines else (y_leg + lh + 0.08)
         ax.set_ylim(H2, 0)
         fig.set_size_inches(W, H2)
     return fig

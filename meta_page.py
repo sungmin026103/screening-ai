@@ -225,7 +225,7 @@ def _analyze_r(key: str, outcome: str, rsets: dict) -> dict:
 # ---------------------------------------------------------------------------
 def _settings(res: dict) -> dict:
     base = st.session_state.setdefault("fig_settings", {}).get(res["outcome"]) or M.default_settings(res["outcome"])
-    return {**base, "study_names": dict(st.session_state.get("study_names", {}))}
+    return {**base, **st.session_state.get("fig_layout", {}), "study_names": dict(st.session_state.get("study_names", {}))}
 
 
 def _all_settings(results) -> dict:
@@ -329,8 +329,15 @@ def _name_editor(res: dict, kind: str) -> dict:
         if kind in FAV_KINDS:
             inc = st.radio("효과 방향", ["감소가 유익", "증가가 유익"], horizontal=True, key=f"{k}_f",
                            index=0 if tuple(st_["favours"])[0] == "Favours Intervention" else 1)
-            st_["favours"] = (("Favours Intervention", "Favours Control") if inc == "감소가 유익"
-                              else ("Favours Control", "Favours Intervention"))
+            new_dir = (("Favours Intervention", "Favours Control") if inc == "감소가 유익"
+                       else ("Favours Control", "Favours Intervention"))
+            if st_.get("fav_hi") != (0 if inc == "감소가 유익" else 1):   # 방향을 바꾸면 라벨도 기본값으로
+                st_["favours"] = new_dir
+            st_["fav_hi"] = 0 if inc == "감소가 유익" else 1
+            c1, c2 = st.columns(2)
+            fl = c1.text_input("왼쪽 방향 라벨", st_["favours"][0], key=f"{k}_fl_{inc}").strip()
+            fr = c2.text_input("오른쪽 방향 라벨", st_["favours"][1], key=f"{k}_fr_{inc}").strip()
+            st_["favours"] = (fl or new_dir[0], fr or new_dir[1])
         if kind in STUDY_KINDS:
             names = st.session_state.setdefault("study_names", {})
             studies = list(dict.fromkeys(F.clean_label(x) for x in res["data"]["Study"].astype(str)))
@@ -345,8 +352,23 @@ def _name_editor(res: dict, kind: str) -> dict:
                 else:
                     names.pop(orig, None)
             st_["study_names"] = dict(names)
-    store[o] = {k_: v for k_, v in st_.items() if k_ != "study_names"}
+    store[o] = {k_: v for k_, v in st_.items() if k_ != "study_names" and k_ not in M.LAYOUT_DEFAULTS}
     return st_
+
+
+LAYOUT_CHOICES = {"het": ("이질성 줄", {"i2": "I²만", "i2_tau": "I² + τ²", "none": "숨김"}),
+                  "overall": ("전체 효과 검정 줄", {"p_k": "p + k", "p": "p만", "none": "숨김"}),
+                  "legend": ("범례", {"one": "한 줄", "auto": "자동", "two": "두 줄", "none": "숨김"})}
+
+
+def _layout_editor():
+    """「✏️ 하단부 레이아웃」 — 범례·이질성·전체 효과 줄. 탭 위에 한 번만 그리고 모든 outcome·그림에 적용."""
+    lay = st.session_state.setdefault("fig_layout", dict(M.LAYOUT_DEFAULTS))
+    with st.expander("✏️ Forest plot 하단부 레이아웃 (모든 outcome 공통)", expanded=False):
+        for key, (label, opts) in LAYOUT_CHOICES.items():
+            cur = lay.get(key, M.LAYOUT_DEFAULTS[key])
+            v = st.segmented_control(label, list(opts), default=cur, format_func=opts.get, key=f"fig_lay_{key}")
+            lay[key] = v or cur
 
 
 def _forest_tab(results):
@@ -578,6 +600,7 @@ def render(active, log_activity) -> None:
         st.session_state["_meta_logged"] = sig
 
     st.subheader("② 그림과 표")
+    _layout_editor()
     t1, t2, t3, t4 = st.tabs(["🌲 Forest plot", "🎯 Sensitivity analysis", "🔻 Trim-and-fill", "📋 Table S2"])
     with t1:
         _forest_tab(results)

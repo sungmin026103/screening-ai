@@ -374,7 +374,11 @@ def candidate_group_columns(res: dict) -> list[str]:
 def default_settings(outcome: str) -> dict:
     t = F.short_title(outcome)
     return {"title": t, "subtitle": f"Effects of interventions on {t}", "favours": F.default_favours(outcome),
-            "style": 1, "label_mode": "plain", "ci_footnote": False, "x_limits": None}
+            "style": 1, "label_mode": "plain", "ci_footnote": False, "x_limits": None, **LAYOUT_DEFAULTS}
+
+
+# 하단부 레이아웃(모든 outcome 공통). het: i2 | i2_tau | none, overall: p | p_k | none, legend: ForestOptions.legend_mode
+LAYOUT_DEFAULTS = {"het": "i2", "overall": "p_k", "legend": "one"}
 
 
 # 그림별 기본 제목·부제("{t}" = outcome 제목). 화면에서 그림마다 바꿀 수 있다(settings["fig_text"][kind]).
@@ -416,23 +420,41 @@ def _two_level(res: dict) -> bool:
     return spec is not None and not spec.model.startswith("ML3")
 
 
-def _het(res: dict) -> str:
+def _het(res: dict, mode: str = "i2_tau") -> str:
     s = res["summary"]
+    if mode == "none":
+        return ""
+    if mode == "i2":
+        return F.het_line(s.i2, None, None)
     if _two_level(res):                      # 2-level/공통효과: τ² 하나만
         line = F.het_line(s.i2, None, None)
         return (line + f"; τ² = {float(s.tau2):.3f}") if res["method"].model != "FE" else line
     return F.het_line(s.i2, s.tau2_L2, s.tau2_L3)
 
 
+def overall_line(res: dict, mode: str = "p_k") -> str:
+    """'Test for overall effect: p = …; k = 7 studies (8 effect sizes)'. mode: p | p_k | none."""
+    p = res["summary"].p_value
+    if mode == "none" or p is None or not np.isfinite(p):
+        return ""
+    line = "Test for overall effect: " + ("$\\it{p}$ < 0.001" if p < 0.001 else f"$\\it{{p}}$ = {p:.3f}")
+    if mode == "p_k":
+        k = int(res["summary"].k)
+        ns = int(getattr(res.get("fit"), "n_studies", k) or k)
+        line += f"; k = {ns} studies" + (f" ({k} effect sizes)" if k != ns else "")
+    return line
+
+
 def _opts(res: dict, st: dict, **kw) -> F.ForestOptions:
     s = res["summary"]
-    footer = [_het(res)]
+    footer = [_het(res, st.get("het", LAYOUT_DEFAULTS["het"])), overall_line(res, st.get("overall", LAYOUT_DEFAULTS["overall"]))]
     if st.get("ci_footnote"):
         footer.append(f"95% CI: {s.ci_note}")
     base = dict(style=int(st.get("style", 1)), title=st.get("title") or F.short_title(res["outcome"]),
                 subtitle=st.get("subtitle"), favours=tuple(st.get("favours") or F.default_favours(res["outcome"])),
                 footer_lines=footer, x_limits=st.get("x_limits"), rename=dict(st.get("study_names") or {}),
-                effect_label=res.get("effect_label", "SMD"))
+                effect_label=res.get("effect_label", "SMD"), legend_mode=st.get("legend", LAYOUT_DEFAULTS["legend"]),
+                fav_highlight=st.get("fav_hi"))
     spec = res.get("method")
     if spec is not None and spec.model == "FE":
         base["pooled_label"] = "Pooled effect (common effect)"

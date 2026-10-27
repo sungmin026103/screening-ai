@@ -31,3 +31,15 @@ def test_every_figure_renders(which, measure, model):
         assert "τ²" not in M._het(res)
     elif not model.startswith("ML3"):
         assert "τ² =" in M._het(res) and "L3" not in M._het(res)
+
+
+def test_bottom_layout_lines():
+    res = MM.analyze(pd.read_csv(FIX / "multi.csv"), "Hepatic TG", MM.Spec("SMD", "ML3_CR2"))
+    line = M.overall_line(res, "p_k")
+    assert line.startswith("Test for overall effect: $\\it{p}$") and "effect sizes)" in line
+    assert "k =" not in M.overall_line(res, "p") and M.overall_line(res, "none") == ""
+    assert M._het(res, "i2").count("τ") == 0 and M._het(res, "none") == ""
+    for mode in ("one", "auto", "two", "none"):
+        st = {**M.default_settings("Hepatic TG"), "legend": mode}
+        assert M.make_figure("forest", res, st, "CR2") is not None
+        plt.close("all")
