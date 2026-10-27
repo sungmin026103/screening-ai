@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime
 import io
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import Any
@@ -36,7 +38,7 @@ FIELD_LABELS = {
     "dispersion": "SD/SE 유형",
 }
 
-_YEAR_RANGE = range(1990, 2027)
+_YEAR_RANGE = range(1990, datetime.date.today().year + 2)
 
 # 정수를 나타내는 영단어 -> 숫자. 나이/기간 표기가 "Two-month-old"처럼 숫자가
 # 아닌 단어로 쓰이는 경우가 많아서 필요하다.
@@ -100,15 +102,102 @@ _STRAIN_SPECIES_PATTERNS = [
 ]
 
 
+def _page_text_columns(page) -> str:
+    """pdfplumber 페이지 → 읽는 순서의 텍스트. 가운데를 가로지르는 줄(제목·저자·한 단 본문)은 그대로,
+    가로지르지 않는 줄이 이어지는 구간은 왼쪽 단 전체 → 오른쪽 단 전체 순서로 둔다(두 단 논문의 줄 섞임 방지)."""
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False, x_tolerance=1.5)
+    if not words:
+        return ""
+    mid = float(page.width) / 2
+    rows: list[list[dict]] = []
+    for w in sorted(words, key=lambda w: (round(w["top"]), w["x0"])):
+        if rows and abs(rows[-1][0]["top"] - w["top"]) <= 3:
+            rows[-1].append(w)
+        else:
+            rows.append([w])
+    out: list[str] = []
+    left: list[str] = []
+    right: list[str] = []
+
+    def line(ws):
+        return " ".join(x["text"] for x in sorted(ws, key=lambda x: x["x0"]))
+
+    def flush():
+        out.extend(left + right)
+        left.clear()
+        right.clear()
+
+    for r in rows:
+        if any(w["x0"] < mid - 2 and w["x1"] > mid + 2 for w in r):
+            flush()
+            out.append(line(r))
+        else:
+            lw = [w for w in r if w["x1"] <= mid + 2]
+            rw = [w for w in r if w["x1"] > mid + 2]
+            if lw:
+                left.append(line(lw))
+            if rw:
+                right.append(line(rw))
+    flush()
+    return "\n".join(out)
+
+
+OCR_MAX_PAGES = 20   # shortcut: 스캔 PDF는 앞 20쪽만 OCR(쪽당 수 초), 필요하면 늘린다
+
+
+def _ocr_pages(data: bytes) -> list[str]:
+    """스캔 PDF용 OCR(pypdfium2 렌더 300 dpi → tesseract). 설치돼 있지 않으면 빈 목록."""
+    try:
+        import pypdfium2 as pdfium
+        import pytesseract
+        pdf = pdfium.PdfDocument(data)
+        return [pytesseract.image_to_string(pdf[i].render(scale=300 / 72).to_pil().convert("L"), lang="eng")
+                for i in range(min(len(pdf), OCR_MAX_PAGES))]
+    except Exception:
+        return []
+
+
+def _normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)                 # ﬁ·ﬂ 합자, 전각 문자
+    text = re.sub(r"(?<=[a-z])-\n(?=[a-z])", "", text)        # 줄 끝 하이픈으로 끊긴 단어 잇기
+    text = text.replace("\u00ad", "").replace("\u00a0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def extract_pdf_text(data: bytes) -> tuple[str, int]:
+    """텍스트 레이어(두 단 순서 보정) → 거의 비어 있으면 OCR. 반환: (텍스트, 쪽수)."""
     reader = PdfReader(io.BytesIO(data))
     pages: list[str] = []
-    for page in reader.pages:
-        try:
-            pages.append(page.extract_text() or "")
-        except Exception:
-            pages.append("")
-    text = "\n".join(pages)
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            pages = [_page_text_columns(pg) for pg in pdf.pages]
+    except Exception:
+        pages = []
+    if not any(p.strip() for p in pages):
+        for page in reader.pages:
+            try:
+                pages.append(page.extract_text() or "")
+            except Exception:
+                pages.append("")
+    if len("".join(pages).strip()) < 300:
+        pages = _ocr_pages(data) or pages
+    return _normalize_text("\n".join(pages)), len(reader.pages)
+
+
+_METHODS_HEADING = re.compile(r"\n\s*(?:\d+\.?\s*|[IVX]+\.\s*)?(?:materials?\s+and\s+methods|methods?(?:\s+and\s+materials?)?|"
+                              r"experimental\s+(?:procedures|design|section))\b", re.I)
+_RESULTS_HEADING = re.compile(r"\n\s*(?:\d+\.?\s*|[IVX]+\.\s*)?results\b", re.I)
+
+
+def _methods_section(text: str) -> str:
+    """Methods ~ Results 구간(없으면 빈 문자열). 동물·용량·기간을 서론의 인용 문장보다 먼저 찾기 위함."""
+    m = _METHODS_HEADING.search(text)
+    if not m:
+        return ""
+    r = _RESULTS_HEADING.search(text, m.end())
+    return text[m.start(): r.start() if r else m.start() + 20000]
     text = text.replace("\u00a0", " ")  # 줄바꿈 없는 공백(nbsp) 정규화
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -159,7 +248,7 @@ def _field(value: str, confidence: float, evidence: str = "") -> ExtractionField
 def _surname_from_name_token(token: str) -> str | None:
     """'Smith J.' 또는 'J. Smith' 또는 'Smith, J.' 형태에서 성(surname)만 추출."""
     token = token.strip(" .,;")
-    token = re.sub(r"[\*\u2020\u2021\d\u00a0]+$", "", token).strip()  # 위첨자·소속번호 제거
+    token = re.sub(r"[\*\u2020\u2021\d\u00a0\u2019'!|¹²³⁴⁵⁶⁷⁸⁹⁰]+$", "", token).strip()  # 위첨자·소속번호(OCR이 ’·!로 읽는 1 포함) 제거
     if not token:
         return None
     parts = token.split()
@@ -177,8 +266,8 @@ def _surname_from_name_token(token: str) -> str | None:
     # 성 뒤에 이니셜이 오는 경우: 'Smith J.' / 'Smith JM'
     if re.match(r"^[A-Z][A-Za-z'\-]{1,30}(\s([A-Z]\.?){1,3})$", token):
         return parts[0]
-    # 'First Last' 형태 (이니셜 없음) — 마지막 단어를 성으로 간주
-    if len(parts) >= 2 and all(re.match(r"^[A-Z][A-Za-z'\-]*$", p) for p in parts):
+    # 'First Last' / 'First M. Last' 형태 — 마지막 단어를 성으로 간주
+    if len(parts) >= 2 and all(re.match(r"^[A-Z][A-Za-z'\-]*\.?$", p) for p in parts) and not parts[-1].endswith("."):
         return parts[-1]
     if len(parts) == 1 and re.match(r"^[A-Z][A-Za-z'\-]{1,30}$", parts[0]):
         return parts[0]
@@ -381,13 +470,15 @@ def _extract_intervention(text_no_refs: str, flat: str, sentences: list[str]) ->
 # 동물종 (계통 + 종)
 # ---------------------------------------------------------------------------
 
-def _extract_species(flat: str, sentences: list[str]) -> ExtractionField:
-    for pattern, strain_label, species_word in _STRAIN_SPECIES_PATTERNS:
-        m = re.search(pattern, flat, re.I)
-        if m:
-            value = f"{strain_label} {species_word}"
+def _extract_species(flat: str, sentences: list[str], methods: str = "") -> ExtractionField:
+    for region in (methods, flat):                 # Methods에서 먼저, 가장 많이 나온 계통
+        hits = [(len(re.findall(p, region, re.I)), re.search(p, region, re.I), lab, sp)
+                for p, lab, sp in _STRAIN_SPECIES_PATTERNS] if region else []
+        hits = [h for h in hits if h[0]]
+        if hits:
+            _n, m, strain_label, species_word = max(hits, key=lambda h: h[0])
             ev = _evidence(sentences, [m.group(0)]) or m.group(0)
-            return _field(value, 0.9, ev)
+            return _field(f"{strain_label} {species_word}", 0.9, ev)
 
     # 계통까지는 못 찾았지만 종은 특정 가능한 경우
     species_map = [
@@ -424,16 +515,21 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
     text_no_refs = _truncate_before_references(text)
     flat = re.sub(r"\s+", " ", text_no_refs)
     sentences = _sentences(text_no_refs)
+    mflat = re.sub(r"\s+", " ", _methods_section(text_no_refs))
 
-    species_field = _extract_species(flat, sentences)
+    def _match_m(pats):                           # Methods 먼저, 없으면 전체
+        hit = _match(mflat, pats) if mflat else ("", "")
+        return hit if hit[0] else _match(flat, pats)
 
-    sex, sex_ev = _match(flat, [
+    species_field = _extract_species(flat, sentences, mflat)
+
+    sex, sex_ev = _match_m([
         r"\b(male and female|female and male|male|female)\s+(?:[A-Z][A-Za-z0-9/\-]{1,20}\s+){0,2}(?:mice|mouse|rats?|rabbits?|animals?|participants|subjects)\b",
     ])
     if sex:
         sex = sex.title()
 
-    age, age_ev = _match(flat, [
+    age, age_ev = _match_m([
         r"\b((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|twelve)[- ](?:week|weeks|wk|month|months|day|days)[- ]old)\b",
         r"\b(aged\s+\d+(?:\s*[–-]\s*\d+)?\s+(?:weeks?|months?|days?))\b",
         r"\b(\d+(?:\.\d+)?\s*(?:wk|weeks?|months?|days?)\s+of\s+age)\b",
@@ -460,8 +556,9 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
 
     intervention_field = _extract_intervention(text_no_refs, flat, sentences)
 
+    _msent = set(_sentences(mflat))
     _dose_context_sentences = [
-        s for s in sentences
+        s for s in sorted(sentences, key=lambda s_: s_ not in _msent)     # Methods 문장 먼저(안정 정렬)
         if re.search(r"\b(administ|inject|supplement|dose|dosage|received|gavage|twice daily|once daily|per day)\b", s, re.I)
         and not re.search(r"\bweigh|anesthe|anaesthe|pentobarbital|euthaniz|euthanis|sacrific", s, re.I)
     ]
@@ -475,7 +572,7 @@ def analyze_pdf_bytes(data: bytes, filename: str = "") -> dict[str, Any]:
             r"\b(\d+(?:\.\d+)?\s*×\s*10\^?\d+\s*CFU(?:/day|/d)?)\b",
         ])
 
-    duration, duration_ev = _match(flat, [
+    duration, duration_ev = _match_m([
         r"\b(?:for|during)\s+((?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|twelve)\s+(?:days?|weeks?|months?))\b",
         r"\b((?:\d+(?:\.\d+)?)\s*[- ](?:day|week|month)\s+(?:treatment|intervention|supplementation|study))\b",
     ])
