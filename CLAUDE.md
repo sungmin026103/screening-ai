@@ -51,7 +51,7 @@ AI(Claude·Codex 등)가 이 저장소를 고칠 때 **매번 먼저 읽는 파�
 | 영역 | 테스트 |
 |---|---|
 | 저장소 규칙 | `tests/test_harness_rules.py` |
-| figure 회귀(글자·위치·크기 27장) | `tests/test_figure_golden.py` + `tests/golden/figures.json` |
+| figure 회귀(글자·위치·크기 27장, 기준 글꼴 환경 = packages.txt 설치 상태) | `tests/test_figure_golden.py` + `tests/golden/figures.json` |
 | 메타분석 방법·화면(헤드리스 앱) | `tests/app/` |
 | PDF 분석 | `tests/app/test_pdf_analyzer.py` |
 | 가능성 예측 | `tests/feasibility/` |

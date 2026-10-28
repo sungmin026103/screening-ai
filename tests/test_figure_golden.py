@@ -22,7 +22,8 @@ def _now():
     return NOW
 
 
-@pytest.mark.skipif(golden.F.FONT != GOLD["font"], reason=f"기준은 {GOLD['font']} 글꼴로 만들었다(현재 {golden.F.FONT})")
+@pytest.mark.skipif(golden.font_key() != GOLD["font"],
+                    reason=f"기준 글꼴 {GOLD['font']}(packages.txt 환경)과 다름: {golden.font_key()}")
 @pytest.mark.parametrize("key", sorted(GOLD["figures"]))
 def test_figure_matches_golden(key):
     now = _now()["figures"].get(key)

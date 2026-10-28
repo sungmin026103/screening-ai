@@ -46,8 +46,13 @@ def snapshot(fig) -> dict:
     return {"size": [round(float(w), 3), round(float(h), 3)], "texts": sorted(texts)}
 
 
+def font_key() -> str:
+    """기본 글꼴 + 한글 대체 글꼴. 대체 글꼴이 '−' 같은 기호를 그리므로 둘 다 같아야 비교가 의미 있다."""
+    return "+".join([F.FONT] + F._CJK)
+
+
 def build_all() -> dict:
-    out = {"font": F.FONT, "figures": {}}
+    out = {"font": font_key(), "figures": {}}
     for name, (which, measure, model) in CASES.items():
         res = MM.analyze(pd.read_csv(FIX / f"{which}.csv"), "Hepatic TG", MM.Spec(measure, model))
         for kind in KINDS:
