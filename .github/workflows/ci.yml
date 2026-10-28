@@ -1,0 +1,26 @@
+name: verify
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: System packages (packages.txt)
+        run: sudo apt-get update && sudo apt-get install -y $(grep -v '^#' packages.txt)
+      - name: Python packages
+        run: pip install -r requirements.txt pytest==9.1.1
+      - name: Verify (tests + figure previews)
+        run: python tools/verify.py
+      - name: Upload figure previews
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: figure-previews
+          path: .verify/

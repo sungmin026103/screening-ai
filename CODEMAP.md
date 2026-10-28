@@ -7,8 +7,10 @@
 | 항목 | 명령 / 위치 |
 |---|---|
 | 앱 실행 | `streamlit run app.py` |
-| 단위 테스트 | `python -m pytest -q tests/feasibility test_ma_core.py test_upload_safety.py test_figure_evidence.py` |
-| 셀프테스트(스크립트) | `python selftest_v36.py` (최신), `selftest_v31.py`, `selftest_v30.py` |
+| **검증(전체)** | `python tools/verify.py` — pytest 전체(셀프테스트·figure 골든 포함) + `.verify/` 미리보기. 규칙은 `CLAUDE.md` |
+| 그림 기준 갱신 | `python tools/golden.py --update` (의도한 figure 변경일 때만) |
+| 셀프테스트(스크립트 단독 실행도 가능) | `python selftest_v36.py`, `selftest_v31.py`, `selftest_v30.py` — pytest에서는 tests/test_selftests.py가 호출 |
+| 외부 검색 API 점검 | `python tools/smoke_apis.py` (네트워크 필요, 자동 검사에는 없음) |
 | 레거시 단독 실행 | `streamlit run ma_feasibility.py`, `streamlit run ma_feasibility_pro.py` |
 | 버전별 변경 이력 | `docs/changelog/` (README_V30~V35, RELEASE_NOTES_V30), 최신은 루트 `README_V36.txt` |
 | 설계/계획 문서 | `docs/superpowers/specs/`, `docs/superpowers/plans/` |
@@ -44,7 +46,7 @@
 | AI 스크리닝: 자동 게이트(개념 규칙) | screening.py | `derive_auto_gate`, `parse_gate_rules_text`, `gate_rules_to_text`, `harvest_abbreviations` | selftest_v36.py (`check_auto_gate`) |
 | AI 스크리닝: 결과·성능 figure | app.py, screening.py | `ScreeningResult`, `_screening_performance_figure_bytes` (app.py) | selftest_v36.py |
 | AI 스크리닝 성능 figure (독립 스크립트) | AI_screening_figures.py | `load_result`, `cv_data`, `cv_predictions`, `main` | - |
-| PDF 분석 (필드 자동 추출) | pdf_analyzer.py | `analyze_pdf_bytes`, `extract_pdf_text`, `extraction_to_dataframe`, `ExtractionField` | - |
+| PDF 분석 (필드 자동 추출) | pdf_analyzer.py | `analyze_pdf_bytes`, `extract_pdf_text`, `_methods_section`, `_page_text_columns`, `extraction_to_dataframe` | tests/app/test_pdf_analyzer.py |
 | 추출 엑셀(outcome 시트) 읽기 | extraction.py | `read_extraction_workbook`, `read_outcome_sheet`, `outcome_name` | - |
 | Figure 값 추출 (막대/점 자동 디지타이징) | figure_digitizer.py (UI) → figure_auto.py (엔진) | `analyze`, `find_panels`, `calibrate`, `calibrate_manual`, `to_rows`; UI `render_figure_digitizer` | selftest_v36.py (`check_figure_auto`) |
 | Figure 오차 해석 (SE/SD/CI → SD) | figure_evidence.py | `interpret_error`, `classify_plot`, `parse_digitized_csv`, `validate_two_group` | test_figure_evidence.py |
@@ -52,7 +54,7 @@
 | 효과크기·풀링 결과 구성, 민감도 표 | meta_sections.py | `result_from_effects`, `result_from_r_sets`, `influence_table`, `loo_table`, `baujat_table`, `gosh_table`, `robustness_table`, `subgroup_analysis_3level`, `section_tables` | selftest_v36.py |
 | 메타분석 figure 생성 (forest/LOO/Baujat/GOSH/funnel/trim-fill) | meta_sections.py | `make_figure`, `forest_fig`, `subgroup_fig`, `loo_fig`, `influence_fig`, `funnel_fig`, `trimfill_funnel_fig`, `build_section_zip` | selftest_v36.py |
 | 풀링 통계 (3수준 REML, RVE, Egger, trim-fill) | rmeta.py, metaanalysis.py | rmeta: `fit_three_level`, `rma_reml`, `aggregate_cs`, `regtest_sei`, `trimfill_l0`, `selection_model`, `escalc_smd`; metaanalysis: `compute_effect_sizes`, `pool_random_effects`, `eggers_test`, `trim_and_fill`, `prediction_interval`, `ForestSummary` (meta_sections.py가 import하므로 레거시 아님) | selftest_v36.py (`check_meta_numbers`) |
-| Forest 스타일/렌더러 | forest_styles.py | `render`, `forest_figure`, `subgroup_figure`, `ForestOptions`, `Pooled`, `save_figure` | selftest_v36.py |
+| Forest 스타일/렌더러 | forest_styles.py | `render`, `forest_figure`, `subgroup_figure`, `ForestOptions`, `Pooled`, `save_figure` | tests/test_figure_golden.py, selftest_v36.py |
 | plotly 간이 forest/funnel (구형 시각화 함수만 해당; 파일 자체는 현역) | metaanalysis.py | `forest_plot_pro`, `funnel_plot_pro`, `run_meta_analysis`, `guess_columns`, `forest_plot_from_R`, `funnel_plot_from_R` | - |
 | 전 outcome 일괄 분석·figure·엑셀 | auto_figures.py | `analyze_outcome`, `summary_row`, `make_figures`, `build_results_workbook`, `build_figure_zip` | - |
 | 고급 분석 (meta-regression, dose-response, PET-PEESE, selection, p-curve) | advanced.py | `run_advanced`, `parse_dose` | - |
@@ -106,3 +108,14 @@
 | 여러 파일 업로드·outcome 합치기, ① 분석 방법 패널 → ② 그림과 표 | meta_page.py | `_collect_datasets`, `_datasets_from_file`, `_datasets_from_table`, `_method_panel` | tests/app/test_meta_page_methods.py, tests/app/test_all_figures_all_methods.py |
 결과 객체에 `method`(Spec), `effect_label`, `effect_axis`, (합산 모형이면) `data_raw`가 붙는다. 민감도 재적합(`meta_sections._refit_without`)과 이질성 표기(`_het`)는 고른 모형을 따른다. Supplementary S1–S7 빌더(supplementary.build_tables, 화면 미사용)는 여전히 3-level SMD 문구를 쓴다.
 
+
+## 하네스(AI 작업 환경)
+
+| 파일 | 역할 |
+|---|---|
+| CLAUDE.md / AGENTS.md | AI 작업 규칙·완료 기준·알려진 문제 |
+| tools/verify.py | 전체 검증 한 번에(테스트 + figure 미리보기) |
+| tools/golden.py | figure 스냅샷(글자·위치·크기) 생성·갱신 |
+| tests/test_harness_rules.py | 파일명 보존·무료·라이선스·버전 고정·V1 기본·CODEMAP 동기화 검사 |
+| tests/test_selftests.py | selftest_v30/v31/v36의 check 함수를 pytest로 |
+| .github/workflows/ci.yml | push마다 verify 실행, 미리보기 PNG를 artifact로 |

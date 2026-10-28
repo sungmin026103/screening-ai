@@ -8,3 +8,4 @@ venv/
 data/projects/*
 !data/projects/.gitkeep
 .superpowers/
+.verify/
