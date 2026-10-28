@@ -7,8 +7,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -17,10 +17,18 @@ jobs:
       - name: Python packages
         run: pip install -r requirements.txt pytest==9.1.1
       - name: Verify (tests + figure previews)
-        run: python tools/verify.py
+        shell: bash
+        run: |
+          set +e
+          python tools/verify.py -rfE 2>&1 | tee verify.log
+          code=${PIPESTATUS[0]}
+          # 실패 이유를 GitHub 화면(Annotations)에 바로 보이게
+          grep -E "^(FAILED|ERROR) |Error:|Traceback" verify.log | head -40 | sed 's/^/::error::/'
+          tail -3 verify.log | sed 's/^/::notice::/'
+          exit $code
       - name: Upload figure previews
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: figure-previews
           path: .verify/
