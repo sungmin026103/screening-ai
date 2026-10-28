@@ -32,3 +32,4 @@ jobs:
         with:
           name: figure-previews
           path: .verify/
+          include-hidden-files: true
